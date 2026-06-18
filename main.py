@@ -1,8 +1,11 @@
 import os
+import re
+import uuid
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -264,4 +267,197 @@ async def voiceflow_summary(
         "response_text": response_text,
         "batch_summary": batch,
         "risk_summary": risk_rows,
+    }
+def clean_file_name(filename: str) -> str:
+    """Make uploaded file names safe for storage paths."""
+    name = filename or "uploaded-file"
+    name = name.strip().replace(" ", "_")
+    name = re.sub(r"[^A-Za-z0-9._-]", "", name)
+    return name or "uploaded-file"
+
+
+async def supabase_insert(table_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Insert one row into a Supabase table through the REST API."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase environment variables are not configured.")
+
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "message": "Supabase insert failed.",
+                "table": table_name,
+                "supabase_status": response.status_code,
+                "supabase_response": response.text,
+            },
+        )
+
+    rows = response.json()
+    return rows[0] if rows else {}
+
+
+async def upload_to_supabase_storage(
+    bucket_name: str,
+    storage_path: str,
+    file: UploadFile,
+) -> Dict[str, Any]:
+    """Upload one file into a Supabase Storage bucket."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase environment variables are not configured.")
+
+    file_bytes = await file.read()
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket_name}/{storage_path}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": file.content_type or "application/octet-stream",
+        "x-upsert": "true",
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(url, headers=headers, content=file_bytes)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "message": "Supabase storage upload failed.",
+                "bucket": bucket_name,
+                "path": storage_path,
+                "supabase_status": response.status_code,
+                "supabase_response": response.text,
+            },
+        )
+
+    return {
+        "bucket": bucket_name,
+        "path": storage_path,
+        "file_name": file.filename,
+        "content_type": file.content_type,
+        "size_bytes": len(file_bytes),
+    }
+
+
+@app.post("/upload-batch")
+async def upload_batch(
+    api_key: str = Form(...),
+    organization_name: str = Form(...),
+    location_name: str = Form(...),
+    location_code: str = Form(...),
+    uploaded_by: str = Form(...),
+    report_period_start: date = Form(...),
+    report_period_end: date = Form(...),
+
+    driver_performance_file: Optional[UploadFile] = File(None),
+    safety_events_file: Optional[UploadFile] = File(None),
+    payroll_exceptions_file: Optional[UploadFile] = File(None),
+    training_gaps_file: Optional[UploadFile] = File(None),
+    compliance_gaps_file: Optional[UploadFile] = File(None),
+    route_performance_file: Optional[UploadFile] = File(None),
+    supervisor_notes_file: Optional[UploadFile] = File(None),
+):
+    """
+    Receives a LORI delivery operations batch from the portal,
+    stores uploaded source files in Supabase Storage,
+    and records batch/file tracking metadata in Supabase.
+    """
+    require_lori_key(api_key)
+
+    bucket_name = "lori-batch-uploads"
+    clean_location_code = location_code.strip().upper().replace(" ", "-")
+    batch_code = f"{clean_location_code}-{report_period_end.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+    source_files = [
+        ("Driver Performance File", driver_performance_file),
+        ("Safety Events File", safety_events_file),
+        ("Payroll Exceptions File", payroll_exceptions_file),
+        ("Training Gaps File", training_gaps_file),
+        ("Compliance Gaps File", compliance_gaps_file),
+        ("Route Performance File", route_performance_file),
+        ("Supervisor Notes File", supervisor_notes_file),
+    ]
+
+    uploaded_file_results = []
+
+    for file_type, file in source_files:
+        if file is None:
+            continue
+
+        safe_name = clean_file_name(file.filename)
+        storage_path = f"{batch_code}/{file_type.replace(' ', '_').lower()}/{safe_name}"
+
+        storage_result = await upload_to_supabase_storage(
+            bucket_name=bucket_name,
+            storage_path=storage_path,
+            file=file,
+        )
+
+        file_record = await supabase_insert(
+            "lori_uploaded_files",
+            {
+                "batch_code": batch_code,
+                "file_type": file_type,
+                "original_file_name": file.filename,
+                "storage_bucket": bucket_name,
+                "storage_path": storage_path,
+                "uploaded_by": uploaded_by,
+                "processing_status": "uploaded",
+                "notes": "Uploaded through LORI Data Intake portal.",
+            },
+        )
+
+        uploaded_file_results.append(
+            {
+                "file_type": file_type,
+                "original_file_name": file.filename,
+                "storage": storage_result,
+                "record": file_record,
+            }
+        )
+
+    batch_record = await supabase_insert(
+        "lori_batch_uploads",
+        {
+            "batch_code": batch_code,
+            "organization_name": organization_name,
+            "location_name": location_name,
+            "location_code": clean_location_code,
+            "uploaded_by": uploaded_by,
+            "report_period_start": report_period_start.isoformat(),
+            "report_period_end": report_period_end.isoformat(),
+            "batch_status": "uploaded",
+            "total_files": len(uploaded_file_results),
+            "notes": "Batch files uploaded successfully. File parsing and scoring will be connected in the next production step.",
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "Batch uploaded successfully. File parsing and scoring will be connected in the next production step.",
+        "batch_code": batch_code,
+        "batch_status": "uploaded",
+        "organization_name": organization_name,
+        "location_name": location_name,
+        "location_code": clean_location_code,
+        "uploaded_by": uploaded_by,
+        "report_period_start": report_period_start.isoformat(),
+        "report_period_end": report_period_end.isoformat(),
+        "files_uploaded": len(uploaded_file_results),
+        "uploaded_files": uploaded_file_results,
+        "batch_record": batch_record,
+        "next_step": "Connect file parsing, scoring, dashboard refresh, and report generation.",
     }
