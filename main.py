@@ -1072,3 +1072,595 @@ async def uploaded_driver_360(
         "recommended_action": driver.get("recommended_action"),
         "source_file_name": driver.get("source_file_name"),
     }
+MONTH_NAMES = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
+}
+
+
+def parse_date_safe(value: Any) -> Optional[date]:
+    """Safely parse a date returned from Supabase."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except Exception:
+        return None
+
+
+def format_birthday(month: Any, day: Any) -> str:
+    """Format birthday month/day without storing a full birthdate."""
+    try:
+        month_int = int(month)
+        day_int = int(day)
+        month_name = MONTH_NAMES.get(month_int, f"Month {month_int}")
+        return f"{month_name} {day_int}"
+    except Exception:
+        return "Not available"
+
+
+async def find_driver_master_record(
+    employee_id: Optional[str] = None,
+    driver_name: Optional[str] = None,
+    question: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Find a driver by employee ID, driver name, or name mentioned inside a question."""
+    if employee_id:
+        rows = await supabase_select(
+            "lori_driver_master",
+            {
+                "select": "*",
+                "employee_id": f"eq.{employee_id}",
+                "limit": "1",
+            },
+        )
+        if rows:
+            return rows[0]
+
+    if driver_name:
+        rows = await supabase_select(
+            "lori_driver_master",
+            {
+                "select": "*",
+                "driver_name": f"ilike.*{driver_name}*",
+                "limit": "1",
+            },
+        )
+        if rows:
+            return rows[0]
+
+    if question:
+        all_drivers = await supabase_select(
+            "lori_driver_master",
+            {
+                "select": "*",
+                "order": "driver_name.asc",
+            },
+        )
+
+        question_lower = question.lower()
+
+        for driver in all_drivers:
+            name = (driver.get("driver_name") or "").lower()
+            preferred = (driver.get("preferred_name") or "").lower()
+            emp_id = (driver.get("employee_id") or "").lower()
+
+            if emp_id and emp_id in question_lower:
+                return driver
+
+            if name and name in question_lower:
+                return driver
+
+            if preferred and preferred in question_lower:
+                return driver
+
+    raise HTTPException(
+        status_code=404,
+        detail="No matching driver was found. Try using the driver name or employee ID.",
+    )
+
+
+async def get_driver_intelligence_payload(
+    employee_id: Optional[str] = None,
+    driver_name: Optional[str] = None,
+    question: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Collect the full driver intelligence profile from all driver tables."""
+    master = await find_driver_master_record(
+        employee_id=employee_id,
+        driver_name=driver_name,
+        question=question,
+    )
+
+    resolved_employee_id = master["employee_id"]
+
+    credentials = await supabase_select(
+        "lori_driver_credentials",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "expiration_date.asc",
+        },
+    )
+
+    counseling = await supabase_select(
+        "lori_driver_counseling",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "counseling_date.desc",
+        },
+    )
+
+    routes = await supabase_select(
+        "lori_driver_routes",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "route_date.desc",
+            "limit": "10",
+        },
+    )
+
+    metrics = await supabase_select(
+        "lori_driver_metrics",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "metric_period_end.desc",
+            "limit": "5",
+        },
+    )
+
+    safety_events = await supabase_select(
+        "lori_driver_safety_events",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "event_date.desc",
+            "limit": "10",
+        },
+    )
+
+    notes = await supabase_select(
+        "lori_driver_notes",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "note_date.desc",
+            "limit": "10",
+        },
+    )
+
+    alerts = await supabase_select(
+        "lori_driver_alerts",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "due_date.asc",
+        },
+    )
+
+    timeline = await supabase_select(
+        "lori_driver_timeline",
+        {
+            "select": "*",
+            "employee_id": f"eq.{resolved_employee_id}",
+            "order": "event_date.desc",
+            "limit": "15",
+        },
+    )
+
+    answer_text = build_driver_intelligence_answer(
+        master=master,
+        credentials=credentials,
+        counseling=counseling,
+        routes=routes,
+        metrics=metrics,
+        safety_events=safety_events,
+        notes=notes,
+        alerts=alerts,
+        timeline=timeline,
+        question=question,
+    )
+
+    return {
+        "status": "success",
+        "driver": master,
+        "credentials": credentials,
+        "counseling": counseling,
+        "routes": routes,
+        "metrics": metrics,
+        "safety_events": safety_events,
+        "notes": notes,
+        "alerts": alerts,
+        "timeline": timeline,
+        "answer_text": answer_text,
+    }
+
+
+def build_driver_intelligence_answer(
+    master: Dict[str, Any],
+    credentials: List[Dict[str, Any]],
+    counseling: List[Dict[str, Any]],
+    routes: List[Dict[str, Any]],
+    metrics: List[Dict[str, Any]],
+    safety_events: List[Dict[str, Any]],
+    notes: List[Dict[str, Any]],
+    alerts: List[Dict[str, Any]],
+    timeline: List[Dict[str, Any]],
+    question: Optional[str] = None,
+) -> str:
+    """Create a leadership-ready answer from the driver intelligence profile."""
+    q = (question or "").lower()
+    driver_name = master.get("driver_name") or "this driver"
+    employee_id = master.get("employee_id") or "Unknown"
+    supervisor = master.get("supervisor_name") or "Not listed"
+    location = master.get("location_name") or "Not listed"
+    primary_route = master.get("primary_route_id") or "Not listed"
+    birthday = format_birthday(master.get("birthday_month"), master.get("birthday_day"))
+
+    latest_metric = metrics[0] if metrics else {}
+    latest_route = routes[0] if routes else {}
+    open_alerts = [a for a in alerts if (a.get("status") or "").lower() == "open"]
+    critical_alerts = [
+        a for a in open_alerts
+        if (a.get("alert_level") or "").lower() in ["critical", "high"]
+    ]
+    open_counseling = [
+        c for c in counseling
+        if (c.get("status") or "").lower() == "open"
+    ]
+
+    if "dot" in q or "credential" in q or "expire" in q or "expiration" in q:
+        if not credentials:
+            return f"I do not see credential records for {driver_name}."
+
+        lines = [
+            f"Credential Readout for {driver_name}",
+            f"Employee ID: {employee_id}",
+            f"Supervisor: {supervisor}",
+            "",
+        ]
+
+        for credential in credentials:
+            lines.append(
+                f"{credential.get('credential_type')}: {credential.get('credential_status')} — "
+                f"expires {credential.get('expiration_date')} "
+                f"({credential.get('days_until_expiration')} days until expiration). "
+                f"Alert Level: {credential.get('alert_level')}. "
+                f"Notes: {credential.get('notes')}"
+            )
+
+        return "\n".join(lines)
+
+    if "birthday" in q:
+        return (
+            f"{driver_name}'s birthday is listed as {birthday}. "
+            f"For privacy, LORI stores month and day only in this demo, not a full birthdate."
+        )
+
+    if "counsel" in q or "coaching" in q or "follow" in q:
+        if not counseling:
+            return f"I do not see counseling or coaching records for {driver_name}."
+
+        lines = [
+            f"Counseling and Coaching History for {driver_name}",
+            f"Supervisor: {supervisor}",
+            "",
+        ]
+
+        for item in counseling[:5]:
+            lines.append(
+                f"{item.get('counseling_date')}: {item.get('counseling_type')} — "
+                f"{item.get('counseling_reason')}. Outcome: {item.get('outcome')}. "
+                f"Follow-up: {item.get('follow_up_date')}. Status: {item.get('status')}. "
+                f"Priority: {item.get('priority')}."
+            )
+
+        return "\n".join(lines)
+
+    if "route" in q:
+        if not routes:
+            return f"I do not see route records for {driver_name}."
+
+        return (
+            f"Route Readout for {driver_name}\n"
+            f"Primary Route: {primary_route}\n"
+            f"Latest Route: {latest_route.get('route_id')} — {latest_route.get('route_name')}\n"
+            f"Planned Stops: {latest_route.get('planned_stops')}\n"
+            f"Completed Stops: {latest_route.get('completed_stops')}\n"
+            f"Missed Stops: {latest_route.get('missed_stops')}\n"
+            f"On-Time Rate: {latest_route.get('on_time_rate')}\n"
+            f"Route Score: {latest_route.get('route_score')}\n"
+            f"Route Risk Flag: {latest_route.get('route_risk_flag')}\n"
+            f"Notes: {latest_route.get('notes')}"
+        )
+
+    if "safety" in q or "event" in q:
+        if not safety_events:
+            return f"I do not see safety events for {driver_name}."
+
+        lines = [
+            f"Safety Event Readout for {driver_name}",
+            "",
+        ]
+
+        for event in safety_events[:5]:
+            lines.append(
+                f"{event.get('event_date')}: {event.get('event_type')} "
+                f"({event.get('severity')}) on {event.get('route_id')}. "
+                f"{event.get('description')} Corrective action required: "
+                f"{event.get('corrective_action_required')}."
+            )
+
+        return "\n".join(lines)
+
+    if "alert" in q or "risk" in q or "everything" in q or "profile" in q or not question:
+        lines = [
+            f"Driver Intelligence Profile: {driver_name}",
+            f"Employee ID: {employee_id}",
+            f"Supervisor: {supervisor}",
+            f"Location: {location}",
+            f"Primary Route: {primary_route}",
+            f"Birthday: {birthday}",
+            "",
+            "Performance Snapshot:",
+            f"Overall Score: {latest_metric.get('overall_score', 'Not available')}",
+            f"Risk Level: {latest_metric.get('risk_level', 'Not available')}",
+            f"Trend Direction: {latest_metric.get('trend_direction', 'Not available')}",
+            f"Recommended Action: {latest_metric.get('recommended_action', 'Not available')}",
+            "",
+            "Open Alerts:",
+        ]
+
+        if open_alerts:
+            for alert in open_alerts[:5]:
+                lines.append(
+                    f"- {alert.get('alert_level')}: {alert.get('alert_title')} — "
+                    f"{alert.get('alert_detail')} Due: {alert.get('due_date')}. "
+                    f"Recommended Action: {alert.get('recommended_action')}"
+                )
+        else:
+            lines.append("- No open alerts found.")
+
+        lines.append("")
+        lines.append("Counseling / Coaching:")
+
+        if open_counseling:
+            for item in open_counseling[:3]:
+                lines.append(
+                    f"- {item.get('counseling_date')}: {item.get('counseling_type')} — "
+                    f"{item.get('counseling_reason')}. Follow-up: {item.get('follow_up_date')}. "
+                    f"Status: {item.get('status')}."
+                )
+        else:
+            lines.append("- No open counseling follow-ups found.")
+
+        lines.append("")
+        lines.append("Leadership Readout:")
+
+        if critical_alerts:
+            lines.append(
+                f"{driver_name} has critical or high-priority items that require leadership review "
+                f"before continued escalation."
+            )
+        else:
+            lines.append(
+                f"{driver_name} does not currently show critical open alerts in the demo intelligence layer."
+            )
+
+        return "\n".join(lines)
+
+    return (
+        f"I found {driver_name}. Employee ID: {employee_id}. Supervisor: {supervisor}. "
+        f"Latest risk level: {latest_metric.get('risk_level', 'Not available')}. "
+        f"Ask about DOT expiration, counseling, routes, safety events, birthday, alerts, or full profile."
+    )
+
+
+@app.get("/driver-search")
+async def driver_search(
+    api_key: str = Query(...),
+    query: Optional[str] = Query(None),
+):
+    """
+    Search driver master records by name or employee ID.
+    """
+    require_lori_key(api_key)
+
+    if query:
+        all_drivers = await supabase_select(
+            "lori_driver_master",
+            {
+                "select": "*",
+                "order": "driver_name.asc",
+            },
+        )
+
+        q = query.lower()
+        matches = [
+            driver for driver in all_drivers
+            if q in (driver.get("driver_name") or "").lower()
+            or q in (driver.get("preferred_name") or "").lower()
+            or q in (driver.get("employee_id") or "").lower()
+        ]
+
+        return matches[:10]
+
+    return await supabase_select(
+        "lori_driver_master",
+        {
+            "select": "*",
+            "order": "driver_name.asc",
+            "limit": "25",
+        },
+    )
+
+
+@app.get("/driver-intelligence")
+async def driver_intelligence(
+    api_key: str = Query(...),
+    employee_id: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    question: Optional[str] = Query(None),
+):
+    """
+    Main driver intelligence endpoint for Voiceflow.
+    Answers deeper questions about a driver using all driver intelligence tables.
+    """
+    require_lori_key(api_key)
+
+    return await get_driver_intelligence_payload(
+        employee_id=employee_id,
+        driver_name=driver_name,
+        question=question,
+    )
+
+
+@app.get("/driver-compliance-watch")
+async def driver_compliance_watch(
+    api_key: str = Query(...),
+    days: int = Query(30, ge=0, le=365),
+):
+    """
+    Show drivers with expired or upcoming credentials.
+    """
+    require_lori_key(api_key)
+
+    credentials = await supabase_select(
+        "lori_driver_credentials",
+        {
+            "select": "*",
+            "order": "days_until_expiration.asc",
+        },
+    )
+
+    results = []
+
+    for credential in credentials:
+        days_until = credential.get("days_until_expiration")
+        status = (credential.get("credential_status") or "").lower()
+
+        include = False
+
+        if days_until is not None:
+            try:
+                include = int(days_until) <= days
+            except Exception:
+                include = False
+
+        if status in ["expired", "overdue"]:
+            include = True
+
+        if include:
+            results.append(credential)
+
+    return {
+        "status": "success",
+        "watch_window_days": days,
+        "drivers_found": len(results),
+        "credentials": results,
+        "answer_text": f"I found {len(results)} credential records that are expired, overdue, or due within {days} days.",
+    }
+
+
+@app.get("/driver-counseling-due")
+async def driver_counseling_due(
+    api_key: str = Query(...),
+    days: int = Query(30, ge=0, le=365),
+):
+    """
+    Show open counseling follow-ups due within a date window.
+    """
+    require_lori_key(api_key)
+
+    counseling_rows = await supabase_select(
+        "lori_driver_counseling",
+        {
+            "select": "*",
+            "order": "follow_up_date.asc",
+        },
+    )
+
+    today = date.today()
+    results = []
+
+    for row in counseling_rows:
+        if (row.get("status") or "").lower() != "open":
+            continue
+
+        follow_up_date = parse_date_safe(row.get("follow_up_date"))
+
+        if follow_up_date is None:
+            continue
+
+        days_until = (follow_up_date - today).days
+
+        if days_until <= days:
+            row["days_until_follow_up"] = days_until
+            results.append(row)
+
+    return {
+        "status": "success",
+        "watch_window_days": days,
+        "drivers_found": len(results),
+        "counseling_follow_ups": results,
+        "answer_text": f"I found {len(results)} open counseling follow-ups due within {days} days.",
+    }
+
+
+@app.get("/driver-birthday-watch")
+async def driver_birthday_watch(
+    api_key: str = Query(...),
+    month: Optional[int] = Query(None, ge=1, le=12),
+):
+    """
+    Show driver birthdays by month. Stores only month/day for privacy.
+    """
+    require_lori_key(api_key)
+
+    selected_month = month or date.today().month
+
+    drivers = await supabase_select(
+        "lori_driver_master",
+        {
+            "select": "*",
+            "birthday_month": f"eq.{selected_month}",
+            "order": "birthday_day.asc",
+        },
+    )
+
+    results = []
+
+    for driver in drivers:
+        results.append(
+            {
+                "employee_id": driver.get("employee_id"),
+                "driver_name": driver.get("driver_name"),
+                "preferred_name": driver.get("preferred_name"),
+                "supervisor_name": driver.get("supervisor_name"),
+                "location_name": driver.get("location_name"),
+                "birthday": format_birthday(driver.get("birthday_month"), driver.get("birthday_day")),
+                "privacy_note": "Only birthday month and day are stored in this demo.",
+            }
+        )
+
+    return {
+        "status": "success",
+        "month": selected_month,
+        "month_name": MONTH_NAMES.get(selected_month, str(selected_month)),
+        "drivers_found": len(results),
+        "birthdays": results,
+        "answer_text": f"I found {len(results)} driver birthdays in {MONTH_NAMES.get(selected_month, str(selected_month))}.",
+    }
