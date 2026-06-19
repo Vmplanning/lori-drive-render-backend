@@ -791,3 +791,284 @@ async def parse_driver_performance(
         "updated_batch": updated_batch,
         "next_step": "Connect parsed driver records to dashboard, reports, and LORI assistant workflows.",
     }
+def uploaded_risk_summary_from_rows(drivers: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Summarize parsed uploaded driver rows by calculated risk level."""
+    summary = {
+        "Corrective Action": 0,
+        "Watch List": 0,
+        "Solid Performer": 0,
+        "Elite Performer": 0,
+    }
+
+    for driver in drivers:
+        risk = driver.get("calculated_risk_level") or "Unclassified"
+        summary[risk] = summary.get(risk, 0) + 1
+
+    return summary
+
+
+def driver_score_for_sort(driver: Dict[str, Any]) -> float:
+    """Return a usable score for sorting uploaded drivers."""
+    score = parse_float(driver.get("overall_score"))
+    return score if score is not None else 0.0
+
+
+async def get_uploaded_batch_or_latest(batch_code: Optional[str]) -> Dict[str, Any]:
+    """Get a requested uploaded batch or the latest uploaded batch."""
+    if batch_code:
+        rows = await supabase_select(
+            "lori_batch_uploads",
+            {
+                "select": "*",
+                "batch_code": f"eq.{batch_code}",
+                "limit": "1",
+            },
+        )
+    else:
+        rows = await supabase_select(
+            "lori_batch_uploads",
+            {
+                "select": "*",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No uploaded batch found.")
+
+    return rows[0]
+
+
+async def get_uploaded_driver_rows(batch_code: str) -> List[Dict[str, Any]]:
+    """Get parsed uploaded driver score rows for a batch."""
+    return await supabase_select(
+        "lori_uploaded_driver_scores",
+        {
+            "select": "*",
+            "batch_code": f"eq.{batch_code}",
+            "order": "overall_score.desc",
+        },
+    )
+
+
+@app.get("/uploaded-batch-summary")
+async def uploaded_batch_summary(
+    api_key: str = Query(...),
+    batch_code: Optional[str] = Query(None),
+):
+    """
+    Summary for the latest or requested uploaded/parsed batch.
+    Used by the Lovable dashboard.
+    """
+    require_lori_key(api_key)
+
+    batch = await get_uploaded_batch_or_latest(batch_code)
+    resolved_batch_code = batch["batch_code"]
+
+    drivers = await get_uploaded_driver_rows(resolved_batch_code)
+    risk_summary = uploaded_risk_summary_from_rows(drivers)
+
+    response_text = (
+        f"Uploaded batch {resolved_batch_code} is {batch.get('batch_status')}. "
+        f"I found {len(drivers)} parsed driver records. "
+        f"Risk summary: {risk_summary.get('Corrective Action', 0)} driver requires corrective action, "
+        f"{risk_summary.get('Watch List', 0)} drivers are on the watch list, "
+        f"{risk_summary.get('Solid Performer', 0)} are solid performers, and "
+        f"{risk_summary.get('Elite Performer', 0)} are elite performers."
+    )
+
+    return {
+        "status": "success",
+        "batch_code": resolved_batch_code,
+        "batch_status": batch.get("batch_status"),
+        "organization_name": batch.get("organization_name"),
+        "location_name": batch.get("location_name"),
+        "location_code": batch.get("location_code"),
+        "uploaded_by": batch.get("uploaded_by"),
+        "report_period_start": batch.get("report_period_start"),
+        "report_period_end": batch.get("report_period_end"),
+        "total_files": batch.get("total_files"),
+        "total_drivers_found": len(drivers),
+        "risk_summary": risk_summary,
+        "response_text": response_text,
+        "next_step": "Use this uploaded batch summary to power the leadership dashboard and report cards.",
+    }
+
+
+@app.get("/uploaded-risk-summary")
+async def uploaded_risk_summary(
+    api_key: str = Query(...),
+    batch_code: Optional[str] = Query(None),
+):
+    """
+    Risk summary from parsed uploaded driver records.
+    """
+    require_lori_key(api_key)
+
+    batch = await get_uploaded_batch_or_latest(batch_code)
+    resolved_batch_code = batch["batch_code"]
+    drivers = await get_uploaded_driver_rows(resolved_batch_code)
+
+    summary = uploaded_risk_summary_from_rows(drivers)
+
+    return [
+        {"risk_level": "Corrective Action", "driver_count": summary.get("Corrective Action", 0)},
+        {"risk_level": "Watch List", "driver_count": summary.get("Watch List", 0)},
+        {"risk_level": "Solid Performer", "driver_count": summary.get("Solid Performer", 0)},
+        {"risk_level": "Elite Performer", "driver_count": summary.get("Elite Performer", 0)},
+    ]
+
+
+@app.get("/uploaded-worst-drivers")
+async def uploaded_worst_drivers(
+    api_key: str = Query(...),
+    batch_code: Optional[str] = Query(None),
+    limit: int = Query(3, ge=1, le=25),
+):
+    """
+    Highest-risk drivers from parsed uploaded batch data.
+    """
+    require_lori_key(api_key)
+
+    batch = await get_uploaded_batch_or_latest(batch_code)
+    resolved_batch_code = batch["batch_code"]
+    drivers = await get_uploaded_driver_rows(resolved_batch_code)
+
+    risk_order = {
+        "Corrective Action": 1,
+        "Watch List": 2,
+        "Solid Performer": 3,
+        "Elite Performer": 4,
+    }
+
+    sorted_drivers = sorted(
+        drivers,
+        key=lambda d: (
+            risk_order.get(d.get("calculated_risk_level") or "", 99),
+            driver_score_for_sort(d),
+        ),
+    )
+
+    results = []
+
+    for driver in sorted_drivers[:limit]:
+        results.append(
+            {
+                "employee_id": driver.get("employee_id"),
+                "driver_name": driver.get("driver_name"),
+                "supervisor_name": driver.get("supervisor_name"),
+                "route_id": driver.get("route_id"),
+                "risk_level": driver.get("calculated_risk_level"),
+                "overall_score": driver.get("overall_score"),
+                "missed_deliveries": driver.get("missed_deliveries"),
+                "customer_complaints": driver.get("customer_complaints"),
+                "recommended_action": driver.get("recommended_action"),
+                "batch_code": resolved_batch_code,
+            }
+        )
+
+    return results
+
+
+@app.get("/uploaded-best-drivers")
+async def uploaded_best_drivers(
+    api_key: str = Query(...),
+    batch_code: Optional[str] = Query(None),
+    limit: int = Query(3, ge=1, le=25),
+):
+    """
+    Best drivers from parsed uploaded batch data.
+    """
+    require_lori_key(api_key)
+
+    batch = await get_uploaded_batch_or_latest(batch_code)
+    resolved_batch_code = batch["batch_code"]
+    drivers = await get_uploaded_driver_rows(resolved_batch_code)
+
+    sorted_drivers = sorted(
+        drivers,
+        key=lambda d: driver_score_for_sort(d),
+        reverse=True,
+    )
+
+    results = []
+
+    for driver in sorted_drivers[:limit]:
+        results.append(
+            {
+                "employee_id": driver.get("employee_id"),
+                "driver_name": driver.get("driver_name"),
+                "supervisor_name": driver.get("supervisor_name"),
+                "route_id": driver.get("route_id"),
+                "risk_level": driver.get("calculated_risk_level"),
+                "overall_score": driver.get("overall_score"),
+                "on_time_rate": driver.get("on_time_rate"),
+                "routes_completed": driver.get("routes_completed"),
+                "recommended_action": driver.get("recommended_action"),
+                "batch_code": resolved_batch_code,
+            }
+        )
+
+    return results
+
+
+@app.get("/uploaded-driver-360")
+async def uploaded_driver_360(
+    api_key: str = Query(...),
+    batch_code: Optional[str] = Query(None),
+    employee_id: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+):
+    """
+    Driver 360 profile from parsed uploaded batch data.
+    """
+    require_lori_key(api_key)
+
+    batch = await get_uploaded_batch_or_latest(batch_code)
+    resolved_batch_code = batch["batch_code"]
+
+    params = {
+        "select": "*",
+        "batch_code": f"eq.{resolved_batch_code}",
+        "limit": "1",
+    }
+
+    if employee_id:
+        params["employee_id"] = f"eq.{employee_id}"
+    elif driver_name:
+        params["driver_name"] = f"ilike.*{driver_name}*"
+    else:
+        params["order"] = "overall_score.asc"
+
+    rows = await supabase_select("lori_uploaded_driver_scores", params)
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No uploaded driver profile found for the provided search.",
+        )
+
+    driver = rows[0]
+
+    return {
+        "batch_code": resolved_batch_code,
+        "employee_id": driver.get("employee_id"),
+        "driver_name": driver.get("driver_name"),
+        "supervisor_name": driver.get("supervisor_name"),
+        "route_id": driver.get("route_id"),
+        "delivery_station": driver.get("delivery_station"),
+        "tenure_months": driver.get("tenure_months"),
+        "routes_completed": driver.get("routes_completed"),
+        "on_time_rate": driver.get("on_time_rate"),
+        "missed_deliveries": driver.get("missed_deliveries"),
+        "customer_complaints": driver.get("customer_complaints"),
+        "overall_score": driver.get("overall_score"),
+        "safety_score": driver.get("safety_score"),
+        "route_score": driver.get("route_score"),
+        "payroll_score": driver.get("payroll_score"),
+        "training_score": driver.get("training_score"),
+        "risk_level": driver.get("calculated_risk_level"),
+        "recommended_action": driver.get("recommended_action"),
+        "source_file_name": driver.get("source_file_name"),
+    }
