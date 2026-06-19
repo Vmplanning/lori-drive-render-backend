@@ -1769,7 +1769,49 @@ async def lori_supabase_upsert_driver_master(payload: dict):
     except Exception:
         return {"raw_response": response.text}
 
+def lori_normalize_birthday_month(value):
+    if value is None:
+        return None
 
+    text = str(value).strip()
+
+    if text == "":
+        return None
+
+    month_lookup = {
+        "1": 1, "01": 1, "jan": 1, "january": 1,
+        "2": 2, "02": 2, "feb": 2, "february": 2,
+        "3": 3, "03": 3, "mar": 3, "march": 3,
+        "4": 4, "04": 4, "apr": 4, "april": 4,
+        "5": 5, "05": 5, "may": 5,
+        "6": 6, "06": 6, "jun": 6, "june": 6,
+        "7": 7, "07": 7, "jul": 7, "july": 7,
+        "8": 8, "08": 8, "aug": 8, "august": 8,
+        "9": 9, "09": 9, "sep": 9, "sept": 9, "september": 9,
+        "10": 10, "oct": 10, "october": 10,
+        "11": 11, "nov": 11, "november": 11,
+        "12": 12, "dec": 12, "december": 12
+    }
+
+    return month_lookup.get(text.lower())
+
+
+def lori_normalize_birthday_day(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if text == "":
+        return None
+
+    try:
+        day = int(text)
+        if day < 1 or day > 31:
+            return None
+        return day
+    except Exception:
+        return None
 @app.post("/new-driver")
 async def create_new_driver(
     driver: NewDriverIntakeRequest,
@@ -1788,7 +1830,8 @@ async def create_new_driver(
 
     if not full_name:
         raise HTTPException(status_code=400, detail="Driver full name is required.")
-
+    birthday_month_value = lori_normalize_birthday_month(driver.birthday_month)
+    birthday_day_value = lori_normalize_birthday_day(driver.birthday_day)
     master_payload = {
         "employee_id": employee_id,
         "driver_name": full_name,
@@ -1803,8 +1846,8 @@ async def create_new_driver(
         "station_operation": driver.station_operation,
         "phone_last4": driver.phone_last4,
         "email": driver.email,
-        "birthday_month": driver.birthday_month,
-        "birthday_day": driver.birthday_day,
+                "birthday_month": birthday_month_value,
+        "birthday_day": birthday_day_value,
         "record_source": "Manual New Driver Intake",
         "created_at": now_value,
         "updated_at": now_value
