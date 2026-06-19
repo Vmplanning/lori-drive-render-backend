@@ -3,7 +3,7 @@ import re
 import uuid
 import csv
 import io
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
