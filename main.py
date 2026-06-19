@@ -1,6 +1,8 @@
 import os
 import re
 import uuid
+import csv
+import io
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -460,4 +462,332 @@ async def upload_batch(
         "uploaded_files": uploaded_file_results,
         "batch_record": batch_record,
         "next_step": "Connect file parsing, scoring, dashboard refresh, and report generation.",
+    }
+def parse_int(value: Any) -> Optional[int]:
+    """Safely convert CSV values into integers."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return None
+
+
+def parse_float(value: Any) -> Optional[float]:
+    """Safely convert CSV values into numbers."""
+    if value is None or value == "":
+        return None
+    try:
+        cleaned = str(value).strip().replace("%", "")
+        number = float(cleaned)
+        return number
+    except Exception:
+        return None
+
+
+def normalize_on_time_rate(value: Any) -> Optional[float]:
+    """Normalize on-time rate values into decimal format when possible."""
+    number = parse_float(value)
+    if number is None:
+        return None
+    if number > 1 and number <= 100:
+        return round(number / 100, 4)
+    return number
+
+
+def calculate_uploaded_driver_risk(
+    overall_score: Optional[float],
+    missed_deliveries: Optional[int],
+    customer_complaints: Optional[int],
+) -> str:
+    """Assign a basic risk level from uploaded driver performance data."""
+    score = overall_score if overall_score is not None else 75
+    missed = missed_deliveries or 0
+    complaints = customer_complaints or 0
+
+    if score < 65 or missed >= 5 or complaints >= 2:
+        return "Corrective Action"
+    if score < 80 or missed >= 3 or complaints >= 1:
+        return "Watch List"
+    if score < 90:
+        return "Solid Performer"
+    return "Elite Performer"
+
+
+def build_uploaded_driver_action(risk_level: str) -> str:
+    """Create a leadership-ready recommended action."""
+    if risk_level == "Corrective Action":
+        return "Prioritize supervisor review, coaching documentation, and follow-up before additional route escalation."
+    if risk_level == "Watch List":
+        return "Schedule coaching conversation and monitor next reporting cycle for safety, route, or service improvement."
+    if risk_level == "Solid Performer":
+        return "Maintain standard performance monitoring and consider targeted recognition if trend remains positive."
+    return "Recognize as a strong performer and consider for peer mentoring, route leadership, or positive reinforcement."
+
+
+async def supabase_select(table_name: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Select rows from Supabase through the REST API."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase environment variables are not configured.")
+
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(url, headers=headers, params=params)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "message": "Supabase select failed.",
+                "table": table_name,
+                "supabase_status": response.status_code,
+                "supabase_response": response.text,
+            },
+        )
+
+    return response.json()
+
+
+async def supabase_delete_by_batch(table_name: str, batch_code: str) -> None:
+    """Delete existing parsed records for a batch before re-parsing."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase environment variables are not configured.")
+
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.delete(
+            url,
+            headers=headers,
+            params={"batch_code": f"eq.{batch_code}"},
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "message": "Supabase delete failed.",
+                "table": table_name,
+                "supabase_status": response.status_code,
+                "supabase_response": response.text,
+            },
+        )
+
+
+async def supabase_update_by_batch(
+    table_name: str,
+    batch_code: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Update a Supabase row by batch code."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase environment variables are not configured.")
+
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.patch(
+            url,
+            headers=headers,
+            params={"batch_code": f"eq.{batch_code}"},
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "message": "Supabase update failed.",
+                "table": table_name,
+                "supabase_status": response.status_code,
+                "supabase_response": response.text,
+            },
+        )
+
+    rows = response.json()
+    return rows[0] if rows else {}
+
+
+async def download_from_supabase_storage(bucket_name: str, storage_path: str) -> bytes:
+    """Download an uploaded file from Supabase Storage."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase environment variables are not configured.")
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket_name}/{storage_path}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.get(url, headers=headers)
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail={
+                "message": "Supabase storage download failed.",
+                "bucket": bucket_name,
+                "path": storage_path,
+                "supabase_status": response.status_code,
+                "supabase_response": response.text,
+            },
+        )
+
+    return response.content
+
+
+def parse_driver_performance_csv(
+    file_bytes: bytes,
+    batch_code: str,
+    source_file_name: str,
+) -> List[Dict[str, Any]]:
+    """Parse the uploaded Driver Performance CSV into normalized driver records."""
+    text = file_bytes.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+
+    parsed_rows: List[Dict[str, Any]] = []
+
+    for row in reader:
+        employee_id = (row.get("employee_id") or "").strip()
+        driver_name = (row.get("driver_name") or "").strip()
+        supervisor_name = (row.get("supervisor_name") or "").strip()
+        route_id = (row.get("route_id") or "").strip()
+        delivery_station = (row.get("delivery_station") or "").strip()
+
+        tenure_months = parse_int(row.get("tenure_months"))
+        routes_completed = parse_int(row.get("routes_completed"))
+        on_time_rate = normalize_on_time_rate(row.get("on_time_rate"))
+        missed_deliveries = parse_int(row.get("missed_deliveries"))
+        customer_complaints = parse_int(row.get("customer_complaints"))
+        overall_score = parse_float(row.get("overall_score"))
+
+        risk_level = calculate_uploaded_driver_risk(
+            overall_score=overall_score,
+            missed_deliveries=missed_deliveries,
+            customer_complaints=customer_complaints,
+        )
+
+        parsed_rows.append(
+            {
+                "batch_code": batch_code,
+                "employee_id": employee_id,
+                "driver_name": driver_name,
+                "supervisor_name": supervisor_name,
+                "route_id": route_id,
+                "delivery_station": delivery_station,
+                "tenure_months": tenure_months,
+                "routes_completed": routes_completed,
+                "on_time_rate": on_time_rate,
+                "missed_deliveries": missed_deliveries,
+                "customer_complaints": customer_complaints,
+                "overall_score": overall_score,
+                "safety_score": None,
+                "route_score": None,
+                "payroll_score": None,
+                "training_score": None,
+                "calculated_risk_level": risk_level,
+                "recommended_action": build_uploaded_driver_action(risk_level),
+                "source_file_name": source_file_name,
+            }
+        )
+
+    return parsed_rows
+
+
+@app.post("/parse-driver-performance")
+async def parse_driver_performance(
+    batch_code: str = Query(...),
+    api_key: str = Query(...),
+):
+    """
+    Parses the uploaded Driver Performance CSV for a batch,
+    stores driver records in Supabase,
+    and updates the batch upload record.
+    """
+    require_lori_key(api_key)
+
+    file_rows = await supabase_select(
+        "lori_uploaded_files",
+        {
+            "select": "*",
+            "batch_code": f"eq.{batch_code}",
+            "file_type": "eq.Driver Performance File",
+            "order": "uploaded_at.desc",
+            "limit": "1",
+        },
+    )
+
+    if not file_rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No Driver Performance File found for batch {batch_code}.",
+        )
+
+    file_record = file_rows[0]
+    bucket_name = file_record.get("storage_bucket") or "lori-batch-uploads"
+    storage_path = file_record.get("storage_path")
+    source_file_name = file_record.get("original_file_name") or "driver_performance.csv"
+
+    if not storage_path:
+        raise HTTPException(status_code=500, detail="Uploaded file record is missing storage_path.")
+
+    file_bytes = await download_from_supabase_storage(bucket_name, storage_path)
+
+    parsed_rows = parse_driver_performance_csv(
+        file_bytes=file_bytes,
+        batch_code=batch_code,
+        source_file_name=source_file_name,
+    )
+
+    await supabase_delete_by_batch("lori_uploaded_driver_scores", batch_code)
+
+    inserted_count = 0
+    risk_summary: Dict[str, int] = {}
+
+    for parsed_row in parsed_rows:
+        await supabase_insert("lori_uploaded_driver_scores", parsed_row)
+        inserted_count += 1
+        risk = parsed_row.get("calculated_risk_level") or "Unclassified"
+        risk_summary[risk] = risk_summary.get(risk, 0) + 1
+
+    updated_batch = await supabase_update_by_batch(
+        "lori_batch_uploads",
+        batch_code,
+        {
+            "batch_status": "parsed",
+            "total_drivers_found": inserted_count,
+            "notes": f"Driver Performance File parsed successfully. {inserted_count} driver records inserted.",
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "Driver Performance File parsed successfully.",
+        "batch_code": batch_code,
+        "source_file_name": source_file_name,
+        "drivers_parsed": inserted_count,
+        "risk_summary": risk_summary,
+        "batch_status": "parsed",
+        "updated_batch": updated_batch,
+        "next_step": "Connect parsed driver records to dashboard, reports, and LORI assistant workflows.",
     }
