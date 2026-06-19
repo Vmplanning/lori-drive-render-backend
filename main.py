@@ -1664,3 +1664,266 @@ async def driver_birthday_watch(
         "birthdays": results,
         "answer_text": f"I found {len(results)} driver birthdays in {MONTH_NAMES.get(selected_month, str(selected_month))}.",
     }
+# ============================================================
+# LORI DRIVE — NEW DRIVER INTAKE ENDPOINT
+# Saves a manually entered driver into Supabase.
+# Demonstration Data Only — Not Company Proprietary Data
+# ============================================================
+
+class NewDriverIntakeRequest(BaseModel):
+    employee_id: str
+    full_name: str
+    preferred_name: Optional[str] = None
+    driver_role: Optional[str] = None
+    employment_status: Optional[str] = None
+    hire_date: Optional[str] = None
+
+    supervisor_name: Optional[str] = None
+    location: Optional[str] = None
+    location_code: Optional[str] = None
+    primary_route_id: Optional[str] = None
+    station_operation: Optional[str] = None
+
+    phone_last4: Optional[str] = None
+    email: Optional[str] = None
+
+    birthday_month: Optional[str] = None
+    birthday_day: Optional[str] = None
+
+    dot_medical_card_expiration: Optional[str] = None
+    cdl_license_status: Optional[str] = None
+    license_class: Optional[str] = None
+    defensive_driving_status: Optional[str] = None
+    training_status: Optional[str] = None
+
+    driver_qualification_file_status: Optional[str] = None
+    onboarding_checklist_status: Optional[str] = None
+    background_screening_status: Optional[str] = None
+    initial_safety_orientation_status: Optional[str] = None
+
+    manager_notes: Optional[str] = None
+    compliance_notes: Optional[str] = None
+    supervisor_notes: Optional[str] = None
+
+
+def lori_supabase_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+
+
+async def lori_supabase_insert(table_name: str, payload: dict):
+    url = f"{SUPABASE_URL}/rest/v1/{table_name}"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            url,
+            headers=lori_supabase_headers(),
+            json=payload
+        )
+
+    if response.status_code not in [200, 201]:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": f"Supabase insert failed for {table_name}",
+                "status_code": response.status_code,
+                "response": response.text
+            }
+        )
+
+    try:
+        return response.json()
+    except Exception:
+        return {"raw_response": response.text}
+
+
+async def lori_supabase_upsert_driver_master(payload: dict):
+    url = f"{SUPABASE_URL}/rest/v1/lori_driver_master?on_conflict=employee_id"
+
+    headers = lori_supabase_headers()
+    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            url,
+            headers=headers,
+            json=payload
+        )
+
+    if response.status_code not in [200, 201]:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Supabase upsert failed for lori_driver_master",
+                "status_code": response.status_code,
+                "response": response.text
+            }
+        )
+
+    try:
+        return response.json()
+    except Exception:
+        return {"raw_response": response.text}
+
+
+@app.post("/new-driver")
+async def create_new_driver(
+    driver: NewDriverIntakeRequest,
+    api_key: str = Query(None)
+):
+    if api_key != LORI_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+    now_value = datetime.utcnow().isoformat()
+
+    employee_id = driver.employee_id.strip()
+    full_name = driver.full_name.strip()
+
+    if not employee_id:
+        raise HTTPException(status_code=400, detail="Employee ID is required.")
+
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Driver full name is required.")
+
+    master_payload = {
+        "employee_id": employee_id,
+        "driver_name": full_name,
+        "preferred_name": driver.preferred_name,
+        "driver_role": driver.driver_role,
+        "employment_status": driver.employment_status or "Active",
+        "hire_date": driver.hire_date,
+        "supervisor_name": driver.supervisor_name,
+        "location": driver.location,
+        "location_code": driver.location_code,
+        "primary_route_id": driver.primary_route_id,
+        "station_operation": driver.station_operation,
+        "phone_last4": driver.phone_last4,
+        "email": driver.email,
+        "birthday_month": driver.birthday_month,
+        "birthday_day": driver.birthday_day,
+        "record_source": "Manual New Driver Intake",
+        "created_at": now_value,
+        "updated_at": now_value
+    }
+
+    master_payload = {k: v for k, v in master_payload.items() if v is not None}
+
+    saved_master = await lori_supabase_upsert_driver_master(master_payload)
+
+    credential_records_created = []
+
+    if driver.dot_medical_card_expiration:
+        dot_payload = {
+            "employee_id": employee_id,
+            "credential_type": "DOT Medical Card",
+            "credential_status": "Active",
+            "expiration_date": driver.dot_medical_card_expiration,
+            "notes": "Created through LORI New Driver Intake.",
+            "created_at": now_value,
+            "updated_at": now_value
+        }
+        credential_records_created.append(
+            await lori_supabase_insert("lori_driver_credentials", dot_payload)
+        )
+
+    if driver.cdl_license_status or driver.license_class:
+        license_payload = {
+            "employee_id": employee_id,
+            "credential_type": "CDL / License",
+            "credential_status": driver.cdl_license_status or "Needs Review",
+            "license_class": driver.license_class,
+            "notes": "Created through LORI New Driver Intake.",
+            "created_at": now_value,
+            "updated_at": now_value
+        }
+        license_payload = {k: v for k, v in license_payload.items() if v is not None}
+        credential_records_created.append(
+            await lori_supabase_insert("lori_driver_credentials", license_payload)
+        )
+
+    onboarding_notes = []
+
+    if driver.driver_qualification_file_status:
+        onboarding_notes.append(f"Driver Qualification File: {driver.driver_qualification_file_status}")
+
+    if driver.onboarding_checklist_status:
+        onboarding_notes.append(f"Onboarding Checklist: {driver.onboarding_checklist_status}")
+
+    if driver.background_screening_status:
+        onboarding_notes.append(f"Background / Screening: {driver.background_screening_status}")
+
+    if driver.initial_safety_orientation_status:
+        onboarding_notes.append(f"Initial Safety Orientation: {driver.initial_safety_orientation_status}")
+
+    if driver.training_status:
+        onboarding_notes.append(f"Training Status: {driver.training_status}")
+
+    if driver.defensive_driving_status:
+        onboarding_notes.append(f"Defensive Driving Certification: {driver.defensive_driving_status}")
+
+    note_text_parts = []
+
+    if onboarding_notes:
+        note_text_parts.append("Compliance Setup:\n" + "\n".join(onboarding_notes))
+
+    if driver.manager_notes:
+        note_text_parts.append("Manager Notes:\n" + driver.manager_notes)
+
+    if driver.compliance_notes:
+        note_text_parts.append("Compliance Notes:\n" + driver.compliance_notes)
+
+    if driver.supervisor_notes:
+        note_text_parts.append("Supervisor Notes:\n" + driver.supervisor_notes)
+
+    note_record_created = None
+
+    if note_text_parts:
+        note_payload = {
+            "employee_id": employee_id,
+            "note_type": "New Driver Intake",
+            "note_text": "\n\n".join(note_text_parts),
+            "created_by": "LORI New Driver Intake",
+            "created_at": now_value,
+            "updated_at": now_value
+        }
+        note_record_created = await lori_supabase_insert("lori_driver_notes", note_payload)
+
+    timeline_payload = {
+        "employee_id": employee_id,
+        "event_type": "New Driver Created",
+        "event_title": "New driver profile created",
+        "event_summary": f"{full_name} was manually added to LORI and staged for compliance review.",
+        "created_at": now_value
+    }
+
+    timeline_record_created = None
+
+    try:
+        timeline_record_created = await lori_supabase_insert("lori_driver_timeline", timeline_payload)
+    except Exception:
+        timeline_record_created = {
+            "status": "timeline_not_created",
+            "message": "Driver was saved, but the timeline record could not be created."
+        }
+
+    return {
+        "status": "success",
+        "message": "New driver profile created and staged for compliance review.",
+        "employee_id": employee_id,
+        "driver_name": full_name,
+        "saved_master_record": saved_master,
+        "credential_records_created": credential_records_created,
+        "note_record_created": note_record_created,
+        "timeline_record_created": timeline_record_created,
+        "next_steps": [
+            "Open Driver 360",
+            "Review driver file readiness",
+            "Add missing credentials",
+            "Assign supervisor follow-up",
+            "Confirm DOT/FMCSA-sensitive records against official company files"
+        ]
+    }
