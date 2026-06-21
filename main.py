@@ -2555,3 +2555,222 @@ async def run_regulatory_scan(
             "official federal, state, DOT/FMCSA, HR, compliance, labor relations, or legal sources before formal action."
         ),
     }
+# ============================================================
+# LORI REGULATORY INTELLIGENCE
+# Company-Specific Filter Override
+# Focus: Food distribution / commercial delivery fleet
+# Excludes irrelevant aviation / FAA / aircraft updates
+# ============================================================
+
+COMPANY_PROFILE_NAME = "Food Authority / Food Distribution Delivery Fleet"
+
+COMPANY_RELEVANT_KEYWORDS = [
+    "fmcsa",
+    "federal motor carrier safety administration",
+    "dot",
+    "department of transportation",
+    "motor carrier",
+    "commercial motor vehicle",
+    "cmv",
+    "carrier",
+    "driver",
+    "drivers",
+    "cdl",
+    "commercial driver's license",
+    "commercial driver",
+    "driver qualification",
+    "driver qualification file",
+    "dqf",
+    "medical card",
+    "dot medical",
+    "medical examiner",
+    "hours of service",
+    "hos",
+    "electronic logging",
+    "eld",
+    "drug",
+    "alcohol",
+    "controlled substance",
+    "testing",
+    "safety",
+    "inspection",
+    "vehicle inspection",
+    "pre-trip",
+    "post-trip",
+    "fleet",
+    "truck",
+    "trucking",
+    "delivery",
+    "route",
+    "logistics",
+    "transportation",
+    "warehouse",
+    "distribution",
+    "food distribution",
+    "food delivery",
+    "foodservice",
+    "refrigerated",
+    "cold chain",
+    "hazmat",
+    "hazardous materials",
+    "compliance",
+    "rule",
+    "notice",
+    "regulation",
+    "enforcement",
+]
+
+COMPANY_EXCLUDED_KEYWORDS = [
+    "faa",
+    "federal aviation administration",
+    "aviation",
+    "aircraft",
+    "airworthiness",
+    "airspace",
+    "airport",
+    "runway",
+    "helicopter",
+    "rotorcraft",
+    "bell textron",
+    "boeing",
+    "airbus",
+    "flight",
+    "pilot",
+    "federal airway",
+    "vortac",
+    "tacan",
+    "navigation aid",
+    "class e airspace",
+    "domestic very high frequency",
+    "vhf",
+    "air traffic",
+    "aeronautical",
+    "maritime",
+    "vessel",
+    "coast guard",
+    "railroad",
+    "railway",
+    "pipeline safety",
+    "transit rail",
+]
+
+
+def lori_company_text_blob(title: str, summary: str, source: Dict[str, Any]) -> str:
+    return f"""
+    {title or ''}
+    {summary or ''}
+    {source.get('source_name', '') or ''}
+    {source.get('agency', '') or ''}
+    {source.get('category', '') or ''}
+    {source.get('source_type', '') or ''}
+    """.lower()
+
+
+def lori_regulatory_is_relevant(title: str, summary: str, source: Dict[str, Any]) -> bool:
+    """
+    Company-specific relevance filter.
+
+    This keeps LORI focused on a food distribution / commercial delivery
+    transportation operation instead of pulling unrelated DOT items such as
+    FAA, aircraft, helicopter, aviation, airspace, railroad, maritime, or pipeline notices.
+    """
+
+    combined = lori_company_text_blob(title, summary, source)
+
+    # Hard exclude aviation / aircraft / non-fleet transportation categories.
+    if any(excluded in combined for excluded in COMPANY_EXCLUDED_KEYWORDS):
+        return False
+
+    source_name = str(source.get("source_name") or "").lower()
+    agency = str(source.get("agency") or "").lower()
+    category = str(source.get("category") or "").lower()
+
+    # FMCSA sources are highly relevant to commercial fleet operations.
+    if "federal motor carrier safety administration" in agency:
+        return True
+
+    if "fmcsa" in source_name or "fmcsa" in category:
+        return True
+
+    # DOT items must still match company-relevant transportation operations.
+    if any(keyword in combined for keyword in COMPANY_RELEVANT_KEYWORDS):
+        return True
+
+    return False
+
+
+async def lori_regulatory_fetch_federal_register(source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Company-specific Federal Register scanner.
+
+    Only scans FMCSA documents for now.
+    Avoids broad DOT-wide Federal Register pulls that include FAA aviation,
+    aircraft, helicopter, airspace, railroad, maritime, and unrelated items.
+    """
+
+    items: List[Dict[str, Any]] = []
+
+    api_urls = [
+        "https://www.federalregister.gov/api/v1/documents.json?conditions%5Bagencies%5D%5B%5D=federal-motor-carrier-safety-administration&order=newest&per_page=20"
+    ]
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for api_url in api_urls:
+            response = await client.get(
+                api_url,
+                headers={"User-Agent": "LORI-Regulatory-Scanner/1.0"},
+            )
+
+            if response.status_code >= 400:
+                continue
+
+            data = response.json()
+
+            for doc in data.get("results", []):
+                title = lori_regulatory_clean_text(doc.get("title"))
+                summary = lori_regulatory_clean_text(doc.get("abstract") or doc.get("type"))
+                url = doc.get("html_url") or doc.get("pdf_url") or doc.get("public_inspection_pdf_url")
+                published_at = lori_regulatory_parse_date(doc.get("publication_date"))
+
+                if not title:
+                    continue
+
+                if not lori_regulatory_is_relevant(title, summary, source):
+                    continue
+
+                items.append(
+                    {
+                        "title": title,
+                        "summary": summary,
+                        "url": url,
+                        "published_at": published_at,
+                        "raw": {
+                            "source": "federal_register",
+                            "company_profile": COMPANY_PROFILE_NAME,
+                            "document_number": doc.get("document_number"),
+                            "type": doc.get("type"),
+                            "publication_date": doc.get("publication_date"),
+                            "agencies": doc.get("agencies"),
+                        },
+                    }
+                )
+
+    return items[:20]
+
+
+def lori_regulatory_build_operational_impact(item: Dict[str, Any]) -> str:
+    return (
+        "This update may require review for potential impact on commercial delivery operations, "
+        "driver qualification, DOT/FMCSA compliance readiness, fleet safety, vehicle inspection, "
+        "driver policy, supervisor briefing, training, audit readiness, or leadership awareness. "
+        "It should be reviewed for relevance to food distribution, delivery routes, commercial drivers, "
+        "warehouse-to-customer transportation, and fleet operations."
+    )
+
+
+def lori_regulatory_build_recommended_preparation(item: Dict[str, Any]) -> str:
+    return (
+        "Review the official source, confirm whether the update applies to the company’s commercial delivery fleet, "
+        "identify affected drivers, supervisors, vehicles, routes, policies, or audit areas, determine whether training "
+        "or policy updates are needed, and prepare a leadership briefing if operational impact is confirmed."
+    )
