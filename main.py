@@ -5445,3 +5445,1627 @@ Compliance Note:
         "briefing_item": briefing_item,
         "answer_text": answer_text,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# KPI ACTION PLANS BACKEND
+# Universal KPI upload, KPI detection, multiple KPI action plans,
+# beautiful print-ready plans, Action Center integration,
+# and Leadership Briefing integration.
+# ============================================================
+
+from fastapi import UploadFile, File, Body
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import date, datetime, timedelta
+from urllib.parse import quote
+import csv
+import io
+import os
+import re
+import uuid
+import html
+import json
+import math
+
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
+
+
+KPI_ACTION_UPLOAD_BUCKET = "kpi-action-plan-uploads"
+
+
+def lori_kpi_clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def lori_kpi_normalize_column(value: Any) -> str:
+    text = lori_kpi_clean_text(value).lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")
+
+
+def lori_kpi_to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        if math.isnan(value) if isinstance(value, float) else False:
+            return None
+        return float(value)
+
+    text = str(value).strip()
+
+    if not text or text.lower() in {"none", "null", "n/a", "na", "-", "string"}:
+        return None
+
+    text = text.replace(",", "")
+    text = text.replace("$", "")
+    text = text.replace("%", "")
+    text = text.replace("(", "-").replace(")", "")
+
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def lori_kpi_safe_file_name(filename: str) -> str:
+    base = filename or "kpi_upload.csv"
+    base = re.sub(r"[^a-zA-Z0-9._-]+", "_", base)
+    return base[:120]
+
+
+def lori_kpi_detect_direction(kpi_name: str) -> str:
+    name = lori_kpi_clean_text(kpi_name).lower()
+
+    lower_is_better_terms = [
+        "call out",
+        "call-out",
+        "absence",
+        "absentee",
+        "incident",
+        "accident",
+        "complaint",
+        "late",
+        "missed",
+        "failure",
+        "defect",
+        "exception",
+        "overtime",
+        "cost",
+        "violation",
+        "turnover",
+        "damage",
+        "injury",
+        "delay",
+        "risk",
+        "gap",
+        "error",
+        "shortage",
+    ]
+
+    for term in lower_is_better_terms:
+        if term in name:
+            return "lower_is_better"
+
+    return "higher_is_better"
+
+
+def lori_kpi_detect_category(kpi_name: str, raw_row: Optional[Dict[str, Any]] = None) -> str:
+    text = lori_kpi_clean_text(kpi_name).lower()
+
+    if raw_row:
+        text += " " + " ".join([lori_kpi_clean_text(v).lower() for v in raw_row.values()])
+
+    category_rules = [
+        ("Delivery Performance", ["on time", "on-time", "delivery", "route", "dispatch", "window", "completion"]),
+        ("Attendance", ["attendance", "call out", "call-out", "absence", "absentee", "no show", "schedule"]),
+        ("Safety", ["safety", "incident", "accident", "injury", "inspection", "dot", "violation"]),
+        ("Training", ["training", "certification", "completion", "course", "learning"]),
+        ("Payroll / Overtime", ["payroll", "overtime", "hours", "timecard", "exception", "labor cost"]),
+        ("Compliance", ["compliance", "audit", "medical card", "license", "credential", "policy"]),
+        ("Customer Service", ["customer", "complaint", "satisfaction", "service"]),
+        ("Driver Performance", ["driver score", "scorecard", "driver", "performance"]),
+        ("Fleet / Maintenance", ["vehicle", "fleet", "maintenance", "truck", "van", "repair"]),
+        ("Warehouse / Operations", ["warehouse", "dock", "load", "pick", "inventory"]),
+    ]
+
+    for category, terms in category_rules:
+        if any(term in text for term in terms):
+            return category
+
+    return "General Operations"
+
+
+def lori_kpi_status(current: Optional[float], target: Optional[float], direction: str) -> Tuple[str, Optional[float], Optional[float]]:
+    if current is None or target is None:
+        return "Needs Review", None, None
+
+    if direction == "lower_is_better":
+        gap_value = current - target
+        off_track = current > target
+    else:
+        gap_value = current - target
+        off_track = current < target
+
+    if target == 0:
+        gap_percent = None
+    else:
+        gap_percent = round((gap_value / abs(target)) * 100, 2)
+
+    if off_track:
+        return "Off Track", round(gap_value, 2), gap_percent
+
+    return "On Track", round(gap_value, 2), gap_percent
+
+
+def lori_kpi_detect_column_roles(headers: List[str]) -> Dict[str, str]:
+    roles: Dict[str, str] = {}
+
+    for header in headers:
+        normalized = lori_kpi_normalize_column(header)
+
+        if normalized in roles:
+            continue
+
+        if any(term in normalized for term in ["kpi", "metric", "measure", "indicator", "goal_name"]):
+            roles[header] = "kpi_name"
+        elif any(term in normalized for term in ["current", "actual", "value", "result", "performance"]):
+            roles[header] = "current_value"
+        elif any(term in normalized for term in ["target", "goal", "standard", "threshold"]):
+            roles[header] = "target_value"
+        elif any(term in normalized for term in ["baseline", "prior", "previous", "last_period"]):
+            roles[header] = "baseline_value"
+        elif any(term in normalized for term in ["owner", "responsible", "manager"]):
+            roles[header] = "owner_name"
+        elif "supervisor" in normalized:
+            roles[header] = "supervisor_name"
+        elif "driver" in normalized and "score" not in normalized:
+            roles[header] = "driver_name"
+        elif any(term in normalized for term in ["employee", "emp_id", "employee_id"]):
+            roles[header] = "employee_id"
+        elif any(term in normalized for term in ["route", "route_id"]):
+            roles[header] = "route_id"
+        elif any(term in normalized for term in ["location", "site", "station", "facility"]):
+            roles[header] = "location_name"
+        elif any(term in normalized for term in ["category", "type", "department", "function"]):
+            roles[header] = "kpi_category"
+        elif any(term in normalized for term in ["period", "week", "month", "date"]):
+            roles[header] = "reporting_period"
+        elif any(term in normalized for term in ["unit", "measure_unit"]):
+            roles[header] = "measurement_unit"
+        elif "direction" in normalized:
+            roles[header] = "direction"
+        else:
+            roles[header] = "dimension"
+
+    return roles
+
+
+def lori_kpi_parse_csv_bytes(file_bytes: bytes) -> List[Dict[str, Any]]:
+    text = file_bytes.decode("utf-8-sig", errors="ignore")
+
+    if not text.strip():
+        return []
+
+    sample = text[:2048]
+
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+    except Exception:
+        dialect = csv.excel
+
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    rows = []
+
+    for row in reader:
+        clean_row = {
+            lori_kpi_clean_text(k): lori_kpi_clean_text(v)
+            for k, v in row.items()
+            if k is not None
+        }
+
+        if any(str(v).strip() for v in clean_row.values()):
+            rows.append(clean_row)
+
+    return rows
+
+
+def lori_kpi_parse_excel_bytes(file_bytes: bytes) -> List[Dict[str, Any]]:
+    if openpyxl is None:
+        raise Exception("Excel support is not installed. Add openpyxl to requirements.txt.")
+
+    workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    worksheet = workbook.active
+
+    rows_raw = list(worksheet.iter_rows(values_only=True))
+
+    if not rows_raw:
+        return []
+
+    headers = [lori_kpi_clean_text(h) for h in rows_raw[0]]
+    rows = []
+
+    for raw in rows_raw[1:]:
+        row = {}
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+            row[header] = lori_kpi_clean_text(raw[idx]) if idx < len(raw) else ""
+
+        if any(str(v).strip() for v in row.values()):
+            rows.append(row)
+
+    return rows
+
+
+async def lori_kpi_upload_file_to_storage(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+) -> Dict[str, Any]:
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    service_key = (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SUPABASE_SERVICE_KEY")
+        or os.getenv("SUPABASE_KEY")
+        or ""
+    )
+
+    if not supabase_url or not service_key:
+        return {
+            "uploaded": False,
+            "file_path": None,
+            "file_url": None,
+            "error": "Supabase storage environment variables not found.",
+        }
+
+    safe_name = lori_kpi_safe_file_name(filename)
+    file_path = f"{datetime.utcnow().strftime('%Y/%m/%d')}/{uuid.uuid4()}_{safe_name}"
+
+    url = f"{supabase_url}/storage/v1/object/{KPI_ACTION_UPLOAD_BUCKET}/{file_path}"
+
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": content_type or "application/octet-stream",
+        "x-upsert": "true",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(url, headers=headers, content=file_bytes)
+
+    if response.status_code >= 400:
+        return {
+            "uploaded": False,
+            "file_path": file_path,
+            "file_url": None,
+            "error": response.text,
+        }
+
+    return {
+        "uploaded": True,
+        "file_path": file_path,
+        "file_url": f"{supabase_url}/storage/v1/object/{KPI_ACTION_UPLOAD_BUCKET}/{file_path}",
+        "error": None,
+    }
+
+
+def lori_kpi_get_role_column(column_roles: Dict[str, str], role: str) -> Optional[str]:
+    for column, detected_role in column_roles.items():
+        if detected_role == role:
+            return column
+    return None
+
+
+def lori_kpi_build_metric_records(
+    upload_id: str,
+    rows: List[Dict[str, Any]],
+    column_roles: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+    metric_records: List[Dict[str, Any]] = []
+    detected_column_records: List[Dict[str, Any]] = []
+
+    headers = list(rows[0].keys()) if rows else []
+
+    for header in headers:
+        samples = []
+        for row in rows[:5]:
+            value = row.get(header)
+            if value not in [None, ""]:
+                samples.append(value)
+
+        detected_column_records.append({
+            "upload_id": upload_id,
+            "original_column_name": header,
+            "normalized_column_name": lori_kpi_normalize_column(header),
+            "detected_role": column_roles.get(header, "dimension"),
+            "detected_confidence": 0.85 if column_roles.get(header) != "dimension" else 0.45,
+            "sample_values": samples,
+            "notes": "Detected by LORI KPI Action Plans universal column mapper.",
+        })
+
+    kpi_col = lori_kpi_get_role_column(column_roles, "kpi_name")
+    current_col = lori_kpi_get_role_column(column_roles, "current_value")
+    target_col = lori_kpi_get_role_column(column_roles, "target_value")
+    baseline_col = lori_kpi_get_role_column(column_roles, "baseline_value")
+    owner_col = lori_kpi_get_role_column(column_roles, "owner_name")
+    supervisor_col = lori_kpi_get_role_column(column_roles, "supervisor_name")
+    driver_col = lori_kpi_get_role_column(column_roles, "driver_name")
+    employee_col = lori_kpi_get_role_column(column_roles, "employee_id")
+    route_col = lori_kpi_get_role_column(column_roles, "route_id")
+    location_col = lori_kpi_get_role_column(column_roles, "location_name")
+    category_col = lori_kpi_get_role_column(column_roles, "kpi_category")
+    period_col = lori_kpi_get_role_column(column_roles, "reporting_period")
+    unit_col = lori_kpi_get_role_column(column_roles, "measurement_unit")
+    direction_col = lori_kpi_get_role_column(column_roles, "direction")
+
+    can_directly_map = bool(kpi_col and current_col)
+
+    if can_directly_map:
+        for row in rows:
+            kpi_name = lori_kpi_clean_text(row.get(kpi_col))
+
+            if not kpi_name:
+                continue
+
+            current = lori_kpi_to_float(row.get(current_col))
+            target = lori_kpi_to_float(row.get(target_col)) if target_col else None
+            baseline = lori_kpi_to_float(row.get(baseline_col)) if baseline_col else None
+            unit = lori_kpi_clean_text(row.get(unit_col)) if unit_col else ""
+            direction = lori_kpi_clean_text(row.get(direction_col)) if direction_col else ""
+
+            if direction not in {"higher_is_better", "lower_is_better"}:
+                direction = lori_kpi_detect_direction(kpi_name)
+
+            status, gap_value, gap_percent = lori_kpi_status(current, target, direction)
+
+            category = lori_kpi_clean_text(row.get(category_col)) if category_col else ""
+            if not category:
+                category = lori_kpi_detect_category(kpi_name, row)
+
+            metric_records.append({
+                "upload_id": upload_id,
+                "kpi_name": kpi_name,
+                "kpi_category": category,
+                "kpi_description": f"Uploaded KPI metric: {kpi_name}",
+                "current_value": current,
+                "baseline_value": baseline,
+                "target_value": target,
+                "gap_value": gap_value,
+                "gap_percent": gap_percent,
+                "measurement_unit": unit or None,
+                "direction": direction,
+                "kpi_status": status,
+                "reporting_period": lori_kpi_clean_text(row.get(period_col)) if period_col else None,
+                "driver_name": lori_kpi_clean_text(row.get(driver_col)) if driver_col else None,
+                "employee_id": lori_kpi_clean_text(row.get(employee_col)) if employee_col else None,
+                "supervisor_name": lori_kpi_clean_text(row.get(supervisor_col)) if supervisor_col else None,
+                "route_id": lori_kpi_clean_text(row.get(route_col)) if route_col else None,
+                "location_name": lori_kpi_clean_text(row.get(location_col)) if location_col else None,
+                "station_code": "JESSUP-01",
+                "operating_state": "MD",
+                "owner_name": lori_kpi_clean_text(row.get(owner_col)) if owner_col else None,
+                "owner_role": "Owner",
+                "dimensions": {
+                    key: value
+                    for key, value in row.items()
+                    if column_roles.get(key) == "dimension"
+                },
+                "raw_row": row,
+            })
+
+    else:
+        numeric_columns = []
+        dimension_columns = []
+
+        for header in headers:
+            numeric_count = sum(1 for row in rows if lori_kpi_to_float(row.get(header)) is not None)
+
+            if numeric_count >= max(1, len(rows) // 2):
+                numeric_columns.append(header)
+            else:
+                dimension_columns.append(header)
+
+        target_like_columns = [
+            h for h in numeric_columns
+            if any(term in lori_kpi_normalize_column(h) for term in ["target", "goal", "standard"])
+        ]
+
+        current_like_columns = [
+            h for h in numeric_columns
+            if h not in target_like_columns
+        ]
+
+        for row in rows:
+            for metric_col in current_like_columns:
+                kpi_name = metric_col
+                current = lori_kpi_to_float(row.get(metric_col))
+
+                if current is None:
+                    continue
+
+                target = None
+                normalized_metric = lori_kpi_normalize_column(metric_col)
+
+                for target_candidate in target_like_columns:
+                    normalized_target = lori_kpi_normalize_column(target_candidate)
+
+                    if normalized_metric in normalized_target or normalized_target.replace("target", "") in normalized_metric:
+                        target = lori_kpi_to_float(row.get(target_candidate))
+                        break
+
+                direction = lori_kpi_detect_direction(kpi_name)
+                status, gap_value, gap_percent = lori_kpi_status(current, target, direction)
+                category = lori_kpi_detect_category(kpi_name, row)
+
+                metric_records.append({
+                    "upload_id": upload_id,
+                    "kpi_name": kpi_name,
+                    "kpi_category": category,
+                    "kpi_description": f"LORI detected this numeric KPI from uploaded column: {metric_col}",
+                    "current_value": current,
+                    "baseline_value": None,
+                    "target_value": target,
+                    "gap_value": gap_value,
+                    "gap_percent": gap_percent,
+                    "measurement_unit": "%" if "%" in metric_col else None,
+                    "direction": direction,
+                    "kpi_status": status,
+                    "reporting_period": None,
+                    "station_code": "JESSUP-01",
+                    "operating_state": "MD",
+                    "owner_name": None,
+                    "owner_role": "Owner",
+                    "dimensions": {
+                        key: value
+                        for key, value in row.items()
+                        if key in dimension_columns
+                    },
+                    "raw_row": row,
+                })
+
+    low_confidence = not can_directly_map and len(metric_records) == 0
+
+    return metric_records, detected_column_records, low_confidence
+
+
+def lori_kpi_root_cause_and_actions(category: str, kpi_name: str, direction: str) -> Dict[str, Any]:
+    text = f"{category} {kpi_name}".lower()
+
+    if "delivery" in text or "route" in text or "dispatch" in text:
+        return {
+            "root_cause": "Likely root causes include late departures, route sequencing gaps, driver readiness issues, dispatch delays, vehicle readiness, attendance coverage pressure, and inconsistent supervisor follow-up.",
+            "impact": "Delivery KPI gaps can affect customer service, route completion, overtime, driver accountability, and leadership confidence.",
+            "actions": [
+                "Review the bottom 10 routes or failed delivery windows daily.",
+                "Compare performance by route, driver, dispatch time, day of week, and zone.",
+                "Launch a daily 10-minute dispatch readiness huddle.",
+                "Assign supervisor follow-ups for drivers or routes below threshold.",
+                "Track recovery trend weekly and escalate if the KPI does not improve."
+            ],
+        }
+
+    if "attendance" in text or "call" in text or "absence" in text:
+        return {
+            "root_cause": "Likely root causes include repeat call-out patterns, unclear expectations, inconsistent documentation, weak early coaching, staffing pressure, and lack of weekly attendance review.",
+            "impact": "Attendance KPI gaps can affect route coverage, overtime, team fairness, customer service, and supervisor planning.",
+            "actions": [
+                "Identify repeat attendance or call-out patterns.",
+                "Review attendance records and supervisor notes.",
+                "Coach employees on the call-out procedure and operational impact.",
+                "Track weekly trend against the target.",
+                "Use HR, labor, compliance, or leadership review before formal action."
+            ],
+        }
+
+    if "safety" in text or "incident" in text or "accident" in text or "inspection" in text:
+        return {
+            "root_cause": "Likely root causes include inconsistent pre-trip discipline, incomplete coaching, route pressure, safety observation gaps, or failure to close prior safety findings.",
+            "impact": "Safety KPI gaps can affect DOT readiness, driver risk, insurance exposure, operational reliability, and leadership accountability.",
+            "actions": [
+                "Review safety events by driver, route, vehicle, date, and severity.",
+                "Confirm whether inspections and safety coaching were completed.",
+                "Assign immediate supervisor follow-up for repeat patterns.",
+                "Track safety observations weekly.",
+                "Escalate unresolved or high-risk issues to safety/compliance leadership."
+            ],
+        }
+
+    if "training" in text or "certification" in text:
+        return {
+            "root_cause": "Likely root causes include incomplete assignment tracking, schedule conflicts, missed reminders, unclear ownership, or training not tied to supervisor accountability.",
+            "impact": "Training KPI gaps can affect readiness, compliance, safety, quality, and audit performance.",
+            "actions": [
+                "Identify employees missing required training.",
+                "Assign training completion dates by owner.",
+                "Set supervisor reminders for incomplete items.",
+                "Track completion weekly until the KPI returns to target.",
+                "Escalate overdue training tied to compliance or safety requirements."
+            ],
+        }
+
+    if "payroll" in text or "overtime" in text or "exception" in text:
+        return {
+            "root_cause": "Likely root causes include schedule gaps, route delays, attendance coverage pressure, timecard exceptions, approval delays, or unplanned labor usage.",
+            "impact": "Payroll and overtime KPI gaps can affect cost control, compliance, staffing decisions, and operational profitability.",
+            "actions": [
+                "Review exceptions by driver, supervisor, route, and week.",
+                "Compare overtime to route completion and attendance gaps.",
+                "Confirm approval workflow and documentation.",
+                "Assign owner to reduce repeat exceptions.",
+                "Track savings or exception reduction weekly."
+            ],
+        }
+
+    return {
+        "root_cause": "Likely root causes may include unclear ownership, inconsistent tracking, process variation, incomplete documentation, staffing or workload pressure, and lack of routine leadership review.",
+        "impact": "This KPI may affect operational reliability, leadership visibility, accountability, cost, compliance, or service performance.",
+        "actions": [
+            "Confirm the KPI definition, target, owner, and reporting period.",
+            "Break performance down by driver, supervisor, route, location, date, and category where available.",
+            "Identify the bottom performers or highest-risk categories.",
+            "Assign owners and due dates for corrective steps.",
+            "Review progress weekly until the KPI returns to target."
+        ],
+    }
+
+
+def lori_kpi_build_print_html(plan: Dict[str, Any], steps: List[Dict[str, Any]]) -> str:
+    title = html.escape(lori_kpi_clean_text(plan.get("print_title") or plan.get("plan_title") or "KPI Action Plan"))
+    subtitle = html.escape(lori_kpi_clean_text(plan.get("print_subtitle") or f"{plan.get('company_name') or 'Company'} | {plan.get('station_code') or ''}"))
+    status_banner = html.escape(lori_kpi_clean_text(plan.get("print_status_banner") or f"{plan.get('plan_status') or 'Draft'} — {plan.get('priority') or 'Priority'}"))
+    summary = html.escape(lori_kpi_clean_text(plan.get("print_executive_summary") or plan.get("executive_summary") or "Executive summary not provided."))
+    problem = html.escape(lori_kpi_clean_text(plan.get("problem_statement") or "Problem statement not provided."))
+    root = html.escape(lori_kpi_clean_text(plan.get("root_cause_analysis") or "Root cause analysis not provided."))
+    thirty = html.escape(lori_kpi_clean_text(plan.get("thirty_day_plan") or "30-day plan not provided."))
+    sixty = html.escape(lori_kpi_clean_text(plan.get("sixty_day_plan") or "60-day plan not provided."))
+    ninety = html.escape(lori_kpi_clean_text(plan.get("ninety_day_plan") or "90-day plan not provided."))
+    success = html.escape(lori_kpi_clean_text(plan.get("success_measure") or "Success measure not provided."))
+    escalation = html.escape(lori_kpi_clean_text(plan.get("escalation_trigger") or "Escalation trigger not provided."))
+    footer = html.escape(lori_kpi_clean_text(plan.get("print_footer_note") or "Prepared by LORI KPI Action Plans."))
+
+    kpi_name = html.escape(lori_kpi_clean_text(plan.get("kpi_name")))
+    category = html.escape(lori_kpi_clean_text(plan.get("kpi_category")))
+    owner = html.escape(lori_kpi_clean_text(plan.get("plan_owner_name") or plan.get("supervisor_name") or "Owner not assigned"))
+    unit = html.escape(lori_kpi_clean_text(plan.get("measurement_unit") or ""))
+
+    current = "" if plan.get("current_value") is None else str(plan.get("current_value"))
+    target = "" if plan.get("target_value") is None else str(plan.get("target_value"))
+    gap = "" if plan.get("gap_value") is None else str(plan.get("gap_value"))
+
+    step_cards = ""
+
+    for step in sorted(steps, key=lambda s: s.get("step_number") or 0):
+        step_cards += f"""
+        <div class="step-card">
+            <div class="step-top">
+                <span class="step-number">Step {html.escape(str(step.get("step_number") or ""))}</span>
+                <span class="step-phase">{html.escape(lori_kpi_clean_text(step.get("phase") or ""))}</span>
+                <span class="step-priority">{html.escape(lori_kpi_clean_text(step.get("priority") or ""))}</span>
+            </div>
+            <h3>{html.escape(lori_kpi_clean_text(step.get("action_title") or ""))}</h3>
+            <p>{html.escape(lori_kpi_clean_text(step.get("action_description") or ""))}</p>
+            <div class="step-grid">
+                <div><strong>Owner</strong><br>{html.escape(lori_kpi_clean_text(step.get("owner_name") or "Owner not assigned"))}</div>
+                <div><strong>Due Date</strong><br>{html.escape(lori_kpi_clean_text(step.get("due_date") or "Not assigned"))}</div>
+                <div><strong>Success Measure</strong><br>{html.escape(lori_kpi_clean_text(step.get("success_measure") or "Not provided"))}</div>
+            </div>
+        </div>
+        """
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+    @page {{
+        size: letter;
+        margin: 0.55in;
+    }}
+
+    body {{
+        font-family: Arial, Helvetica, sans-serif;
+        color: #172033;
+        background: #ffffff;
+        margin: 0;
+        padding: 0;
+        line-height: 1.42;
+    }}
+
+    .plan {{
+        max-width: 900px;
+        margin: 0 auto;
+    }}
+
+    .cover {{
+        border-radius: 22px;
+        padding: 34px;
+        background: linear-gradient(135deg, #f6f8ff 0%, #eef3ff 52%, #ffffff 100%);
+        border: 1px solid #dbe5ff;
+        margin-bottom: 24px;
+    }}
+
+    .brand {{
+        font-size: 12px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: #52627a;
+        font-weight: 700;
+        margin-bottom: 22px;
+    }}
+
+    h1 {{
+        font-size: 34px;
+        line-height: 1.08;
+        margin: 0 0 10px 0;
+        color: #111827;
+    }}
+
+    .subtitle {{
+        color: #42526b;
+        font-size: 15px;
+        margin-bottom: 22px;
+    }}
+
+    .status {{
+        display: inline-block;
+        background: #1e3a8a;
+        color: #ffffff;
+        padding: 10px 14px;
+        border-radius: 999px;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-weight: 700;
+        margin-bottom: 22px;
+    }}
+
+    .metric-grid {{
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+        margin-top: 18px;
+    }}
+
+    .metric {{
+        background: #ffffff;
+        border: 1px solid #dbe5ff;
+        border-radius: 16px;
+        padding: 14px;
+    }}
+
+    .metric-label {{
+        font-size: 11px;
+        color: #667085;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 700;
+        margin-bottom: 6px;
+    }}
+
+    .metric-value {{
+        font-size: 22px;
+        font-weight: 800;
+        color: #111827;
+    }}
+
+    .section {{
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        padding: 22px;
+        margin-bottom: 16px;
+        page-break-inside: avoid;
+    }}
+
+    .section h2 {{
+        font-size: 18px;
+        margin: 0 0 10px 0;
+        color: #111827;
+    }}
+
+    .timeline {{
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 14px;
+    }}
+
+    .phase {{
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 16px;
+        padding: 16px;
+    }}
+
+    .phase h3 {{
+        margin: 0 0 8px 0;
+        font-size: 15px;
+        color: #1e3a8a;
+    }}
+
+    .step-card {{
+        border: 1px solid #dbe5ff;
+        border-radius: 16px;
+        padding: 16px;
+        margin-bottom: 12px;
+        page-break-inside: avoid;
+        background: #fbfdff;
+    }}
+
+    .step-top {{
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+    }}
+
+    .step-number,
+    .step-phase,
+    .step-priority {{
+        font-size: 11px;
+        font-weight: 700;
+        border-radius: 999px;
+        padding: 6px 9px;
+        background: #eef3ff;
+        color: #1e3a8a;
+    }}
+
+    .step-card h3 {{
+        font-size: 15px;
+        margin: 8px 0 6px 0;
+    }}
+
+    .step-grid {{
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 10px;
+        margin-top: 12px;
+        font-size: 12px;
+    }}
+
+    .footer {{
+        border-top: 1px solid #e5e7eb;
+        padding-top: 14px;
+        margin-top: 20px;
+        color: #667085;
+        font-size: 11px;
+    }}
+
+    @media print {{
+        body {{
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+        }}
+
+        .no-print {{
+            display: none !important;
+        }}
+
+        .cover {{
+            page-break-inside: avoid;
+        }}
+    }}
+</style>
+</head>
+<body>
+<div class="plan">
+    <div class="cover">
+        <div class="brand">LORI Drive Command Center</div>
+        <div class="status">{status_banner}</div>
+        <h1>{title}</h1>
+        <div class="subtitle">{subtitle}</div>
+        <p>{summary}</p>
+
+        <div class="metric-grid">
+            <div class="metric">
+                <div class="metric-label">KPI</div>
+                <div class="metric-value" style="font-size:16px;">{kpi_name}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Current</div>
+                <div class="metric-value">{html.escape(current)}{unit}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Target</div>
+                <div class="metric-value">{html.escape(target)}{unit}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Gap</div>
+                <div class="metric-value">{html.escape(gap)}{unit}</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Plan Ownership</h2>
+        <p><strong>Category:</strong> {category}</p>
+        <p><strong>Owner:</strong> {owner}</p>
+        <p><strong>Target Date:</strong> {html.escape(lori_kpi_clean_text(plan.get("recovery_target_date") or "Not assigned"))}</p>
+    </div>
+
+    <div class="section">
+        <h2>Problem Statement</h2>
+        <p>{problem}</p>
+    </div>
+
+    <div class="section">
+        <h2>Root Cause Analysis</h2>
+        <p>{root}</p>
+    </div>
+
+    <div class="section">
+        <h2>30 / 60 / 90 Day Action Plan</h2>
+        <div class="timeline">
+            <div class="phase">
+                <h3>30 Days</h3>
+                <p>{thirty}</p>
+            </div>
+            <div class="phase">
+                <h3>60 Days</h3>
+                <p>{sixty}</p>
+            </div>
+            <div class="phase">
+                <h3>90 Days</h3>
+                <p>{ninety}</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Action Steps</h2>
+        {step_cards}
+    </div>
+
+    <div class="section">
+        <h2>Success Measure</h2>
+        <p>{success}</p>
+        <h2>Escalation Trigger</h2>
+        <p>{escalation}</p>
+    </div>
+
+    <div class="footer">
+        {footer}<br>
+        LORI provides operational decision support. Validate KPI findings, action plans, HR/labor considerations, compliance risks, and formal corrective actions with authorized leadership before final action.
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+async def lori_kpi_get_rows(table: str, query: str = "select=*&order=created_at.desc&limit=500") -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_kpi_create_finding_and_plan(upload_id: str, metric: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if metric.get("kpi_status") != "Off Track":
+        return None
+
+    kpi_name = metric.get("kpi_name") or "Uploaded KPI"
+    category = metric.get("kpi_category") or lori_kpi_detect_category(kpi_name)
+    direction = metric.get("direction") or lori_kpi_detect_direction(kpi_name)
+    root_action = lori_kpi_root_cause_and_actions(category, kpi_name, direction)
+
+    current = metric.get("current_value")
+    target = metric.get("target_value")
+    gap = metric.get("gap_value")
+    gap_percent = metric.get("gap_percent")
+    unit = metric.get("measurement_unit") or ""
+
+    severity = "High"
+    if gap_percent is not None and abs(float(gap_percent)) >= 50:
+        severity = "Critical"
+
+    owner_name = metric.get("owner_name") or metric.get("supervisor_name") or "Operations Leadership"
+    owner_role = metric.get("owner_role") or "Leadership"
+
+    finding_payload = {
+        "upload_id": upload_id,
+        "metric_id": metric.get("id"),
+        "finding_title": f"{kpi_name} is off track",
+        "finding_type": "Off-Track KPI",
+        "severity": severity,
+        "finding_status": "Open",
+        "kpi_name": kpi_name,
+        "kpi_category": category,
+        "current_value": current,
+        "target_value": target,
+        "gap_value": gap,
+        "gap_percent": gap_percent,
+        "operational_impact": root_action["impact"],
+        "likely_root_cause": root_action["root_cause"],
+        "evidence_summary": f"Current value is {current}{unit} against a target of {target}{unit}.",
+        "affected_driver": metric.get("driver_name"),
+        "affected_supervisor": metric.get("supervisor_name"),
+        "affected_route": metric.get("route_id"),
+        "affected_location": metric.get("location_name") or metric.get("station_code"),
+        "recommended_next_action": "Generate a KPI Action Plan with owner, due dates, 30/60/90-day corrective actions, and leadership review checkpoints.",
+        "owner_name": owner_name,
+        "owner_role": owner_role,
+        "due_date": (date.today() + timedelta(days=3)).isoformat(),
+        "leadership_note": "Leadership should review this KPI until it returns to target.",
+    }
+
+    created_finding = await lori_policy_supabase_post(
+        "lori_kpi_action_plan_findings",
+        finding_payload,
+    )
+
+    finding = created_finding[0] if created_finding else {}
+
+    action_1 = root_action["actions"][0]
+    action_2 = root_action["actions"][1] if len(root_action["actions"]) > 1 else "Review KPI drivers and confirm ownership."
+    action_3 = root_action["actions"][2] if len(root_action["actions"]) > 2 else "Track weekly progress."
+
+    plan_title = f"{kpi_name} KPI Action Plan"
+
+    plan_payload = {
+        "upload_id": upload_id,
+        "metric_id": metric.get("id"),
+        "finding_id": finding.get("id"),
+        "plan_title": plan_title,
+        "plan_status": "Draft",
+        "plan_type": "KPI Action Plan",
+        "priority": severity,
+        "kpi_name": kpi_name,
+        "kpi_category": category,
+        "current_value": current,
+        "target_value": target,
+        "baseline_value": metric.get("baseline_value"),
+        "gap_value": gap,
+        "gap_percent": gap_percent,
+        "measurement_unit": unit,
+        "direction": direction,
+        "company_name": "Food Authority",
+        "station_code": metric.get("station_code") or "JESSUP-01",
+        "operating_state": metric.get("operating_state") or "MD",
+        "plan_owner_name": owner_name,
+        "plan_owner_role": owner_role,
+        "supervisor_name": metric.get("supervisor_name"),
+        "executive_summary": f"{kpi_name} is off track and requires a focused KPI Action Plan.",
+        "problem_statement": f"Current performance is {current}{unit} against a target of {target}{unit}, creating a gap of {gap}{unit}.",
+        "root_cause_analysis": root_action["root_cause"],
+        "thirty_day_plan": f"{action_1} Confirm the KPI owner, review the lowest-performing segments, assign immediate follow-ups, and begin weekly tracking.",
+        "sixty_day_plan": f"{action_2} Compare performance by available dimensions such as driver, route, supervisor, location, date, and category. Adjust process gaps and assign Action Center follow-ups.",
+        "ninety_day_plan": f"{action_3} Sustain the KPI at or better than target, document the operating rhythm, and convert successful recovery actions into standard practice.",
+        "success_measure": f"Return {kpi_name} to target of {target}{unit} and sustain for 4 consecutive weeks.",
+        "recovery_target_date": (date.today() + timedelta(days=90)).isoformat(),
+        "escalation_trigger": "Escalate if the KPI does not show measurable improvement after 30 days or remains off target after 60 days.",
+        "print_title": plan_title,
+        "print_subtitle": "Food Authority | JESSUP-01 | Executive KPI Action Plan",
+        "print_cover_summary": f"This print-ready KPI Action Plan is designed to move {kpi_name} back to target with practical leadership actions, owner accountability, due dates, and measurable recovery checkpoints.",
+        "print_status_banner": f"OFF TRACK — {severity.upper()} PRIORITY ACTION PLAN",
+        "print_executive_summary": f"{kpi_name} is currently {current}{unit} against a target of {target}{unit}. The plan focuses on root cause review, owner assignment, operational discipline, weekly tracking, and escalation triggers.",
+        "print_action_plan_text": "This plan includes KPI gap review, likely root causes, 30/60/90-day actions, owner accountability, due dates, success measures, and escalation triggers.",
+        "print_footer_note": "Prepared by LORI KPI Action Plans. Validate operational findings before formal corrective action.",
+        "print_ready": True,
+    }
+
+    created_plan = await lori_policy_supabase_post(
+        "lori_kpi_action_plans",
+        plan_payload,
+    )
+
+    plan = created_plan[0] if created_plan else {}
+
+    steps = [
+        {
+            "plan_id": plan.get("id"),
+            "step_number": 1,
+            "phase": "30-Day Action",
+            "step_status": "Open",
+            "priority": severity,
+            "action_title": action_1,
+            "action_description": "Start with immediate KPI stabilization by reviewing performance details, confirming ownership, and assigning specific follow-up.",
+            "owner_name": owner_name,
+            "owner_role": owner_role,
+            "due_date": (date.today() + timedelta(days=7)).isoformat(),
+            "success_measure": "Immediate action started and documented within 7 days.",
+            "required_data": "Uploaded KPI file, current value, target value, affected dimensions, and owner review.",
+            "documentation_note": "Document actions taken, facts confirmed, and follow-up needs.",
+        },
+        {
+            "plan_id": plan.get("id"),
+            "step_number": 2,
+            "phase": "30-Day Action",
+            "step_status": "Open",
+            "priority": "High",
+            "action_title": action_2,
+            "action_description": "Analyze KPI drivers and identify repeat patterns by available dimensions.",
+            "owner_name": owner_name,
+            "owner_role": owner_role,
+            "due_date": (date.today() + timedelta(days=14)).isoformat(),
+            "success_measure": "Root cause pattern identified and actioned.",
+            "required_data": "KPI trend, driver/route/supervisor/location breakdown if available.",
+            "documentation_note": "Document root cause signals and corrective steps.",
+        },
+        {
+            "plan_id": plan.get("id"),
+            "step_number": 3,
+            "phase": "60-Day Action",
+            "step_status": "Open",
+            "priority": "Medium",
+            "action_title": action_3,
+            "action_description": "Track weekly progress and adjust operational actions until performance moves toward target.",
+            "owner_name": owner_name,
+            "owner_role": owner_role,
+            "due_date": (date.today() + timedelta(days=45)).isoformat(),
+            "success_measure": "KPI trend shows measurable improvement toward target.",
+            "required_data": "Weekly KPI report and Action Center follow-up status.",
+            "documentation_note": "Escalate if improvement is not visible by checkpoint.",
+        },
+    ]
+
+    created_steps = await lori_policy_supabase_post(
+        "lori_kpi_action_plan_steps",
+        steps,
+    )
+
+    print_html = lori_kpi_build_print_html(plan, created_steps or [])
+
+    await lori_policy_supabase_post(
+        "lori_kpi_action_plan_print_exports",
+        {
+            "plan_id": plan.get("id"),
+            "export_title": f"Printable {plan_title}",
+            "export_type": "Printable KPI Action Plan",
+            "export_status": "Ready to Print",
+            "printable_text": plan.get("print_action_plan_text"),
+            "printable_html": print_html,
+            "print_view_created": True,
+            "created_by": "LORI KPI Action Plans",
+        },
+    )
+
+    return {
+        "finding": finding,
+        "plan": plan,
+        "steps": created_steps or [],
+    }
+
+
+@app.get("/kpi-action-plans-summary")
+async def kpi_action_plans_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    uploads = await lori_kpi_get_rows("lori_kpi_action_plan_uploads")
+    metrics = await lori_kpi_get_rows("lori_kpi_action_plan_metric_records")
+    findings = await lori_kpi_get_rows("lori_kpi_action_plan_findings")
+    plans = await lori_kpi_get_rows("lori_kpi_action_plans")
+    steps = await lori_kpi_get_rows("lori_kpi_action_plan_steps")
+    mapping_queue = await lori_kpi_get_rows("lori_kpi_action_plan_mapping_queue")
+
+    off_track = [m for m in metrics if m.get("kpi_status") == "Off Track"]
+    active_plans = [p for p in plans if p.get("plan_status") in {"Draft", "Active", "In Progress"}]
+    print_ready = [p for p in plans if p.get("print_ready") is True]
+
+    answer_text = f"""KPI Action Plans Summary
+
+KPI Uploads:
+{len(uploads)}
+
+Detected KPI Metrics:
+{len(metrics)}
+
+Off-Track KPIs:
+{len(off_track)}
+
+KPI Action Plans:
+{len(plans)}
+
+Open Action Steps:
+{len([s for s in steps if s.get("step_status") == "Open"])}
+
+Print-Ready Plans:
+{len(print_ready)}
+
+Mapping Reviews Needed:
+{len(mapping_queue)}
+
+Recommended Next Action:
+Review off-track KPIs first, open each KPI Action Plan, confirm ownership, and print the executive action plan for leadership review."""
+
+    return {
+        "status": "success",
+        "uploads_count": len(uploads),
+        "metrics_count": len(metrics),
+        "off_track_kpis_count": len(off_track),
+        "findings_count": len(findings),
+        "action_plans_count": len(plans),
+        "active_plans_count": len(active_plans),
+        "action_steps_count": len(steps),
+        "print_ready_plans_count": len(print_ready),
+        "mapping_reviews_needed_count": len(mapping_queue),
+        "recent_uploads": uploads[:10],
+        "recent_plans": plans[:10],
+        "answer_text": answer_text,
+    }
+
+
+@app.get("/kpi-action-plan-uploads")
+async def kpi_action_plan_uploads(
+    api_key: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_kpi_get_rows(
+        "lori_kpi_action_plan_uploads",
+        f"select=*&order=created_at.desc&limit={max(1, min(limit, 200))}",
+    )
+
+    return {
+        "status": "success",
+        "uploads_count": len(rows),
+        "uploads": rows,
+    }
+
+
+@app.get("/kpi-action-plans")
+async def kpi_action_plans(
+    api_key: Optional[str] = Query(None),
+    upload_id: Optional[str] = Query(None),
+    plan_status: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_kpi_get_rows(
+        "lori_kpi_action_plans",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if upload_id:
+        rows = [r for r in rows if str(r.get("upload_id")) == upload_id]
+
+    if plan_status:
+        rows = [
+            r for r in rows
+            if lori_kpi_clean_text(r.get("plan_status")).lower() == plan_status.lower()
+        ]
+
+    if priority:
+        rows = [
+            r for r in rows
+            if lori_kpi_clean_text(r.get("priority")).lower() == priority.lower()
+        ]
+
+    rows = rows[:max(1, min(limit, 200))]
+
+    return {
+        "status": "success",
+        "plans_count": len(rows),
+        "plans": rows,
+    }
+
+
+@app.get("/kpi-action-plan-detail")
+async def kpi_action_plan_detail(
+    api_key: Optional[str] = Query(None),
+    plan_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    plans = await lori_kpi_get_rows(
+        "lori_kpi_action_plans",
+        f"select=*&id=eq.{quote(plan_id)}&limit=1",
+    )
+
+    if not plans:
+        return {
+            "status": "not_found",
+            "message": "KPI Action Plan not found.",
+            "plan_id": plan_id,
+        }
+
+    plan = plans[0]
+
+    steps = await lori_kpi_get_rows(
+        "lori_kpi_action_plan_steps",
+        f"select=*&plan_id=eq.{quote(plan_id)}&order=step_number.asc&limit=100",
+    )
+
+    exports = await lori_kpi_get_rows(
+        "lori_kpi_action_plan_print_exports",
+        f"select=*&plan_id=eq.{quote(plan_id)}&order=created_at.desc&limit=5",
+    )
+
+    return {
+        "status": "success",
+        "plan": plan,
+        "steps_count": len(steps),
+        "steps": steps,
+        "print_exports": exports,
+    }
+
+
+@app.get("/kpi-action-plan-print")
+async def kpi_action_plan_print(
+    api_key: Optional[str] = Query(None),
+    plan_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    plans = await lori_kpi_get_rows(
+        "lori_kpi_action_plans",
+        f"select=*&id=eq.{quote(plan_id)}&limit=1",
+    )
+
+    if not plans:
+        return {
+            "status": "not_found",
+            "message": "KPI Action Plan not found.",
+            "plan_id": plan_id,
+        }
+
+    plan = plans[0]
+
+    steps = await lori_kpi_get_rows(
+        "lori_kpi_action_plan_steps",
+        f"select=*&plan_id=eq.{quote(plan_id)}&order=step_number.asc&limit=100",
+    )
+
+    printable_html = lori_kpi_build_print_html(plan, steps)
+
+    return {
+        "status": "success",
+        "plan_id": plan_id,
+        "plan_title": plan.get("plan_title"),
+        "print_ready": True,
+        "printable_html": printable_html,
+        "answer_text": "Printable KPI Action Plan is ready.",
+    }
+
+
+@app.post("/kpi-action-plan-upload")
+async def kpi_action_plan_upload(
+    api_key: Optional[str] = Query(None),
+    upload_title: Optional[str] = Query(None),
+    company_name: str = Query("Food Authority"),
+    station_code: str = Query("JESSUP-01"),
+    operating_state: str = Query("MD"),
+    file: UploadFile = File(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    file_bytes = await file.read()
+    filename = lori_kpi_safe_file_name(file.filename or "kpi_upload.csv")
+    content_type = file.content_type or "application/octet-stream"
+
+    lower_name = filename.lower()
+
+    if lower_name.endswith(".csv") or lower_name.endswith(".txt"):
+        rows = lori_kpi_parse_csv_bytes(file_bytes)
+    elif lower_name.endswith(".xlsx"):
+        rows = lori_kpi_parse_excel_bytes(file_bytes)
+    else:
+        return {
+            "status": "unsupported_file_type",
+            "message": "Please upload a CSV or XLSX KPI file.",
+            "filename": filename,
+        }
+
+    if not rows:
+        return {
+            "status": "no_rows_found",
+            "message": "LORI could not find KPI rows in the uploaded file.",
+            "filename": filename,
+        }
+
+    storage_result = await lori_kpi_upload_file_to_storage(
+        file_bytes=file_bytes,
+        filename=filename,
+        content_type=content_type,
+    )
+
+    headers = list(rows[0].keys())
+    column_roles = lori_kpi_detect_column_roles(headers)
+
+    upload_payload = {
+        "upload_title": upload_title or f"KPI Upload — {filename}",
+        "upload_type": "KPI Upload",
+        "company_name": company_name,
+        "station_code": station_code,
+        "operating_state": operating_state,
+        "upload_status": "Uploaded / Analyzing KPI Structure",
+        "source_file_name": filename,
+        "source_file_path": storage_result.get("file_path"),
+        "source_file_url": storage_result.get("file_url"),
+        "detected_columns": column_roles,
+        "notes": "Uploaded through KPI Action Plans universal intake.",
+        "created_by": "LORI KPI Action Plans",
+    }
+
+    created_upload = await lori_policy_supabase_post(
+        "lori_kpi_action_plan_uploads",
+        upload_payload,
+    )
+
+    upload = created_upload[0] if created_upload else {}
+    upload_id = upload.get("id")
+
+    metric_records, detected_column_records, low_confidence = lori_kpi_build_metric_records(
+        upload_id=upload_id,
+        rows=rows,
+        column_roles=column_roles,
+    )
+
+    if detected_column_records:
+        await lori_policy_supabase_post(
+            "lori_kpi_action_plan_detected_columns",
+            detected_column_records,
+        )
+
+    if low_confidence:
+        await lori_policy_supabase_post(
+            "lori_kpi_action_plan_mapping_queue",
+            {
+                "upload_id": upload_id,
+                "mapping_status": "Needs User Confirmation",
+                "confidence_level": "Low Confidence",
+                "detected_columns": column_roles,
+                "sample_rows": rows[:5],
+                "question_for_user": "LORI detected an unknown KPI structure. Please confirm which columns represent KPI name, current value, target value, date, owner, location, and category.",
+            },
+        )
+
+        await lori_policy_supabase_patch(
+            "lori_kpi_action_plan_uploads",
+            upload_id,
+            {
+                "upload_status": "Needs KPI Column Mapping",
+                "detected_kpi_count": 0,
+                "off_track_kpi_count": 0,
+                "action_plan_count": 0,
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+        return {
+            "status": "needs_mapping",
+            "message": "LORI uploaded the KPI file but needs help mapping the KPI columns.",
+            "upload": upload,
+            "detected_columns": column_roles,
+            "sample_rows": rows[:5],
+        }
+
+    created_metrics = []
+
+    if metric_records:
+        created_metrics = await lori_policy_supabase_post(
+            "lori_kpi_action_plan_metric_records",
+            metric_records,
+        )
+
+    created_plans = []
+    created_findings = []
+
+    for metric in created_metrics:
+        result = await lori_kpi_create_finding_and_plan(upload_id, metric)
+
+        if result:
+            created_findings.append(result.get("finding"))
+            created_plans.append(result.get("plan"))
+
+    off_track_count = len([m for m in created_metrics if m.get("kpi_status") == "Off Track"])
+
+    upload_status = "Analyzed / KPI Action Plans Available" if created_plans else "Analyzed / No Off-Track KPI Plans Created"
+
+    updated_upload = await lori_policy_supabase_patch(
+        "lori_kpi_action_plan_uploads",
+        upload_id,
+        {
+            "upload_status": upload_status,
+            "detected_kpi_count": len(created_metrics),
+            "off_track_kpi_count": off_track_count,
+            "action_plan_count": len(created_plans),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    answer_text = f"""KPI Upload Analyzed
+
+Upload:
+{upload_payload["upload_title"]}
+
+Detected KPI Metrics:
+{len(created_metrics)}
+
+Off-Track KPIs:
+{off_track_count}
+
+KPI Action Plans Created:
+{len(created_plans)}
+
+Print-Ready Plans:
+{len(created_plans)}
+
+Recommended Next Action:
+Open KPI Action Plans, review each off-track KPI, confirm owners, print the executive action plan, and send approved action steps to Action Center."""
+
+    return {
+        "status": "success",
+        "message": "KPI file uploaded, analyzed, and action plans generated.",
+        "upload": updated_upload[0] if updated_upload else upload,
+        "detected_columns": column_roles,
+        "metrics_created": len(created_metrics),
+        "off_track_kpis": off_track_count,
+        "action_plans_created": len(created_plans),
+        "created_plans": created_plans,
+        "answer_text": answer_text,
+    }
+
+
+@app.post("/kpi-action-plan-send-to-action-center")
+async def kpi_action_plan_send_to_action_center(
+    api_key: Optional[str] = Query(None),
+    plan_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    plans = await lori_kpi_get_rows(
+        "lori_kpi_action_plans",
+        f"select=*&id=eq.{quote(plan_id)}&limit=1",
+    )
+
+    if not plans:
+        return {
+            "status": "not_found",
+            "message": "KPI Action Plan not found.",
+            "plan_id": plan_id,
+        }
+
+    plan = plans[0]
+
+    steps = await lori_kpi_get_rows(
+        "lori_kpi_action_plan_steps",
+        f"select=*&plan_id=eq.{quote(plan_id)}&order=step_number.asc&limit=100",
+    )
+
+    created_actions = []
+
+    parent_action = await lori_policy_supabase_post(
+        "lori_action_items",
+        {
+            "action_title": plan.get("plan_title") or "KPI Action Plan",
+            "action_type": "KPI Action Plan",
+            "action_status": "Open",
+            "priority": plan.get("priority") or "High",
+            "source_module": "KPI Action Plans",
+            "source_type": "KPI Action Plan",
+            "source_reference_id": plan_id,
+            "supervisor_name": plan.get("supervisor_name"),
+            "owner_name": plan.get("plan_owner_name") or "Operations Leadership",
+            "owner_role": plan.get("plan_owner_role") or "Leadership",
+            "station_code": plan.get("station_code") or "JESSUP-01",
+            "operating_state": plan.get("operating_state") or "MD",
+            "company_name": plan.get("company_name") or "Food Authority",
+            "reason": plan.get("problem_statement"),
+            "recommended_follow_up": plan.get("success_measure"),
+            "documentation_note": plan.get("root_cause_analysis"),
+            "due_date": plan.get("recovery_target_date"),
+            "created_by": "LORI KPI Action Plans",
+        },
+    )
+
+    if parent_action:
+        created_actions.append(parent_action[0])
+
+    for step in steps:
+        action = await lori_policy_supabase_post(
+            "lori_action_items",
+            {
+                "action_title": step.get("action_title"),
+                "action_type": "KPI Action Step",
+                "action_status": "Open",
+                "priority": step.get("priority") or "Medium",
+                "source_module": "KPI Action Plans",
+                "source_type": step.get("phase") or "KPI Action Step",
+                "source_reference_id": step.get("id"),
+                "owner_name": step.get("owner_name"),
+                "owner_role": step.get("owner_role"),
+                "station_code": plan.get("station_code") or "JESSUP-01",
+                "operating_state": plan.get("operating_state") or "MD",
+                "company_name": plan.get("company_name") or "Food Authority",
+                "reason": step.get("action_description"),
+                "recommended_follow_up": step.get("success_measure"),
+                "documentation_note": step.get("documentation_note"),
+                "due_date": step.get("due_date"),
+                "created_by": "LORI KPI Action Plans",
+            },
+        )
+
+        if action:
+            created_actions.append(action[0])
+            await lori_policy_supabase_patch(
+                "lori_kpi_action_plan_steps",
+                step.get("id"),
+                {
+                    "action_center_item_id": action[0].get("id"),
+                    "updated_at": datetime.utcnow().isoformat(),
+                },
+            )
+
+    await lori_policy_supabase_patch(
+        "lori_kpi_action_plans",
+        plan_id,
+        {
+            "action_center_status": "Sent to Action Center",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "KPI Action Plan sent to Action Center.",
+        "plan_id": plan_id,
+        "actions_created": len(created_actions),
+        "created_actions": created_actions,
+        "answer_text": f"KPI Action Plan sent to Action Center. {len(created_actions)} action items were created.",
+    }
+
+
+@app.post("/kpi-action-plan-send-to-leadership-briefing")
+async def kpi_action_plan_send_to_leadership_briefing(
+    api_key: Optional[str] = Query(None),
+    plan_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    plans = await lori_kpi_get_rows(
+        "lori_kpi_action_plans",
+        f"select=*&id=eq.{quote(plan_id)}&limit=1",
+    )
+
+    if not plans:
+        return {
+            "status": "not_found",
+            "message": "KPI Action Plan not found.",
+            "plan_id": plan_id,
+        }
+
+    plan = plans[0]
+
+    briefing = await lori_policy_supabase_post(
+        "lori_leadership_briefing_queue",
+        {
+            "briefing_title": plan.get("plan_title") or "KPI Action Plan",
+            "briefing_type": "KPI Action Plan Leadership Briefing",
+            "briefing_status": "Queued",
+            "priority": plan.get("priority") or "High",
+            "station_code": plan.get("station_code") or "JESSUP-01",
+            "operating_state": plan.get("operating_state") or "MD",
+            "executive_summary": plan.get("executive_summary"),
+            "key_risk": plan.get("problem_statement"),
+            "recommended_leadership_action": plan.get("success_measure"),
+            "supervisor_follow_up": plan.get("thirty_day_plan"),
+            "compliance_note": "Validate KPI findings, root causes, action assignments, HR/labor implications, and corrective actions before formal action.",
+            "created_by": "LORI KPI Action Plans",
+        },
+    )
+
+    await lori_policy_supabase_patch(
+        "lori_kpi_action_plans",
+        plan_id,
+        {
+            "leadership_briefing_status": "Sent to Leadership Briefing",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "KPI Action Plan added to Leadership Briefing Queue.",
+        "plan_id": plan_id,
+        "briefing_item": briefing[0] if briefing else {},
+        "answer_text": "KPI Action Plan added to Leadership Briefing Queue.",
+    }
