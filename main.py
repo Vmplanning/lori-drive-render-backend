@@ -2774,3 +2774,192 @@ def lori_regulatory_build_recommended_preparation(item: Dict[str, Any]) -> str:
         "identify affected drivers, supervisors, vehicles, routes, policies, or audit areas, determine whether training "
         "or policy updates are needed, and prepare a leadership briefing if operational impact is confirmed."
     )
+# ============================================================
+# LORI REGULATORY INTELLIGENCE
+# Voiceflow-ready daily alert briefing endpoint
+# Allows user to ask: "Tell me the alerts for today."
+# ============================================================
+
+def lori_regulatory_short_date(value: Any) -> str:
+    if not value:
+        return "Not listed"
+
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.strftime("%b %d, %Y")
+    except Exception:
+        return str(value)
+
+
+def lori_regulatory_safe_line(value: Any, fallback: str = "Not listed") -> str:
+    cleaned = lori_regulatory_clean_text(value)
+    return cleaned if cleaned else fallback
+
+
+def lori_regulatory_build_alert_briefing(
+    alerts: List[Dict[str, Any]],
+    latest_scan: Optional[Dict[str, Any]],
+    requested_state: Optional[str] = None,
+) -> str:
+    today_label = datetime.now(timezone.utc).strftime("%b %d, %Y")
+
+    if latest_scan:
+        scan_status = latest_scan.get("scan_status") or "Scan status not listed"
+        sources_checked = latest_scan.get("sources_checked", 0)
+        alerts_found = latest_scan.get("alerts_found", 0)
+        new_alerts_found = latest_scan.get("new_alerts_found", 0)
+        scan_completed = lori_regulatory_short_date(latest_scan.get("scan_completed_at"))
+        operating_state = latest_scan.get("operating_state") or requested_state or "Not selected"
+        station_code = latest_scan.get("station_code") or "Not listed"
+        result_summary = latest_scan.get("result_summary") or "No scan summary listed."
+    else:
+        scan_status = "No scan log found"
+        sources_checked = 0
+        alerts_found = 0
+        new_alerts_found = 0
+        scan_completed = "Not listed"
+        operating_state = requested_state or "Not selected"
+        station_code = "Not listed"
+        result_summary = "No completed regulatory scan is available yet."
+
+    if not alerts:
+        return f"""Regulatory Alert Briefing — Today
+
+Date:
+{today_label}
+
+Status:
+No new verified regulatory alerts are currently listed for review.
+
+Latest Scan:
+{scan_status}
+
+Sources Checked:
+{sources_checked}
+
+Operating State:
+{operating_state}
+
+Station:
+{station_code}
+
+Result:
+{result_summary}
+
+Recommended Next Action:
+No immediate regulatory briefing is required based on the current stored alert set. Continue monitoring and verify official DOT, FMCSA, state, HR, compliance, labor relations, or legal sources before taking formal action.
+
+Compliance Note:
+LORI provides operational decision support. Regulatory alerts, transportation laws, DOT/FMCSA updates, state law changes, labor/HR updates, and compliance-sensitive matters must be verified against official sources and reviewed by appropriate compliance, HR, labor relations, or legal personnel before formal action."""
+
+    lines = []
+    lines.append("Regulatory Alert Briefing — Today")
+    lines.append("")
+    lines.append("Date:")
+    lines.append(today_label)
+    lines.append("")
+    lines.append("Current Status:")
+    lines.append("New regulatory alerts require leadership review.")
+    lines.append("")
+    lines.append("Latest Scan:")
+    lines.append(str(scan_status))
+    lines.append("")
+    lines.append("Operating State:")
+    lines.append(str(operating_state))
+    lines.append("")
+    lines.append("Station:")
+    lines.append(str(station_code))
+    lines.append("")
+    lines.append("Sources Checked:")
+    lines.append(str(sources_checked))
+    lines.append("")
+    lines.append("Alerts Found:")
+    lines.append(str(alerts_found))
+    lines.append("")
+    lines.append("New Alerts Found:")
+    lines.append(str(new_alerts_found))
+    lines.append("")
+    lines.append("Top Alerts for Leadership Review:")
+
+    for index, alert in enumerate(alerts[:5], start=1):
+        title = lori_regulatory_safe_line(alert.get("alert_title"))
+        agency = lori_regulatory_safe_line(alert.get("agency"))
+        category = lori_regulatory_safe_line(alert.get("category"))
+        priority = lori_regulatory_safe_line(alert.get("alert_priority"))
+        published = lori_regulatory_short_date(alert.get("published_at"))
+        impact = lori_regulatory_safe_line(alert.get("operational_impact"))
+        preparation = lori_regulatory_safe_line(alert.get("recommended_preparation"))
+        verification = lori_regulatory_safe_line(alert.get("source_verification_status"))
+
+        lines.append("")
+        lines.append(f"{index}. {title}")
+        lines.append(f"Agency: {agency}")
+        lines.append(f"Category: {category}")
+        lines.append(f"Priority: {priority}")
+        lines.append(f"Published: {published}")
+        lines.append(f"Operational Impact: {impact}")
+        lines.append(f"Recommended Preparation: {preparation}")
+        lines.append(f"Verification Status: {verification}")
+
+    lines.append("")
+    lines.append("Recommended Next Action:")
+    lines.append(
+        "Review the top alerts, confirm official source relevance, identify affected drivers, supervisors, policies, audits, or training areas, and add confirmed items to the leadership briefing or compliance follow-up list."
+    )
+
+    lines.append("")
+    lines.append("Compliance Note:")
+    lines.append(
+        "LORI provides operational decision support. Regulatory alerts, transportation laws, DOT/FMCSA updates, state law changes, labor/HR updates, and compliance-sensitive matters must be verified against official sources and reviewed by appropriate compliance, HR, labor relations, or legal personnel before formal action."
+    )
+
+    return "\n".join(lines)
+
+
+@app.get("/voiceflow/regulatory-alerts")
+async def voiceflow_regulatory_alerts(
+    api_key: Optional[str] = Query(None),
+    question: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    limit: int = Query(5),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 10))
+
+    alerts = await lori_regulatory_supabase_get(
+        "lori_regulatory_alerts?select=*&order=created_at.desc&limit=25"
+    )
+
+    filtered_alerts = []
+
+    if state:
+        requested_state = state.upper()
+        for alert in alerts:
+            alert_state = alert.get("state_code")
+            if alert_state is None or str(alert_state).upper() == requested_state:
+                filtered_alerts.append(alert)
+    else:
+        filtered_alerts = alerts
+
+    filtered_alerts = filtered_alerts[:limit]
+
+    latest_logs = await lori_regulatory_supabase_get(
+        "lori_regulatory_scan_logs?select=*&order=created_at.desc&limit=1"
+    )
+
+    latest_scan = latest_logs[0] if latest_logs else None
+
+    answer_text = lori_regulatory_build_alert_briefing(
+        filtered_alerts,
+        latest_scan,
+        state,
+    )
+
+    return {
+        "status": "success",
+        "question": question,
+        "alerts_count": len(filtered_alerts),
+        "latest_scan": latest_scan,
+        "answer_text": answer_text,
+    }
