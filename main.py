@@ -2963,3 +2963,494 @@ async def voiceflow_regulatory_alerts(
         "latest_scan": latest_scan,
         "answer_text": answer_text,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# Agreement / Policy Intelligence Backend
+# Searches uploaded/demo policy, agreement, work rule, and CBA sections
+# and returns Voiceflow-ready review guidance.
+# ============================================================
+
+from typing import Any, Dict, List, Optional
+from fastapi import Query, HTTPException
+import re
+
+
+POLICY_REVIEW_KEYWORDS = {
+    "attendance": [
+        "attendance",
+        "call out",
+        "call-out",
+        "callout",
+        "absence",
+        "late",
+        "tardy",
+        "no call",
+        "no show",
+        "scheduled assignment",
+        "report to work",
+    ],
+    "discipline": [
+        "discipline",
+        "corrective action",
+        "write up",
+        "write-up",
+        "coaching",
+        "counseling",
+        "progressive",
+        "formal action",
+        "warning",
+        "suspension",
+        "termination",
+    ],
+    "safety": [
+        "safety",
+        "accident",
+        "incident",
+        "unsafe",
+        "inspection",
+        "vehicle",
+        "pre trip",
+        "pre-trip",
+        "post trip",
+        "post-trip",
+        "hazard",
+    ],
+    "route": [
+        "route",
+        "assignment",
+        "bid",
+        "run",
+        "delivery",
+        "schedule",
+        "dispatch",
+        "route assignment",
+    ],
+    "overtime": [
+        "overtime",
+        "hours",
+        "extra work",
+        "premium",
+        "pay",
+        "payroll",
+        "timekeeping",
+    ],
+    "seniority": [
+        "seniority",
+        "bid",
+        "bidding",
+        "assignment",
+        "preference",
+        "order",
+    ],
+    "grievance": [
+        "grievance",
+        "dispute",
+        "appeal",
+        "union",
+        "labor relations",
+        "representation",
+    ],
+    "policy": [
+        "policy",
+        "work rule",
+        "sop",
+        "procedure",
+        "company policy",
+        "driver policy",
+    ],
+    "agreement": [
+        "agreement",
+        "contract",
+        "cba",
+        "collective bargaining",
+        "union agreement",
+        "labor agreement",
+    ],
+}
+
+
+def lori_policy_clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def lori_policy_terms(text: str) -> List[str]:
+    text = lori_policy_clean_text(text).lower()
+    text = re.sub(r"[^a-z0-9\s\-]", " ", text)
+    return [term for term in text.split() if len(term) >= 3]
+
+
+def lori_policy_detect_situation_type(question: str) -> str:
+    q = lori_policy_clean_text(question).lower()
+
+    best_type = "Policy / Agreement Review"
+    best_score = 0
+
+    for situation_type, keywords in POLICY_REVIEW_KEYWORDS.items():
+        score = 0
+        for keyword in keywords:
+            if keyword in q:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_type = situation_type.title()
+
+    return best_type
+
+
+def lori_policy_score_section(question: str, section: Dict[str, Any], document: Dict[str, Any]) -> int:
+    q = lori_policy_clean_text(question).lower()
+
+    section_blob = " ".join(
+        [
+            lori_policy_clean_text(section.get("section_title")),
+            lori_policy_clean_text(section.get("section_text")),
+            lori_policy_clean_text(section.get("article_number")),
+            lori_policy_clean_text(section.get("section_number")),
+            " ".join(section.get("topic_tags") or []),
+            " ".join(section.get("risk_tags") or []),
+            " ".join(section.get("applies_to") or []),
+            lori_policy_clean_text(document.get("document_title")),
+            lori_policy_clean_text(document.get("document_type")),
+            lori_policy_clean_text(document.get("summary")),
+        ]
+    ).lower()
+
+    score = 0
+
+    for term in lori_policy_terms(q):
+        if term in section_blob:
+            score += 2
+
+    for situation_type, keywords in POLICY_REVIEW_KEYWORDS.items():
+        if any(keyword in q for keyword in keywords):
+            for keyword in keywords:
+                if keyword in section_blob:
+                    score += 3
+
+    return score
+
+
+async def lori_policy_supabase_get(query_path: str) -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{query_path}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(url, headers=lori_regulatory_supabase_headers())
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase GET failed: {response.text}",
+        )
+
+    return response.json()
+
+
+async def lori_policy_supabase_post(table: str, payload: Dict[str, Any]) -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            url,
+            headers=lori_regulatory_supabase_headers("return=representation"),
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase POST failed: {response.text}",
+        )
+
+    return response.json()
+
+
+def lori_policy_build_supervisor_language(situation_type: str) -> str:
+    if situation_type.lower() == "attendance":
+        return (
+            "This conversation should be positioned as an attendance expectation review. "
+            "The supervisor should confirm the facts, review the attendance or call-out record, "
+            "explain the expectation clearly, and document the discussion without making a final "
+            "discipline or agreement determination."
+        )
+
+    if situation_type.lower() == "discipline":
+        return (
+            "This conversation should be positioned as a coaching and documentation review. "
+            "The supervisor should focus on facts, prior coaching history, expectations, and corrective steps. "
+            "Formal discipline should not be finalized until HR, labor relations, compliance, or leadership review is complete."
+        )
+
+    if situation_type.lower() == "safety":
+        return (
+            "This conversation should be positioned as a safety expectation and prevention review. "
+            "The supervisor should confirm the safety facts, document what occurred, reinforce the required behavior, "
+            "and determine whether training, vehicle inspection, or compliance follow-up is needed."
+        )
+
+    if situation_type.lower() == "route":
+        return (
+            "This conversation should be positioned as a route assignment and operational expectation review. "
+            "The supervisor should confirm the assignment facts, schedule impact, route instructions, and whether policy, "
+            "agreement, dispatch, or leadership review is needed."
+        )
+
+    return (
+        "This conversation should be positioned as an operational expectation review. "
+        "The supervisor should confirm the facts, compare the situation to the applicable policy or agreement language, "
+        "document the discussion, and avoid final conclusions until the matter is reviewed by the appropriate leader, "
+        "HR, labor relations, compliance, or legal reviewer."
+    )
+
+
+def lori_policy_build_answer(
+    question: str,
+    situation_type: str,
+    matches: List[Dict[str, Any]],
+    review_request: Optional[Dict[str, Any]] = None,
+) -> str:
+    if not matches:
+        return f"""Agreement / Policy Review
+
+Situation Type:
+{situation_type}
+
+Status:
+I do not see a matching agreement or policy section in the currently searchable LORI policy records.
+
+Recommended Next Action:
+Upload or confirm the relevant union agreement, company policy, work rule, SOP, or driver policy so LORI can compare the situation against the official language.
+
+Supervisor Guidance:
+Do not make a final policy, agreement, labor, HR, or disciplinary determination until the official document is reviewed.
+
+Compliance Note:
+This is not a final HR, legal, labor, or contract determination. HR, labor relations, compliance, legal, or leadership review is recommended before formal action."""
+
+    top_match = matches[0]
+    top_section = top_match["section"]
+    top_document = top_match["document"]
+
+    lines = []
+
+    lines.append("Agreement / Policy Review")
+    lines.append("")
+    lines.append("Situation Type:")
+    lines.append(situation_type)
+    lines.append("")
+    lines.append("Primary Document:")
+    lines.append(lori_policy_clean_text(top_document.get("document_title")) or "Not listed")
+    lines.append("")
+    lines.append("Document Type:")
+    lines.append(lori_policy_clean_text(top_document.get("document_type")) or "Not listed")
+    lines.append("")
+    lines.append("Potentially Relevant Section:")
+    section_label_parts = [
+        lori_policy_clean_text(top_section.get("article_number")),
+        lori_policy_clean_text(top_section.get("section_number")),
+        lori_policy_clean_text(top_section.get("section_title")),
+    ]
+    section_label = " — ".join([part for part in section_label_parts if part])
+    lines.append(section_label or "Section not listed")
+    lines.append("")
+    lines.append("Relevant Language:")
+    lines.append(lori_policy_clean_text(top_section.get("section_text")))
+    lines.append("")
+    lines.append("Operational Concern:")
+    lines.append(
+        "The situation may require review against the identified agreement, policy, work rule, or procedure. "
+        "The section appears relevant for operational review, but it should not be treated as a final violation finding."
+    )
+    lines.append("")
+    lines.append("Facts to Confirm:")
+    lines.append(
+        "Confirm the date, time, driver or employee involved, supervisor, prior coaching history, documentation, "
+        "applicable route or assignment details, and whether the official agreement or company policy version is current."
+    )
+    lines.append("")
+    lines.append("Recommended Supervisor Language:")
+    lines.append(lori_policy_build_supervisor_language(situation_type))
+    lines.append("")
+    lines.append("Recommended Next Action:")
+    lines.append(
+        "Review the official document, confirm the facts, document the discussion, and route the matter to HR, labor relations, "
+        "compliance, legal, or leadership review before formal action if discipline, contract interpretation, or policy enforcement is being considered."
+    )
+
+    if len(matches) > 1:
+        lines.append("")
+        lines.append("Additional Sections to Review:")
+        for index, match in enumerate(matches[1:4], start=2):
+            section = match["section"]
+            document = match["document"]
+            label_parts = [
+                lori_policy_clean_text(document.get("document_title")),
+                lori_policy_clean_text(section.get("article_number")),
+                lori_policy_clean_text(section.get("section_number")),
+                lori_policy_clean_text(section.get("section_title")),
+            ]
+            label = " — ".join([part for part in label_parts if part])
+            lines.append(f"{index}. {label}")
+
+    lines.append("")
+    lines.append("HR / Labor / Compliance Note:")
+    lines.append(
+        "This is not a final HR, legal, labor, or contract determination. HR, labor relations, compliance, legal, or leadership review is recommended before formal action."
+    )
+
+    return "\n".join(lines)
+
+
+async def lori_policy_find_matches(question: str, limit: int = 5) -> List[Dict[str, Any]]:
+    documents = await lori_policy_supabase_get(
+        "lori_policy_documents?select=*&order=created_at.desc&limit=100"
+    )
+
+    sections = await lori_policy_supabase_get(
+        "lori_policy_sections?select=*&order=created_at.desc&limit=500"
+    )
+
+    docs_by_id = {doc.get("id"): doc for doc in documents}
+
+    scored: List[Dict[str, Any]] = []
+
+    for section in sections:
+        doc = docs_by_id.get(section.get("document_id"), {})
+        score = lori_policy_score_section(question, section, doc)
+
+        if score > 0:
+            scored.append(
+                {
+                    "score": score,
+                    "section": section,
+                    "document": doc,
+                }
+            )
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+
+    return scored[:limit]
+
+
+@app.get("/policy-documents")
+async def get_policy_documents(
+    api_key: Optional[str] = Query(None),
+    limit: int = Query(25),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 100))
+
+    documents = await lori_policy_supabase_get(
+        f"lori_policy_documents?select=*&order=created_at.desc&limit={limit}"
+    )
+
+    return {
+        "status": "success",
+        "documents_count": len(documents),
+        "documents": documents,
+    }
+
+
+@app.get("/policy-search")
+async def policy_search(
+    api_key: Optional[str] = Query(None),
+    query: str = Query(...),
+    limit: int = Query(5),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 10))
+
+    matches = await lori_policy_find_matches(query, limit)
+
+    return {
+        "status": "success",
+        "query": query,
+        "matches_count": len(matches),
+        "matches": matches,
+    }
+
+
+@app.get("/voiceflow/policy-review")
+async def voiceflow_policy_review(
+    api_key: Optional[str] = Query(None),
+    question: str = Query(...),
+    driver_name: Optional[str] = Query(None),
+    employee_id: Optional[str] = Query(None),
+    supervisor_name: Optional[str] = Query(None),
+    limit: int = Query(5),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 10))
+
+    situation_type = lori_policy_detect_situation_type(question)
+
+    review_payload = {
+        "request_text": question,
+        "driver_name": driver_name,
+        "employee_id": employee_id,
+        "supervisor_name": supervisor_name,
+        "situation_type": situation_type,
+        "operating_state": "MD",
+        "station_code": "JESSUP-01",
+        "review_status": "Open",
+        "priority": "Review Needed",
+    }
+
+    created_review = await lori_policy_supabase_post(
+        "lori_policy_review_requests",
+        review_payload,
+    )
+
+    review_request = created_review[0] if created_review else None
+
+    matches = await lori_policy_find_matches(question, limit)
+
+    answer_text = lori_policy_build_answer(
+        question=question,
+        situation_type=situation_type,
+        matches=matches,
+        review_request=review_request,
+    )
+
+    if review_request and matches:
+        top_match = matches[0]
+        finding_payload = {
+            "review_request_id": review_request.get("id"),
+            "document_id": top_match["document"].get("id"),
+            "section_id": top_match["section"].get("id"),
+            "finding_type": "Policy / Agreement Review",
+            "confidence_level": "Needs Human Review",
+            "issue_summary": question,
+            "potentially_relevant_section": top_match["section"].get("section_title"),
+            "relevant_language": top_match["section"].get("section_text"),
+            "operational_concern": (
+                "This may require review against the identified agreement, policy, work rule, or procedure."
+            ),
+            "facts_to_confirm": (
+                "Confirm the facts, involved driver or employee, date, supervisor, documentation, current policy version, and prior coaching history."
+            ),
+            "recommended_supervisor_language": lori_policy_build_supervisor_language(situation_type),
+            "recommended_next_action": (
+                "Review the official document and route the matter to HR, labor relations, compliance, legal, or leadership review before formal action."
+            ),
+        }
+
+        await lori_policy_supabase_post(
+            "lori_policy_findings",
+            finding_payload,
+        )
+
+    return {
+        "status": "success",
+        "question": question,
+        "situation_type": situation_type,
+        "matches_count": len(matches),
+        "review_request": review_request,
+        "answer_text": answer_text,
+    }
