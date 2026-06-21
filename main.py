@@ -3974,3 +3974,535 @@ async def policy_intake_status(
             "Documents can be uploaded or registered and staged for extraction."
         ),
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# Policy / Agreement Document Extraction Endpoint
+# Extracts uploaded PDF/TXT policy documents from Supabase Storage,
+# splits them into searchable sections, tags topics, and updates
+# the document status to Extracted / Searchable.
+# ============================================================
+
+from io import BytesIO
+
+
+async def lori_policy_download_from_storage(file_path: str) -> bytes:
+    download_url = f"{SUPABASE_URL}/storage/v1/object/{POLICY_UPLOAD_BUCKET}/{file_path}"
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(
+            download_url,
+            headers=lori_policy_storage_headers(),
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase Storage download failed: {response.text}",
+        )
+
+    return response.content
+
+
+async def lori_policy_supabase_patch(
+    table: str,
+    record_id: str,
+    payload: Dict[str, Any],
+) -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{record_id}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(
+            url,
+            headers=lori_regulatory_supabase_headers("return=representation"),
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase PATCH failed: {response.text}",
+        )
+
+    return response.json()
+
+
+async def lori_policy_supabase_delete_sections(document_id: str) -> None:
+    url = f"{SUPABASE_URL}/rest/v1/lori_policy_sections?document_id=eq.{document_id}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.delete(
+            url,
+            headers=lori_regulatory_supabase_headers(),
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase DELETE failed: {response.text}",
+        )
+
+
+async def lori_policy_supabase_post_many(
+    table: str,
+    payload: List[Dict[str, Any]],
+) -> Any:
+    if not payload:
+        return []
+
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            url,
+            headers=lori_regulatory_supabase_headers("return=representation"),
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase batch POST failed: {response.text}",
+        )
+
+    return response.json()
+
+
+def lori_policy_extract_text_from_file(
+    file_bytes: bytes,
+    file_name: Optional[str],
+) -> str:
+    safe_name = (file_name or "").lower()
+
+    if safe_name.endswith(".txt"):
+        return file_bytes.decode("utf-8", errors="ignore")
+
+    if safe_name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "PDF extraction requires the pypdf package. "
+                    "Add pypdf to requirements.txt and redeploy Render."
+                ),
+            ) from exc
+
+        reader = PdfReader(BytesIO(file_bytes))
+        pages = []
+
+        for page_index, page in enumerate(reader.pages, start=1):
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                page_text = ""
+
+            if page_text.strip():
+                pages.append(f"\n\n--- Page {page_index} ---\n{page_text}")
+
+        return "\n".join(pages).strip()
+
+    try:
+        return file_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def lori_policy_extract_topic_tags(text: str) -> List[str]:
+    blob = lori_policy_clean_text(text).lower()
+    tags = []
+
+    for topic, keywords in POLICY_REVIEW_KEYWORDS.items():
+        if any(keyword in blob for keyword in keywords):
+            tags.append(topic)
+
+    if "call-out" in blob or "call out" in blob or "callout" in blob:
+        if "call-out" not in tags:
+            tags.append("call-out")
+
+    if "driver" in blob:
+        if "driver operations" not in tags:
+            tags.append("driver operations")
+
+    if not tags:
+        tags.append("general policy")
+
+    return tags
+
+
+def lori_policy_extract_risk_tags(text: str) -> List[str]:
+    blob = lori_policy_clean_text(text).lower()
+    risk_tags = []
+
+    if any(term in blob for term in ["attendance", "call-out", "call out", "absence", "late", "no call", "no show"]):
+        risk_tags.append("attendance risk")
+
+    if any(term in blob for term in ["discipline", "corrective", "coaching", "counseling", "warning"]):
+        risk_tags.append("coaching / discipline review")
+
+    if any(term in blob for term in ["safety", "incident", "accident", "inspection", "vehicle"]):
+        risk_tags.append("safety review")
+
+    if any(term in blob for term in ["union", "agreement", "contract", "cba", "grievance", "labor"]):
+        risk_tags.append("HR / labor review recommended")
+
+    if any(term in blob for term in ["documentation", "document", "record"]):
+        risk_tags.append("documentation needed")
+
+    if not risk_tags:
+        risk_tags.append("review needed")
+
+    return risk_tags
+
+
+def lori_policy_parse_section_heading(heading: str) -> Dict[str, Any]:
+    clean_heading = lori_policy_clean_text(heading)
+
+    article_number = None
+    section_number = None
+    section_title = clean_heading
+
+    section_match = re.search(
+        r"(section|sec\.?)\s+([0-9]+(?:\.[0-9]+)*)\s*[—\-:]\s*(.+)",
+        clean_heading,
+        flags=re.IGNORECASE,
+    )
+
+    if section_match:
+        section_number = section_match.group(2).strip()
+        section_title = section_match.group(3).strip()
+        return {
+            "article_number": None,
+            "section_number": section_number,
+            "section_title": section_title,
+        }
+
+    article_match = re.search(
+        r"(article)\s+([0-9ivxlcdm]+)\s*[—\-:]\s*(.+)",
+        clean_heading,
+        flags=re.IGNORECASE,
+    )
+
+    if article_match:
+        article_number = f"Article {article_match.group(2).strip()}"
+        section_title = article_match.group(3).strip()
+        return {
+            "article_number": article_number,
+            "section_number": None,
+            "section_title": section_title,
+        }
+
+    policy_match = re.search(
+        r"(policy area)\s+([0-9]+)\s*[—\-:]\s*(.+)",
+        clean_heading,
+        flags=re.IGNORECASE,
+    )
+
+    if policy_match:
+        article_number = f"Policy Area {policy_match.group(2).strip()}"
+        section_title = policy_match.group(3).strip()
+        return {
+            "article_number": article_number,
+            "section_number": None,
+            "section_title": section_title,
+        }
+
+    return {
+        "article_number": article_number,
+        "section_number": section_number,
+        "section_title": section_title,
+    }
+
+
+def lori_policy_split_text_into_sections(text: str) -> List[Dict[str, Any]]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized).strip()
+
+    if not normalized:
+        return []
+
+    heading_pattern = re.compile(
+        r"(?im)^(section\s+[0-9]+(?:\.[0-9]+)*\s*[—\-:]\s*.+|article\s+[0-9ivxlcdm]+\s*[—\-:]\s*.+|policy area\s+[0-9]+\s*[—\-:]\s*.+)$"
+    )
+
+    matches = list(heading_pattern.finditer(normalized))
+    sections: List[Dict[str, Any]] = []
+
+    if matches:
+        for index, match in enumerate(matches):
+            heading = match.group(1).strip()
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+            section_body = normalized[start:end].strip()
+
+            parsed = lori_policy_parse_section_heading(heading)
+
+            full_text = f"{heading}\n{section_body}".strip()
+
+            if len(full_text) < 30:
+                continue
+
+            sections.append(
+                {
+                    "article_number": parsed.get("article_number"),
+                    "section_number": parsed.get("section_number"),
+                    "section_title": parsed.get("section_title"),
+                    "section_text": full_text,
+                    "page_number": None,
+                    "topic_tags": lori_policy_extract_topic_tags(full_text),
+                    "risk_tags": lori_policy_extract_risk_tags(full_text),
+                    "applies_to": ["drivers", "supervisors", "operations leadership"],
+                }
+            )
+
+    if not sections:
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", normalized) if p.strip()]
+        current_chunk = []
+        current_length = 0
+        chunk_number = 1
+
+        for paragraph in paragraphs:
+            current_chunk.append(paragraph)
+            current_length += len(paragraph)
+
+            if current_length >= 1200:
+                chunk_text = "\n\n".join(current_chunk).strip()
+                sections.append(
+                    {
+                        "article_number": "Extracted Text",
+                        "section_number": str(chunk_number),
+                        "section_title": f"Extracted Policy Section {chunk_number}",
+                        "section_text": chunk_text,
+                        "page_number": None,
+                        "topic_tags": lori_policy_extract_topic_tags(chunk_text),
+                        "risk_tags": lori_policy_extract_risk_tags(chunk_text),
+                        "applies_to": ["drivers", "supervisors", "operations leadership"],
+                    }
+                )
+                chunk_number += 1
+                current_chunk = []
+                current_length = 0
+
+        if current_chunk:
+            chunk_text = "\n\n".join(current_chunk).strip()
+            sections.append(
+                {
+                    "article_number": "Extracted Text",
+                    "section_number": str(chunk_number),
+                    "section_title": f"Extracted Policy Section {chunk_number}",
+                    "section_text": chunk_text,
+                    "page_number": None,
+                    "topic_tags": lori_policy_extract_topic_tags(chunk_text),
+                    "risk_tags": lori_policy_extract_risk_tags(chunk_text),
+                    "applies_to": ["drivers", "supervisors", "operations leadership"],
+                }
+            )
+
+    return sections[:100]
+
+
+async def lori_policy_get_document_for_extraction(
+    document_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if document_id:
+        records = await lori_policy_supabase_get(
+            f"lori_policy_documents?select=*&id=eq.{document_id}&limit=1"
+        )
+        return records[0] if records else None
+
+    documents = await lori_policy_supabase_get(
+        "lori_policy_documents?select=*&order=created_at.desc&limit=50"
+    )
+
+    for document in documents:
+        status = str(document.get("document_status") or "")
+        file_path = document.get("source_file_path")
+
+        if file_path and "Pending Extraction" in status:
+            return document
+
+    return None
+
+
+@app.post("/policy-document-extract")
+async def policy_document_extract(
+    api_key: Optional[str] = Query(None),
+    document_id: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    document = await lori_policy_get_document_for_extraction(document_id)
+
+    if not document:
+        return {
+            "status": "not_found",
+            "message": "No uploaded policy/agreement document is currently pending extraction.",
+            "sections_created": 0,
+            "answer_text": (
+                "No uploaded policy or agreement document is currently pending extraction. "
+                "Upload a document first or provide a valid document_id."
+            ),
+        }
+
+    doc_id = document.get("id")
+    file_path = document.get("source_file_path")
+    file_name = document.get("source_file_name") or document.get("document_title")
+
+    if not file_path:
+        return {
+            "status": "missing_file",
+            "message": "The selected policy/agreement document does not have a stored file path.",
+            "document": document,
+            "sections_created": 0,
+        }
+
+    file_bytes = await lori_policy_download_from_storage(file_path)
+
+    extracted_text = lori_policy_extract_text_from_file(
+        file_bytes=file_bytes,
+        file_name=file_name,
+    )
+
+    if not extracted_text.strip():
+        await lori_policy_supabase_patch(
+            "lori_policy_documents",
+            doc_id,
+            {
+                "document_status": "Extraction Failed / No Text Found",
+                "notes": "LORI attempted extraction, but no readable text was found. This may be a scanned PDF requiring OCR.",
+            },
+        )
+
+        return {
+            "status": "no_text_found",
+            "message": "No readable text was found in the uploaded document.",
+            "document_id": doc_id,
+            "sections_created": 0,
+            "answer_text": (
+                "LORI could not extract readable text from this document. "
+                "If this is a scanned PDF, OCR will be needed in a later upgrade."
+            ),
+        }
+
+    sections = lori_policy_split_text_into_sections(extracted_text)
+
+    if not sections:
+        return {
+            "status": "no_sections_created",
+            "message": "Text was extracted, but no sections were created.",
+            "document_id": doc_id,
+            "extracted_character_count": len(extracted_text),
+            "sections_created": 0,
+        }
+
+    await lori_policy_supabase_delete_sections(doc_id)
+
+    insert_payload = []
+
+    for section in sections:
+        insert_payload.append(
+            {
+                "document_id": doc_id,
+                "article_number": section.get("article_number"),
+                "section_number": section.get("section_number"),
+                "section_title": section.get("section_title"),
+                "page_number": section.get("page_number"),
+                "section_text": section.get("section_text"),
+                "topic_tags": section.get("topic_tags"),
+                "risk_tags": section.get("risk_tags"),
+                "applies_to": section.get("applies_to"),
+            }
+        )
+
+    created_sections = await lori_policy_supabase_post_many(
+        "lori_policy_sections",
+        insert_payload,
+    )
+
+    await lori_policy_supabase_patch(
+        "lori_policy_documents",
+        doc_id,
+        {
+            "document_status": "Extracted / Searchable",
+            "summary": (
+                f"{document.get('document_type') or 'Policy / Agreement'} extracted by LORI. "
+                f"{len(created_sections)} searchable section(s) created for policy search, agreement review, "
+                f"supervisor-ready counseling language, HR/labor/compliance review, and operational decision support."
+            ),
+            "notes": (
+                f"Extraction complete. LORI created {len(created_sections)} searchable section(s). "
+                "Human review is still required before formal HR, labor, legal, compliance, or leadership action."
+            ),
+        },
+    )
+
+    answer_text = f"""Policy / Agreement Extraction Complete
+
+Document:
+{document.get("document_title")}
+
+Status:
+Extracted / Searchable
+
+Sections Created:
+{len(created_sections)}
+
+What LORI Can Do Now:
+- Search this uploaded document
+- Identify potentially relevant sections
+- Support agreement or policy review
+- Generate supervisor-ready counseling language
+- Stage HR, labor, compliance, legal, or leadership review notes
+
+Important Note:
+This extraction supports operational decision-making. The official document and extracted sections should be verified by authorized HR, labor relations, compliance, legal, or leadership personnel before formal action."""
+
+    return {
+        "status": "success",
+        "message": "Policy/agreement document extraction completed.",
+        "document_id": doc_id,
+        "document_title": document.get("document_title"),
+        "source_file_name": file_name,
+        "extracted_character_count": len(extracted_text),
+        "sections_created": len(created_sections),
+        "sections": created_sections,
+        "answer_text": answer_text,
+    }
+
+
+@app.get("/policy-extraction-status")
+async def policy_extraction_status(
+    api_key: Optional[str] = Query(None),
+    limit: int = Query(20),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 100))
+
+    documents = await lori_policy_supabase_get(
+        f"lori_policy_documents?select=*&order=created_at.desc&limit={limit}"
+    )
+
+    extracted_count = len([
+        doc for doc in documents
+        if "Extracted / Searchable" in str(doc.get("document_status") or "")
+    ])
+
+    pending_count = len([
+        doc for doc in documents
+        if "Pending Extraction" in str(doc.get("document_status") or "")
+    ])
+
+    failed_count = len([
+        doc for doc in documents
+        if "Extraction Failed" in str(doc.get("document_status") or "")
+    ])
+
+    return {
+        "status": "success",
+        "documents_count": len(documents),
+        "extracted_count": extracted_count,
+        "pending_extraction_count": pending_count,
+        "failed_extraction_count": failed_count,
+        "documents": documents,
+    }
