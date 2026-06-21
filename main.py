@@ -4506,3 +4506,290 @@ async def policy_extraction_status(
         "failed_extraction_count": failed_count,
         "documents": documents,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# Specific Document Policy / Agreement Intelligence
+# Allows LORI to search and review against one uploaded document,
+# instead of searching every policy/agreement section together.
+# ============================================================
+
+from urllib.parse import quote
+
+
+async def lori_policy_get_document_by_id_or_title(
+    document_id: Optional[str] = None,
+    document_title: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if document_id:
+        docs = await lori_policy_supabase_get(
+            f"lori_policy_documents?select=*&id=eq.{quote(document_id)}&limit=1"
+        )
+        if docs:
+            return docs[0]
+
+    if document_title:
+        cleaned_title = lori_policy_clean_text(document_title)
+        docs = await lori_policy_supabase_get(
+            f"lori_policy_documents?select=*&document_title=ilike.*{quote(cleaned_title)}*&order=created_at.desc&limit=1"
+        )
+        if docs:
+            return docs[0]
+
+    return None
+
+
+async def lori_policy_get_latest_extracted_document() -> Optional[Dict[str, Any]]:
+    docs = await lori_policy_supabase_get(
+        "lori_policy_documents?select=*&order=created_at.desc&limit=50"
+    )
+
+    for doc in docs:
+        status = str(doc.get("document_status") or "")
+        if "Extracted / Searchable" in status:
+            return doc
+
+    return None
+
+
+async def lori_policy_get_sections_for_document(document_id: str) -> List[Dict[str, Any]]:
+    sections = await lori_policy_supabase_get(
+        f"lori_policy_sections?select=*&document_id=eq.{quote(document_id)}&order=section_number.asc&limit=500"
+    )
+    return sections
+
+
+async def lori_policy_find_matches_in_document(
+    question: str,
+    document: Dict[str, Any],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    document_id = document.get("id")
+
+    if not document_id:
+        return []
+
+    sections = await lori_policy_get_sections_for_document(document_id)
+
+    scored: List[Dict[str, Any]] = []
+
+    for section in sections:
+        score = lori_policy_score_section(question, section, document)
+
+        if score > 0:
+            scored.append(
+                {
+                    "score": score,
+                    "section": section,
+                    "document": document,
+                }
+            )
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+
+    return scored[:limit]
+
+
+@app.get("/policy-document-sections")
+async def policy_document_sections(
+    api_key: Optional[str] = Query(None),
+    document_id: Optional[str] = Query(None),
+    document_title: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 500))
+
+    document = await lori_policy_get_document_by_id_or_title(
+        document_id=document_id,
+        document_title=document_title,
+    )
+
+    if not document:
+        return {
+            "status": "not_found",
+            "message": "No matching policy/agreement document was found.",
+            "document_id": document_id,
+            "document_title": document_title,
+            "sections_count": 0,
+            "sections": [],
+        }
+
+    sections = await lori_policy_get_sections_for_document(document.get("id"))
+    sections = sections[:limit]
+
+    return {
+        "status": "success",
+        "document": document,
+        "sections_count": len(sections),
+        "sections": sections,
+    }
+
+
+@app.get("/policy-search-document")
+async def policy_search_document(
+    api_key: Optional[str] = Query(None),
+    query: str = Query(...),
+    document_id: Optional[str] = Query(None),
+    document_title: Optional[str] = Query(None),
+    limit: int = Query(5),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 10))
+
+    document = await lori_policy_get_document_by_id_or_title(
+        document_id=document_id,
+        document_title=document_title,
+    )
+
+    if not document:
+        document = await lori_policy_get_latest_extracted_document()
+
+    if not document:
+        return {
+            "status": "not_found",
+            "message": "No searchable policy/agreement document was found. Upload and extract a document first.",
+            "query": query,
+            "matches_count": 0,
+            "matches": [],
+        }
+
+    matches = await lori_policy_find_matches_in_document(
+        question=query,
+        document=document,
+        limit=limit,
+    )
+
+    return {
+        "status": "success",
+        "query": query,
+        "document_id": document.get("id"),
+        "document_title": document.get("document_title"),
+        "document_status": document.get("document_status"),
+        "matches_count": len(matches),
+        "matches": matches,
+    }
+
+
+@app.get("/voiceflow/policy-review-document")
+async def voiceflow_policy_review_document(
+    api_key: Optional[str] = Query(None),
+    question: str = Query(...),
+    document_id: Optional[str] = Query(None),
+    document_title: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    employee_id: Optional[str] = Query(None),
+    supervisor_name: Optional[str] = Query(None),
+    limit: int = Query(5),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 10))
+
+    situation_type = lori_policy_detect_situation_type(question)
+
+    document = await lori_policy_get_document_by_id_or_title(
+        document_id=document_id,
+        document_title=document_title,
+    )
+
+    if not document:
+        document = await lori_policy_get_latest_extracted_document()
+
+    if not document:
+        answer_text = f"""Agreement / Policy Review
+
+Situation Type:
+{situation_type}
+
+Status:
+No extracted/searchable policy or agreement document is currently available.
+
+Recommended Next Action:
+Upload and extract the relevant union agreement, company policy, SOP, work rule, or driver policy before asking LORI to review the situation against a specific document.
+
+Compliance Note:
+This is not a final HR, legal, labor, compliance, or contract determination. Authorized review is required before formal action."""
+
+        return {
+            "status": "not_found",
+            "question": question,
+            "situation_type": situation_type,
+            "matches_count": 0,
+            "answer_text": answer_text,
+        }
+
+    matches = await lori_policy_find_matches_in_document(
+        question=question,
+        document=document,
+        limit=limit,
+    )
+
+    review_payload = {
+        "request_text": question,
+        "driver_name": driver_name,
+        "employee_id": employee_id,
+        "supervisor_name": supervisor_name,
+        "situation_type": situation_type,
+        "operating_state": document.get("operating_state") or "MD",
+        "station_code": document.get("station_code") or "JESSUP-01",
+        "document_id": document.get("id"),
+        "review_status": "Open",
+        "priority": "Review Needed",
+    }
+
+    created_review = await lori_policy_supabase_post(
+        "lori_policy_review_requests",
+        review_payload,
+    )
+
+    review_request = created_review[0] if created_review else None
+
+    answer_text = lori_policy_build_answer(
+        question=question,
+        situation_type=situation_type,
+        matches=matches,
+        review_request=review_request,
+    )
+
+    if review_request and matches:
+        top_match = matches[0]
+
+        finding_payload = {
+            "review_request_id": review_request.get("id"),
+            "document_id": document.get("id"),
+            "section_id": top_match["section"].get("id"),
+            "finding_type": "Specific Document Policy / Agreement Review",
+            "confidence_level": "Needs Human Review",
+            "issue_summary": question,
+            "potentially_relevant_section": top_match["section"].get("section_title"),
+            "relevant_language": top_match["section"].get("section_text"),
+            "operational_concern": (
+                "This may require review against the selected uploaded policy/agreement document."
+            ),
+            "facts_to_confirm": (
+                "Confirm the facts, driver or employee involved, date, supervisor, documentation, current policy version, and prior coaching history."
+            ),
+            "recommended_supervisor_language": lori_policy_build_supervisor_language(situation_type),
+            "recommended_next_action": (
+                "Review the extracted document section and route the matter to HR, labor relations, compliance, legal, or leadership review before formal action."
+            ),
+        }
+
+        await lori_policy_supabase_post(
+            "lori_policy_findings",
+            finding_payload,
+        )
+
+    return {
+        "status": "success",
+        "question": question,
+        "situation_type": situation_type,
+        "document_id": document.get("id"),
+        "document_title": document.get("document_title"),
+        "document_status": document.get("document_status"),
+        "matches_count": len(matches),
+        "review_request": review_request,
+        "answer_text": answer_text,
+    }
