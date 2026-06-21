@@ -4793,3 +4793,655 @@ This is not a final HR, legal, labor, compliance, or contract determination. Aut
         "review_request": review_request,
         "answer_text": answer_text,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# ACTION CENTER BACKEND
+# Creates, reads, updates, and summarizes operational action items,
+# supervisor follow-ups, HR/labor/compliance review notes,
+# and leadership briefing queue items.
+# ============================================================
+
+from fastapi import Body
+from datetime import date, datetime, timedelta
+from urllib.parse import quote
+from typing import Any, Dict, List, Optional
+
+
+ACTION_ITEM_ALLOWED_FIELDS = {
+    "action_title",
+    "action_type",
+    "action_status",
+    "priority",
+    "source_module",
+    "source_type",
+    "source_reference_id",
+    "driver_name",
+    "employee_id",
+    "supervisor_name",
+    "owner_name",
+    "owner_role",
+    "station_code",
+    "operating_state",
+    "company_name",
+    "reason",
+    "recommended_follow_up",
+    "documentation_note",
+    "compliance_note",
+    "due_date",
+    "created_by",
+}
+
+REVIEW_NOTE_ALLOWED_FIELDS = {
+    "action_item_id",
+    "review_type",
+    "review_status",
+    "priority",
+    "related_driver_name",
+    "related_employee_id",
+    "supervisor_name",
+    "policy_document_id",
+    "policy_section_id",
+    "review_summary",
+    "relevant_policy_or_agreement",
+    "facts_to_confirm",
+    "recommended_review_note",
+    "required_reviewer",
+    "created_by",
+}
+
+LEADERSHIP_QUEUE_ALLOWED_FIELDS = {
+    "action_item_id",
+    "briefing_title",
+    "briefing_type",
+    "briefing_status",
+    "priority",
+    "station_code",
+    "operating_state",
+    "executive_summary",
+    "key_risk",
+    "recommended_leadership_action",
+    "supervisor_follow_up",
+    "compliance_note",
+    "created_by",
+}
+
+SUPERVISOR_FOLLOWUP_ALLOWED_FIELDS = {
+    "action_item_id",
+    "supervisor_name",
+    "driver_name",
+    "employee_id",
+    "followup_type",
+    "followup_status",
+    "priority",
+    "followup_reason",
+    "recommended_script",
+    "documentation_required",
+    "due_date",
+    "created_by",
+}
+
+
+def lori_action_clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def lori_action_parse_due_date(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text or text.lower() in {"string", "null", "none"}:
+        return None
+
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d").date()
+        return parsed.isoformat()
+    except Exception:
+        return None
+
+
+def lori_action_default_due_date(days: int = 3) -> str:
+    return (date.today() + timedelta(days=days)).isoformat()
+
+
+def lori_action_filter_payload(
+    payload: Dict[str, Any],
+    allowed_fields: set,
+) -> Dict[str, Any]:
+    cleaned: Dict[str, Any] = {}
+
+    for key, value in payload.items():
+        if key not in allowed_fields:
+            continue
+
+        if key == "due_date":
+            cleaned[key] = lori_action_parse_due_date(value)
+        else:
+            cleaned[key] = value if value != "" else None
+
+    return cleaned
+
+
+async def lori_action_get_table_rows(
+    table: str,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    limit = max(1, min(limit, 1000))
+    return await lori_policy_supabase_get(
+        f"{table}?select=*&order=created_at.desc&limit={limit}"
+    )
+
+
+def lori_action_count_by(rows: List[Dict[str, Any]], field: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+
+    for row in rows:
+        value = row.get(field) or "Not Listed"
+        counts[str(value)] = counts.get(str(value), 0) + 1
+
+    return counts
+
+
+def lori_action_is_open(status: Any) -> bool:
+    text = lori_action_clean_text(status).lower()
+    return text not in {"closed", "complete", "completed", "resolved", "cancelled", "canceled"}
+
+
+def lori_action_due_soon(row: Dict[str, Any], days: int = 7) -> bool:
+    due_date_value = row.get("due_date")
+
+    if not due_date_value:
+        return False
+
+    try:
+        due = datetime.strptime(str(due_date_value), "%Y-%m-%d").date()
+    except Exception:
+        return False
+
+    today = date.today()
+    return today <= due <= today + timedelta(days=days)
+
+
+def lori_action_build_answer(action: Dict[str, Any]) -> str:
+    return f"""Action Center Item Created
+
+Action:
+{action.get("action_title") or "Operational follow-up"}
+
+Type:
+{action.get("action_type") or "Operational Follow-Up"}
+
+Priority:
+{action.get("priority") or "Medium"}
+
+Status:
+{action.get("action_status") or "Open"}
+
+Owner:
+{action.get("owner_name") or action.get("supervisor_name") or "Owner to be assigned"}
+
+Reason:
+{action.get("reason") or "Operational follow-up created through LORI."}
+
+Recommended Follow-Up:
+{action.get("recommended_follow_up") or "Review the issue, confirm the facts, document next steps, and escalate if needed."}
+
+Due Date:
+{action.get("due_date") or "Not assigned"}
+
+Leadership / Compliance Note:
+{action.get("compliance_note") or "Validate before formal HR, labor, legal, compliance, audit, regulatory, or corrective action."}"""
+
+
+@app.get("/action-center-summary")
+async def action_center_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    actions = await lori_action_get_table_rows("lori_action_items", 500)
+    review_notes = await lori_action_get_table_rows("lori_review_notes", 500)
+    briefing_items = await lori_action_get_table_rows("lori_leadership_briefing_queue", 500)
+    supervisor_followups = await lori_action_get_table_rows("lori_supervisor_followups", 500)
+
+    open_actions = [a for a in actions if lori_action_is_open(a.get("action_status"))]
+    high_priority_actions = [
+        a for a in actions
+        if str(a.get("priority") or "").lower() in {"high", "critical"}
+        and lori_action_is_open(a.get("action_status"))
+    ]
+    due_soon_actions = [
+        a for a in actions
+        if lori_action_is_open(a.get("action_status")) and lori_action_due_soon(a, 7)
+    ]
+
+    hr_labor_review_needed = [
+        n for n in review_notes
+        if lori_action_is_open(n.get("review_status"))
+    ]
+
+    answer_text = f"""Action Center Summary
+
+Open Actions:
+{len(open_actions)}
+
+High / Critical Priority Actions:
+{len(high_priority_actions)}
+
+Supervisor Follow-Ups:
+{len(supervisor_followups)}
+
+HR / Labor / Compliance Review Notes:
+{len(hr_labor_review_needed)}
+
+Leadership Briefing Queue:
+{len(briefing_items)}
+
+Due Within 7 Days:
+{len(due_soon_actions)}
+
+Recommended Next Action:
+Review high-priority open actions first, assign owners where missing, and move HR/labor/compliance-sensitive items into formal review before any corrective action is finalized."""
+
+    return {
+        "status": "success",
+        "action_items_count": len(actions),
+        "open_actions_count": len(open_actions),
+        "high_priority_open_count": len(high_priority_actions),
+        "due_within_7_days_count": len(due_soon_actions),
+        "review_notes_count": len(review_notes),
+        "open_review_notes_count": len(hr_labor_review_needed),
+        "briefing_items_count": len(briefing_items),
+        "supervisor_followups_count": len(supervisor_followups),
+        "action_status_counts": lori_action_count_by(actions, "action_status"),
+        "priority_counts": lori_action_count_by(actions, "priority"),
+        "source_module_counts": lori_action_count_by(actions, "source_module"),
+        "recent_actions": actions[:10],
+        "answer_text": answer_text,
+    }
+
+
+@app.get("/action-items")
+async def get_action_items(
+    api_key: Optional[str] = Query(None),
+    action_status: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    source_module: Optional[str] = Query(None),
+    supervisor_name: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_action_get_table_rows("lori_action_items", 500)
+
+    if action_status:
+        rows = [
+            r for r in rows
+            if lori_action_clean_text(r.get("action_status")).lower() == action_status.lower()
+        ]
+
+    if priority:
+        rows = [
+            r for r in rows
+            if lori_action_clean_text(r.get("priority")).lower() == priority.lower()
+        ]
+
+    if source_module:
+        rows = [
+            r for r in rows
+            if source_module.lower() in lori_action_clean_text(r.get("source_module")).lower()
+        ]
+
+    if supervisor_name:
+        rows = [
+            r for r in rows
+            if supervisor_name.lower() in lori_action_clean_text(r.get("supervisor_name")).lower()
+        ]
+
+    limit = max(1, min(limit, 200))
+    rows = rows[:limit]
+
+    return {
+        "status": "success",
+        "action_items_count": len(rows),
+        "action_items": rows,
+    }
+
+
+@app.post("/action-item-create")
+async def action_item_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    action_payload = lori_action_filter_payload(
+        payload,
+        ACTION_ITEM_ALLOWED_FIELDS,
+    )
+
+    if not action_payload.get("action_title"):
+        action_payload["action_title"] = "LORI Operational Follow-Up"
+
+    action_payload.setdefault("action_type", "Operational Follow-Up")
+    action_payload.setdefault("action_status", "Open")
+    action_payload.setdefault("priority", "Medium")
+    action_payload.setdefault("source_module", "LORI Action Center")
+    action_payload.setdefault("station_code", "JESSUP-01")
+    action_payload.setdefault("operating_state", "MD")
+    action_payload.setdefault("company_name", "Food Authority")
+    action_payload.setdefault("due_date", lori_action_default_due_date(3))
+    action_payload.setdefault("created_by", "LORI Action Center")
+
+    created = await lori_policy_supabase_post(
+        "lori_action_items",
+        action_payload,
+    )
+
+    action = created[0] if created else {}
+
+    return {
+        "status": "success",
+        "message": "Action item created.",
+        "action_item": action,
+        "answer_text": lori_action_build_answer(action),
+    }
+
+
+@app.post("/action-item-update")
+async def action_item_update(
+    api_key: Optional[str] = Query(None),
+    action_item_id: str = Query(...),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    update_payload = lori_action_filter_payload(
+        payload,
+        ACTION_ITEM_ALLOWED_FIELDS,
+    )
+
+    if "action_status" in update_payload:
+        status_text = lori_action_clean_text(update_payload.get("action_status")).lower()
+        if status_text in {"complete", "completed", "closed", "resolved"}:
+            update_payload["completed_at"] = datetime.utcnow().isoformat()
+
+    update_payload["updated_at"] = datetime.utcnow().isoformat()
+
+    updated = await lori_policy_supabase_patch(
+        "lori_action_items",
+        action_item_id,
+        update_payload,
+    )
+
+    action = updated[0] if updated else {}
+
+    return {
+        "status": "success",
+        "message": "Action item updated.",
+        "action_item": action,
+        "answer_text": lori_action_build_answer(action),
+    }
+
+
+@app.post("/supervisor-followup-create")
+async def supervisor_followup_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    action_payload = {
+        "action_title": payload.get("action_title") or "Supervisor Follow-Up Required",
+        "action_type": payload.get("action_type") or "Supervisor Follow-Up",
+        "action_status": "Open",
+        "priority": payload.get("priority") or "Medium",
+        "source_module": payload.get("source_module") or "LORI Action Center",
+        "source_type": payload.get("source_type") or "Supervisor Follow-Up",
+        "driver_name": payload.get("driver_name"),
+        "employee_id": payload.get("employee_id"),
+        "supervisor_name": payload.get("supervisor_name"),
+        "owner_name": payload.get("owner_name") or payload.get("supervisor_name"),
+        "owner_role": payload.get("owner_role") or "Supervisor",
+        "station_code": payload.get("station_code") or "JESSUP-01",
+        "operating_state": payload.get("operating_state") or "MD",
+        "company_name": payload.get("company_name") or "Food Authority",
+        "reason": payload.get("followup_reason") or payload.get("reason") or "Supervisor follow-up created through LORI.",
+        "recommended_follow_up": payload.get("recommended_script") or payload.get("recommended_follow_up"),
+        "documentation_note": payload.get("documentation_required") or payload.get("documentation_note"),
+        "due_date": lori_action_parse_due_date(payload.get("due_date")) or lori_action_default_due_date(3),
+        "created_by": "LORI Action Center",
+    }
+
+    created_action = await lori_policy_supabase_post(
+        "lori_action_items",
+        action_payload,
+    )
+
+    action = created_action[0] if created_action else {}
+
+    followup_payload = lori_action_filter_payload(
+        payload,
+        SUPERVISOR_FOLLOWUP_ALLOWED_FIELDS,
+    )
+
+    followup_payload["action_item_id"] = action.get("id")
+    followup_payload.setdefault("followup_type", "Supervisor Follow-Up")
+    followup_payload.setdefault("followup_status", "Open")
+    followup_payload.setdefault("priority", action.get("priority") or "Medium")
+    followup_payload.setdefault("due_date", action.get("due_date"))
+    followup_payload.setdefault("created_by", "LORI Action Center")
+
+    created_followup = await lori_policy_supabase_post(
+        "lori_supervisor_followups",
+        followup_payload,
+    )
+
+    followup = created_followup[0] if created_followup else {}
+
+    answer_text = f"""Supervisor Follow-Up Created
+
+Action:
+{action.get("action_title")}
+
+Supervisor / Owner:
+{action.get("owner_name") or "Owner to be assigned"}
+
+Driver:
+{action.get("driver_name") or "Not driver-specific"}
+
+Priority:
+{action.get("priority")}
+
+Due Date:
+{action.get("due_date")}
+
+Recommended Follow-Up:
+{action.get("recommended_follow_up") or "Review the issue, confirm facts, document the conversation, and escalate if needed."}
+
+Documentation Note:
+{action.get("documentation_note") or "Document the follow-up and validate before formal action."}"""
+
+    return {
+        "status": "success",
+        "message": "Supervisor follow-up created.",
+        "action_item": action,
+        "supervisor_followup": followup,
+        "answer_text": answer_text,
+    }
+
+
+@app.post("/review-note-create")
+async def review_note_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    action_payload = {
+        "action_title": payload.get("action_title") or "HR / Labor / Compliance Review Required",
+        "action_type": payload.get("action_type") or "HR / Labor / Compliance Review",
+        "action_status": "Open",
+        "priority": payload.get("priority") or "High",
+        "source_module": payload.get("source_module") or "LORI Action Center",
+        "source_type": payload.get("source_type") or "Review Note",
+        "driver_name": payload.get("related_driver_name"),
+        "employee_id": payload.get("related_employee_id"),
+        "supervisor_name": payload.get("supervisor_name"),
+        "owner_name": payload.get("owner_name") or "HR / Labor / Compliance",
+        "owner_role": payload.get("owner_role") or "HR / Labor / Compliance",
+        "station_code": payload.get("station_code") or "JESSUP-01",
+        "operating_state": payload.get("operating_state") or "MD",
+        "company_name": payload.get("company_name") or "Food Authority",
+        "reason": payload.get("review_summary") or "Review note created through LORI.",
+        "recommended_follow_up": payload.get("recommended_review_note"),
+        "documentation_note": payload.get("facts_to_confirm"),
+        "due_date": lori_action_parse_due_date(payload.get("due_date")) or lori_action_default_due_date(3),
+        "created_by": "LORI Action Center",
+    }
+
+    created_action = await lori_policy_supabase_post(
+        "lori_action_items",
+        action_payload,
+    )
+
+    action = created_action[0] if created_action else {}
+
+    review_payload = lori_action_filter_payload(
+        payload,
+        REVIEW_NOTE_ALLOWED_FIELDS,
+    )
+
+    review_payload["action_item_id"] = action.get("id")
+    review_payload.setdefault("review_type", "HR / Labor / Compliance Review")
+    review_payload.setdefault("review_status", "Open")
+    review_payload.setdefault("priority", action.get("priority") or "High")
+    review_payload.setdefault("required_reviewer", "HR, labor relations, compliance, legal, or leadership")
+    review_payload.setdefault("created_by", "LORI Action Center")
+
+    created_review = await lori_policy_supabase_post(
+        "lori_review_notes",
+        review_payload,
+    )
+
+    review_note = created_review[0] if created_review else {}
+
+    answer_text = f"""HR / Labor / Compliance Review Note Created
+
+Review Type:
+{review_note.get("review_type") or "HR / Labor / Compliance Review"}
+
+Priority:
+{review_note.get("priority") or "High"}
+
+Review Summary:
+{review_note.get("review_summary") or action.get("reason") or "Review needed."}
+
+Facts to Confirm:
+{review_note.get("facts_to_confirm") or "Confirm facts, documentation, policy/agreement language, and reviewer assignment."}
+
+Required Reviewer:
+{review_note.get("required_reviewer") or "HR, labor relations, compliance, legal, or leadership"}
+
+Action Item:
+{action.get("action_title")}
+
+Due Date:
+{action.get("due_date")}"""
+
+    return {
+        "status": "success",
+        "message": "Review note created.",
+        "action_item": action,
+        "review_note": review_note,
+        "answer_text": answer_text,
+    }
+
+
+@app.post("/leadership-briefing-item-create")
+async def leadership_briefing_item_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    action_payload = {
+        "action_title": payload.get("action_title") or payload.get("briefing_title") or "Leadership Briefing Item",
+        "action_type": payload.get("action_type") or "Leadership Briefing Item",
+        "action_status": "Open",
+        "priority": payload.get("priority") or "Medium",
+        "source_module": payload.get("source_module") or "LORI Action Center",
+        "source_type": payload.get("source_type") or "Leadership Briefing",
+        "owner_name": payload.get("owner_name") or "Operations Leadership",
+        "owner_role": payload.get("owner_role") or "Leadership",
+        "station_code": payload.get("station_code") or "JESSUP-01",
+        "operating_state": payload.get("operating_state") or "MD",
+        "company_name": payload.get("company_name") or "Food Authority",
+        "reason": payload.get("executive_summary") or payload.get("key_risk") or "Leadership briefing item created through LORI.",
+        "recommended_follow_up": payload.get("recommended_leadership_action"),
+        "documentation_note": payload.get("supervisor_follow_up"),
+        "due_date": lori_action_parse_due_date(payload.get("due_date")) or lori_action_default_due_date(5),
+        "created_by": "LORI Action Center",
+    }
+
+    created_action = await lori_policy_supabase_post(
+        "lori_action_items",
+        action_payload,
+    )
+
+    action = created_action[0] if created_action else {}
+
+    briefing_payload = lori_action_filter_payload(
+        payload,
+        LEADERSHIP_QUEUE_ALLOWED_FIELDS,
+    )
+
+    briefing_payload["action_item_id"] = action.get("id")
+    briefing_payload.setdefault("briefing_title", action.get("action_title") or "Leadership Briefing Item")
+    briefing_payload.setdefault("briefing_type", "Operational Leadership Briefing")
+    briefing_payload.setdefault("briefing_status", "Queued")
+    briefing_payload.setdefault("priority", action.get("priority") or "Medium")
+    briefing_payload.setdefault("station_code", action.get("station_code") or "JESSUP-01")
+    briefing_payload.setdefault("operating_state", action.get("operating_state") or "MD")
+    briefing_payload.setdefault("created_by", "LORI Action Center")
+
+    created_briefing = await lori_policy_supabase_post(
+        "lori_leadership_briefing_queue",
+        briefing_payload,
+    )
+
+    briefing_item = created_briefing[0] if created_briefing else {}
+
+    answer_text = f"""Leadership Briefing Item Created
+
+Briefing Title:
+{briefing_item.get("briefing_title")}
+
+Priority:
+{briefing_item.get("priority")}
+
+Status:
+{briefing_item.get("briefing_status")}
+
+Executive Summary:
+{briefing_item.get("executive_summary") or action.get("reason")}
+
+Recommended Leadership Action:
+{briefing_item.get("recommended_leadership_action") or action.get("recommended_follow_up")}
+
+Supervisor Follow-Up:
+{briefing_item.get("supervisor_follow_up") or action.get("documentation_note")}
+
+Compliance Note:
+{briefing_item.get("compliance_note") or "Validate before formal action."}"""
+
+    return {
+        "status": "success",
+        "message": "Leadership briefing item created.",
+        "action_item": action,
+        "briefing_item": briefing_item,
+        "answer_text": answer_text,
+    }
