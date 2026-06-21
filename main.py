@@ -3748,3 +3748,229 @@ This is not a final HR, legal, labor, or contract determination. HR, labor relat
     )
 
     return "\n".join(lines)
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# Compliance & Policy Center Upload / Intake Endpoint
+# Stores uploaded agreement, policy, SOP, and work-rule documents
+# in Supabase Storage and creates document metadata records.
+# ============================================================
+
+from fastapi import UploadFile, File, Form
+import uuid
+import mimetypes
+
+
+POLICY_UPLOAD_BUCKET = "policy-agreement-uploads"
+
+
+def lori_policy_safe_filename(filename: str) -> str:
+    filename = filename or "uploaded-policy-document"
+    filename = filename.strip().replace("\\", "/").split("/")[-1]
+    filename = re.sub(r"[^a-zA-Z0-9._-]+", "_", filename)
+    filename = filename.strip("_")
+    return filename or "uploaded-policy-document"
+
+
+def lori_policy_safe_document_type(document_type: Optional[str]) -> str:
+    allowed_types = {
+        "Union Agreement / CBA",
+        "Company Policy",
+        "Driver Work Rules",
+        "SOP / Procedure",
+        "Safety Policy",
+        "Attendance Policy",
+        "Discipline / Progressive Coaching Policy",
+        "Route Assignment Rules",
+        "Overtime / Scheduling Rules",
+        "Other Policy / Agreement",
+    }
+
+    if document_type in allowed_types:
+        return document_type
+
+    return "Other Policy / Agreement"
+
+
+def lori_policy_storage_headers(content_type: Optional[str] = None) -> Dict[str, str]:
+    base_headers = lori_regulatory_supabase_headers()
+
+    headers = {
+        "apikey": base_headers.get("apikey", ""),
+        "Authorization": base_headers.get("Authorization", ""),
+        "x-upsert": "true",
+    }
+
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    return headers
+
+
+async def lori_policy_upload_to_storage(
+    file_bytes: bytes,
+    file_path: str,
+    content_type: str,
+) -> Dict[str, Any]:
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{POLICY_UPLOAD_BUCKET}/{file_path}"
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            upload_url,
+            headers=lori_policy_storage_headers(content_type),
+            content=file_bytes,
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase Storage upload failed: {response.text}",
+        )
+
+    return {
+        "storage_status": "uploaded",
+        "storage_path": file_path,
+        "storage_response": response.text,
+    }
+
+
+@app.post("/policy-document-intake")
+async def policy_document_intake(
+    api_key: Optional[str] = Form(None),
+
+    document_title: str = Form(...),
+    document_type: str = Form("Company Policy"),
+    company_name: str = Form("Demonstration Company"),
+    operating_state: str = Form("MD"),
+    station_code: str = Form("JESSUP-01"),
+
+    document_version: Optional[str] = Form(None),
+    effective_date: Optional[str] = Form(None),
+    expiration_date: Optional[str] = Form(None),
+    notes: Optional[str] = Form(None),
+
+    file: Optional[UploadFile] = File(None),
+):
+    """
+    Upload/intake endpoint for Compliance & Policy Center.
+
+    This creates a searchable document metadata record now.
+    Full PDF/text extraction and section parsing will be connected later.
+    """
+
+    lori_regulatory_require_key(api_key)
+
+    cleaned_document_title = lori_policy_clean_text(document_title)
+    cleaned_document_type = lori_policy_safe_document_type(document_type)
+    cleaned_company_name = lori_policy_clean_text(company_name) or "Demonstration Company"
+    cleaned_operating_state = lori_policy_clean_text(operating_state).upper() or "MD"
+    cleaned_station_code = lori_policy_clean_text(station_code).upper() or "JESSUP-01"
+
+    source_file_name = None
+    source_file_path = None
+    source_file_url = None
+    upload_status = "Metadata Created / Pending File Upload"
+
+    if file is not None:
+        original_filename = lori_policy_safe_filename(file.filename or "policy-document")
+        file_bytes = await file.read()
+
+        if file_bytes:
+            guessed_type = file.content_type or mimetypes.guess_type(original_filename)[0] or "application/octet-stream"
+
+            unique_id = str(uuid.uuid4())
+            source_file_path = (
+                f"{cleaned_station_code}/"
+                f"{cleaned_document_type.replace(' ', '_').replace('/', '_')}/"
+                f"{unique_id}_{original_filename}"
+            )
+
+            await lori_policy_upload_to_storage(
+                file_bytes=file_bytes,
+                file_path=source_file_path,
+                content_type=guessed_type,
+            )
+
+            source_file_name = original_filename
+            source_file_url = f"{POLICY_UPLOAD_BUCKET}/{source_file_path}"
+            upload_status = "Uploaded / Pending Extraction"
+
+    summary = (
+        f"{cleaned_document_type} uploaded or registered for LORI Compliance & Policy Center review. "
+        f"Document is staged for section extraction, topic tagging, policy search, agreement review, "
+        f"and supervisor-ready counseling intelligence."
+    )
+
+    payload = {
+        "document_title": cleaned_document_title,
+        "document_type": cleaned_document_type,
+        "company_name": cleaned_company_name,
+        "operating_state": cleaned_operating_state,
+        "station_code": cleaned_station_code,
+        "document_status": upload_status,
+        "document_version": document_version,
+        "effective_date": effective_date or None,
+        "expiration_date": expiration_date or None,
+        "source_file_name": source_file_name,
+        "source_file_path": source_file_path,
+        "source_file_url": source_file_url,
+        "summary": summary,
+        "notes": notes or "Uploaded through LORI Compliance & Policy Center. Extraction pending.",
+        "created_by": "LORI Compliance Policy Center",
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_policy_documents",
+        payload,
+    )
+
+    document_record = created[0] if created else None
+
+    return {
+        "status": "success",
+        "message": "Policy/agreement document intake completed.",
+        "document_status": upload_status,
+        "document": document_record,
+        "storage_bucket": POLICY_UPLOAD_BUCKET,
+        "source_file_name": source_file_name,
+        "source_file_path": source_file_path,
+        "next_step": (
+            "Document metadata is saved. Full text extraction, clause parsing, section tagging, "
+            "and searchable policy intelligence can now be connected as the next backend upgrade."
+        ),
+        "disclaimer": (
+            "LORI provides operational decision support. Uploaded agreements, policies, SOPs, and work rules "
+            "must be reviewed by authorized HR, labor relations, compliance, legal, or leadership personnel "
+            "before formal action."
+        ),
+    }
+
+
+@app.get("/policy-intake-status")
+async def policy_intake_status(
+    api_key: Optional[str] = Query(None),
+    limit: int = Query(10),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 50))
+
+    documents = await lori_policy_supabase_get(
+        f"lori_policy_documents?select=*&order=created_at.desc&limit={limit}"
+    )
+
+    pending_extraction = [
+        doc for doc in documents
+        if "Pending Extraction" in str(doc.get("document_status") or "")
+        or "Pending File Upload" in str(doc.get("document_status") or "")
+    ]
+
+    return {
+        "status": "success",
+        "documents_count": len(documents),
+        "pending_extraction_count": len(pending_extraction),
+        "documents": documents,
+        "message": (
+            "Compliance & Policy Center document intake is active. "
+            "Documents can be uploaded or registered and staged for extraction."
+        ),
+    }
