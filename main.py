@@ -3454,3 +3454,297 @@ async def voiceflow_policy_review(
         "review_request": review_request,
         "answer_text": answer_text,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# Enhanced Counseling Language Override
+# Upgrades Agreement / Policy Review responses with polished,
+# supervisor-ready counseling scripts based on the policy issue.
+# ============================================================
+
+def lori_policy_build_enhanced_counseling_script(
+    situation_type: str,
+    question: str,
+    section: Dict[str, Any],
+    document: Dict[str, Any],
+) -> str:
+    situation = lori_policy_clean_text(situation_type).lower()
+    section_title = lori_policy_clean_text(section.get("section_title")) or "the applicable policy or agreement section"
+    document_title = lori_policy_clean_text(document.get("document_title")) or "the applicable policy or agreement document"
+
+    if situation == "attendance":
+        return f"""Supervisor Counseling Script — Attendance / Call-Out Review
+
+Opening Statement:
+I want to review an attendance and call-out concern with you in a clear and professional way. This conversation is intended to confirm the facts, review expectations, and prevent this from becoming a larger performance or compliance issue.
+
+Policy / Agreement Reference:
+The section currently flagged for review is "{section_title}" from "{document_title}." This section appears relevant because it addresses attendance expectations, call-out procedures, documentation, and supervisor follow-up.
+
+Facts to Confirm:
+Before any conclusion is made, we need to confirm the date or dates involved, the scheduled assignment, whether proper call-out steps were followed, whether notice was timely, whether documentation exists, and whether there is any prior coaching or pattern that should be reviewed.
+
+Expectation:
+The operational expectation is that drivers report to scheduled assignments on time and follow the established call-out process when they are unable to report. The call-out process is important because it allows the station to protect route coverage, customer commitments, staffing plans, and driver accountability.
+
+Operational Impact:
+When call-outs are repeated, late, undocumented, or inconsistent with procedure, it can affect route coverage, supervisor planning, customer service, overtime exposure, team fairness, and overall station reliability.
+
+Employee Response Prompt:
+Before we determine next steps, I want to give you an opportunity to explain what happened from your perspective. Is there any information, documentation, or context we should review before this matter is evaluated further?
+
+Corrective Expectation:
+Going forward, the expectation is that you follow the call-out procedure exactly, communicate as early as required, provide any required documentation, and understand that repeated attendance issues may require additional review under company policy, applicable work rules, or agreement language.
+
+Documentation Language:
+This conversation should be documented as an attendance expectation review and fact-confirmation discussion. It should not be written as a final policy violation, contract violation, or disciplinary determination unless HR, labor relations, compliance, legal, or leadership review confirms the appropriate next step.
+
+Recommended Next Step:
+Review the official policy or agreement language, verify the attendance record, confirm prior coaching history, document the conversation, and determine whether this should remain at the coaching level or be escalated for HR/labor review.
+
+HR / Labor / Compliance Note:
+This is not a final HR, legal, labor, or contract determination. Formal action should be reviewed by HR, labor relations, compliance, legal, or leadership before being finalized."""
+
+    if situation == "discipline":
+        return f"""Supervisor Counseling Script — Progressive Coaching / Discipline Review
+
+Opening Statement:
+I want to review this concern with you in a factual and professional manner. The purpose of this conversation is to clarify expectations, review the available facts, and determine whether coaching, documentation, or further review is appropriate.
+
+Policy / Agreement Reference:
+The section currently flagged for review is "{section_title}" from "{document_title}." This section appears relevant because it addresses coaching, documentation, progressive review, or the steps that should be considered before formal action.
+
+Facts to Confirm:
+Before any decision is made, we need to confirm what occurred, when it occurred, who was involved, whether prior coaching exists, whether the issue is isolated or repeated, and whether the official policy or agreement requires specific steps before escalation.
+
+Expectation:
+The expectation is that performance, conduct, safety, and operational concerns are addressed through a fair, documented, and consistent review process.
+
+Operational Impact:
+Unresolved concerns can affect safety, route reliability, team accountability, compliance readiness, and leadership confidence in the operation.
+
+Employee Response Prompt:
+I want to give you the opportunity to respond and provide any context or documentation that should be considered before next steps are determined.
+
+Corrective Expectation:
+Going forward, you are expected to correct the concern, follow the applicable work rule or policy expectation, and understand that repeated or unresolved concerns may require additional review.
+
+Documentation Language:
+This should be documented as a coaching and fact-review conversation unless HR, labor relations, compliance, legal, or leadership confirms that formal discipline is appropriate.
+
+Recommended Next Step:
+Confirm the facts, review the official policy or agreement, check prior documentation, and determine whether the matter should remain coaching or move to formal review.
+
+HR / Labor / Compliance Note:
+This is not a final disciplinary, contract, labor, or legal determination. Formal action should be reviewed before being finalized."""
+
+    if situation == "safety":
+        return f"""Supervisor Counseling Script — Safety Expectation Review
+
+Opening Statement:
+I want to review a safety-related concern with you. This conversation is focused on prevention, accountability, and making sure expectations are clear before the issue creates greater operational or compliance risk.
+
+Policy / Agreement Reference:
+The section currently flagged for review is "{section_title}" from "{document_title}." This section appears relevant because it may relate to safety expectations, vehicle readiness, inspection behavior, or driver responsibility.
+
+Facts to Confirm:
+We need to confirm what happened, when it happened, whether a vehicle, route, customer location, or inspection was involved, whether there were any safety events, and whether documentation or witness information exists.
+
+Expectation:
+The expectation is that drivers follow all safety procedures, report concerns immediately, complete required checks, and operate in a way that protects themselves, the public, customers, equipment, and the company.
+
+Operational Impact:
+Safety concerns can affect driver readiness, fleet reliability, customer delivery, DOT/FMCSA compliance posture, insurance exposure, and leadership confidence.
+
+Employee Response Prompt:
+Please explain what happened from your perspective and identify anything that may have contributed to the issue.
+
+Corrective Expectation:
+Going forward, the expectation is full compliance with safety procedures, timely communication of hazards or equipment concerns, and immediate correction of any unsafe behavior or missed process.
+
+Documentation Language:
+This should be documented as a safety expectation and prevention review. Any formal finding should be validated against safety records, policy, training records, and leadership/compliance review.
+
+Recommended Next Step:
+Confirm the facts, review safety documentation, determine whether retraining or inspection follow-up is needed, and document the supervisor discussion.
+
+HR / Labor / Compliance Note:
+This is not a final safety, HR, labor, legal, or compliance determination. Formal action should be reviewed before being finalized."""
+
+    if situation == "route":
+        return f"""Supervisor Counseling Script — Route Assignment / Operational Expectation Review
+
+Opening Statement:
+I want to review a route or assignment concern with you so we can confirm the facts, clarify expectations, and prevent operational disruption going forward.
+
+Policy / Agreement Reference:
+The section currently flagged for review is "{section_title}" from "{document_title}." This section appears relevant because it may relate to route assignment, dispatch expectations, scheduling, work rules, or operational coverage.
+
+Facts to Confirm:
+We need to confirm the assigned route, scheduled time, dispatch instruction, communication history, supervisor direction, and whether the issue affected customer delivery, route completion, or staffing.
+
+Expectation:
+The expectation is that route assignments and dispatch instructions are followed unless a supervisor approves a change or an operational exception is documented.
+
+Operational Impact:
+Route issues can affect customer service, service windows, staffing, overtime, delivery completion, supervisor planning, and team accountability.
+
+Employee Response Prompt:
+Please explain what happened and whether there was any confusion, delay, instruction issue, route condition, or communication problem that should be reviewed.
+
+Corrective Expectation:
+Going forward, route instructions, schedule expectations, and communication procedures must be followed. Any route concern should be escalated promptly to supervision.
+
+Documentation Language:
+This should be documented as a route assignment and expectation review. It should not be treated as a final agreement or policy violation without confirming the applicable work rule and operational facts.
+
+Recommended Next Step:
+Review dispatch records, route assignment details, supervisor notes, and applicable policy or agreement language before determining next steps.
+
+HR / Labor / Compliance Note:
+This is not a final HR, legal, labor, contract, or policy determination. Formal action should be reviewed before being finalized."""
+
+    return f"""Supervisor Counseling Script — Operational Expectation Review
+
+Opening Statement:
+I want to review this concern with you in a factual and professional way. The goal is to clarify expectations, confirm the facts, and determine the appropriate next step without jumping to conclusions.
+
+Policy / Agreement Reference:
+The section currently flagged for review is "{section_title}" from "{document_title}." This section appears relevant for review, but it should not be treated as a final violation finding without human review.
+
+Facts to Confirm:
+We need to confirm what occurred, when it occurred, who was involved, whether documentation exists, whether prior coaching applies, and whether the official policy, agreement, work rule, or procedure is current.
+
+Expectation:
+The expectation is that all drivers and team members follow applicable policies, work rules, supervisor instructions, safety requirements, and operational procedures.
+
+Operational Impact:
+If not addressed, this type of issue may affect accountability, safety, route reliability, team fairness, documentation quality, compliance readiness, or leadership confidence.
+
+Employee Response Prompt:
+Before next steps are determined, I want to give you an opportunity to provide your perspective and any information that should be considered.
+
+Corrective Expectation:
+Going forward, the expectation is that the concern is corrected, the applicable policy or work rule is followed, and any future issue is communicated promptly through the proper channel.
+
+Documentation Language:
+This should be documented as a coaching and expectation-setting discussion unless HR, labor relations, compliance, legal, or leadership review confirms that formal action is appropriate.
+
+Recommended Next Step:
+Review the official document, confirm the facts, document the conversation, and determine whether coaching, monitoring, additional training, or formal review is appropriate.
+
+HR / Labor / Compliance Note:
+This is not a final HR, legal, labor, contract, or policy determination. Formal action should be reviewed before being finalized."""
+
+
+def lori_policy_build_answer(
+    question: str,
+    situation_type: str,
+    matches: List[Dict[str, Any]],
+    review_request: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Enhanced policy/agreement answer.
+    Overrides the earlier version to include stronger counseling language.
+    """
+
+    if not matches:
+        return f"""Agreement / Policy Review
+
+Situation Type:
+{situation_type}
+
+Status:
+I do not see a matching agreement or policy section in the currently searchable LORI policy records.
+
+Recommended Next Action:
+Upload or confirm the relevant union agreement, company policy, work rule, SOP, or driver policy so LORI can compare the situation against the official language.
+
+Supervisor Counseling Guidance:
+Before counseling, the supervisor should confirm the facts, identify the correct document, review the current policy or agreement language, and avoid making a final violation statement until HR, labor relations, compliance, legal, or leadership review is complete.
+
+Recommended Supervisor Language:
+“I want to review this matter with you to clarify expectations and confirm the facts. This conversation is not a final policy, agreement, or disciplinary determination. We will review the applicable policy or agreement language before determining next steps.”
+
+Compliance Note:
+This is not a final HR, legal, labor, or contract determination. HR, labor relations, compliance, legal, or leadership review is recommended before formal action."""
+
+    top_match = matches[0]
+    top_section = top_match["section"]
+    top_document = top_match["document"]
+
+    section_label_parts = [
+        lori_policy_clean_text(top_section.get("article_number")),
+        lori_policy_clean_text(top_section.get("section_number")),
+        lori_policy_clean_text(top_section.get("section_title")),
+    ]
+    section_label = " — ".join([part for part in section_label_parts if part])
+
+    counseling_script = lori_policy_build_enhanced_counseling_script(
+        situation_type=situation_type,
+        question=question,
+        section=top_section,
+        document=top_document,
+    )
+
+    lines = []
+
+    lines.append("Agreement / Policy Review")
+    lines.append("")
+    lines.append("Situation Type:")
+    lines.append(situation_type)
+    lines.append("")
+    lines.append("Primary Document:")
+    lines.append(lori_policy_clean_text(top_document.get("document_title")) or "Not listed")
+    lines.append("")
+    lines.append("Document Type:")
+    lines.append(lori_policy_clean_text(top_document.get("document_type")) or "Not listed")
+    lines.append("")
+    lines.append("Potentially Relevant Section:")
+    lines.append(section_label or "Section not listed")
+    lines.append("")
+    lines.append("Relevant Language:")
+    lines.append(lori_policy_clean_text(top_section.get("section_text")))
+    lines.append("")
+    lines.append("Operational Concern:")
+    lines.append(
+        "The situation may require review against the identified agreement, policy, work rule, or procedure. "
+        "The section appears relevant for operational review, but it should not be treated as a final violation finding."
+    )
+    lines.append("")
+    lines.append("Facts to Confirm:")
+    lines.append(
+        "Confirm the date, time, driver or employee involved, supervisor, prior coaching history, documentation, "
+        "applicable route or assignment details, whether the official agreement or company policy version is current, "
+        "and whether HR, labor relations, compliance, legal, or leadership review is required before formal action."
+    )
+    lines.append("")
+    lines.append(counseling_script)
+    lines.append("")
+    lines.append("Recommended Next Action:")
+    lines.append(
+        "Use the counseling script as a supervisor-ready starting point, verify the official document language, confirm the facts, "
+        "document the conversation, and route the matter to HR, labor relations, compliance, legal, or leadership review before any formal action."
+    )
+
+    if len(matches) > 1:
+        lines.append("")
+        lines.append("Additional Sections to Review:")
+        for index, match in enumerate(matches[1:4], start=2):
+            section = match["section"]
+            document = match["document"]
+            label_parts = [
+                lori_policy_clean_text(document.get("document_title")),
+                lori_policy_clean_text(section.get("article_number")),
+                lori_policy_clean_text(section.get("section_number")),
+                lori_policy_clean_text(section.get("section_title")),
+            ]
+            label = " — ".join([part for part in label_parts if part])
+            lines.append(f"{index}. {label}")
+
+    lines.append("")
+    lines.append("HR / Labor / Compliance Note:")
+    lines.append(
+        "This is not a final HR, legal, labor, or contract determination. HR, labor relations, compliance, legal, or leadership review is recommended before formal action."
+    )
+
+    return "\n".join(lines)
