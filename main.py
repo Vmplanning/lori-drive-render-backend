@@ -1970,3 +1970,588 @@ async def create_new_driver(
             "Confirm DOT/FMCSA-sensitive records against official company files"
         ]
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# Regulatory Intelligence Backend
+# Adds live-ready regulatory alert scan endpoints
+# ============================================================
+
+import hashlib
+import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Optional
+
+import httpx
+from fastapi import Query, HTTPException
+
+
+REGULATORY_KEYWORDS = [
+    "fmcsa",
+    "dot",
+    "department of transportation",
+    "transportation",
+    "motor carrier",
+    "commercial motor vehicle",
+    "driver",
+    "drivers",
+    "cdl",
+    "medical card",
+    "hours of service",
+    "drug",
+    "alcohol",
+    "safety",
+    "inspection",
+    "vehicle",
+    "fleet",
+    "compliance",
+    "rule",
+    "notice",
+    "regulation",
+    "enforcement",
+    "crash",
+    "carrier",
+    "hazmat",
+    "hazardous materials",
+    "electronic logging",
+    "eld",
+]
+
+
+def lori_regulatory_require_key(api_key: Optional[str]) -> None:
+    if LORI_API_KEY and api_key != LORI_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+def lori_regulatory_supabase_headers(prefer: Optional[str] = None) -> Dict[str, str]:
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def lori_regulatory_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def lori_regulatory_clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def lori_regulatory_parse_date(value: Any) -> Optional[str]:
+    if not value:
+        return None
+
+    text = str(value).strip()
+
+    try:
+        parsed = parsedate_to_datetime(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    except Exception:
+        pass
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def lori_regulatory_hash(*parts: Any) -> str:
+    raw = "||".join([str(p or "") for p in parts])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def lori_regulatory_is_relevant(title: str, summary: str, source: Dict[str, Any]) -> bool:
+    combined = f"{title} {summary} {source.get('source_name', '')} {source.get('category', '')}".lower()
+
+    if source.get("source_type") in ["Federal", "State"] and source.get("agency"):
+        agency = str(source.get("agency", "")).lower()
+        if "transportation" in agency:
+            return True
+        if "motor carrier" in agency:
+            return True
+
+    return any(keyword in combined for keyword in REGULATORY_KEYWORDS)
+
+
+async def lori_regulatory_supabase_get(query_path: str) -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{query_path}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(url, headers=lori_regulatory_supabase_headers())
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase GET failed: {response.text}",
+        )
+
+    return response.json()
+
+
+async def lori_regulatory_supabase_post(table: str, payload: Dict[str, Any]) -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            url,
+            headers=lori_regulatory_supabase_headers("return=representation"),
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase POST failed: {response.text}",
+        )
+
+    return response.json()
+
+
+async def lori_regulatory_supabase_patch(table: str, row_id: str, payload: Dict[str, Any]) -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{row_id}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(
+            url,
+            headers=lori_regulatory_supabase_headers("return=representation"),
+            json=payload,
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase PATCH failed: {response.text}",
+        )
+
+    return response.json()
+
+
+async def lori_regulatory_alert_exists(content_hash: str) -> bool:
+    safe_hash = content_hash.replace("'", "")
+    rows = await lori_regulatory_supabase_get(
+        f"lori_regulatory_alerts?content_hash=eq.{safe_hash}&select=id&limit=1"
+    )
+    return bool(rows)
+
+
+async def lori_regulatory_fetch_rss(source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    feed_url = source.get("feed_url") or source.get("source_url")
+    if not feed_url:
+        return []
+
+    items: List[Dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        response = await client.get(
+            feed_url,
+            headers={"User-Agent": "LORI-Regulatory-Scanner/1.0"},
+        )
+
+    if response.status_code >= 400:
+        raise Exception(f"RSS fetch failed for {feed_url}: {response.status_code}")
+
+    root = ET.fromstring(response.text)
+
+    for item in root.findall(".//item"):
+        title = lori_regulatory_clean_text(item.findtext("title"))
+        link = lori_regulatory_clean_text(item.findtext("link"))
+        summary = lori_regulatory_clean_text(
+            item.findtext("description") or item.findtext("summary")
+        )
+        published_raw = item.findtext("pubDate") or item.findtext("published") or item.findtext("updated")
+        published_at = lori_regulatory_parse_date(published_raw)
+
+        if not title:
+            continue
+
+        if not lori_regulatory_is_relevant(title, summary, source):
+            continue
+
+        items.append(
+            {
+                "title": title,
+                "summary": summary,
+                "url": link,
+                "published_at": published_at,
+                "raw": {
+                    "source": "rss",
+                    "feed_url": feed_url,
+                    "published_raw": published_raw,
+                },
+            }
+        )
+
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    for entry in root.findall(".//atom:entry", ns):
+        title = lori_regulatory_clean_text(entry.findtext("atom:title", default="", namespaces=ns))
+        summary = lori_regulatory_clean_text(
+            entry.findtext("atom:summary", default="", namespaces=ns)
+            or entry.findtext("atom:content", default="", namespaces=ns)
+        )
+        published_raw = (
+            entry.findtext("atom:published", default="", namespaces=ns)
+            or entry.findtext("atom:updated", default="", namespaces=ns)
+        )
+        published_at = lori_regulatory_parse_date(published_raw)
+
+        link = ""
+        link_el = entry.find("atom:link", ns)
+        if link_el is not None:
+            link = link_el.attrib.get("href", "")
+
+        if not title:
+            continue
+
+        if not lori_regulatory_is_relevant(title, summary, source):
+            continue
+
+        items.append(
+            {
+                "title": title,
+                "summary": summary,
+                "url": link,
+                "published_at": published_at,
+                "raw": {
+                    "source": "atom",
+                    "feed_url": feed_url,
+                    "published_raw": published_raw,
+                },
+            }
+        )
+
+    return items[:20]
+
+
+async def lori_regulatory_fetch_federal_register(source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+
+    api_urls = [
+        "https://www.federalregister.gov/api/v1/documents.json?conditions%5Bagencies%5D%5B%5D=federal-motor-carrier-safety-administration&order=newest&per_page=10",
+        "https://www.federalregister.gov/api/v1/documents.json?conditions%5Bagencies%5D%5B%5D=transportation-department&order=newest&per_page=10",
+    ]
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for api_url in api_urls:
+            response = await client.get(
+                api_url,
+                headers={"User-Agent": "LORI-Regulatory-Scanner/1.0"},
+            )
+
+            if response.status_code >= 400:
+                continue
+
+            data = response.json()
+
+            for doc in data.get("results", []):
+                title = lori_regulatory_clean_text(doc.get("title"))
+                summary = lori_regulatory_clean_text(doc.get("abstract") or doc.get("type"))
+                url = doc.get("html_url") or doc.get("pdf_url") or doc.get("public_inspection_pdf_url")
+                published_at = lori_regulatory_parse_date(doc.get("publication_date"))
+
+                if not title:
+                    continue
+
+                if not lori_regulatory_is_relevant(title, summary, source):
+                    continue
+
+                items.append(
+                    {
+                        "title": title,
+                        "summary": summary,
+                        "url": url,
+                        "published_at": published_at,
+                        "raw": {
+                            "source": "federal_register",
+                            "document_number": doc.get("document_number"),
+                            "type": doc.get("type"),
+                            "publication_date": doc.get("publication_date"),
+                            "agencies": doc.get("agencies"),
+                        },
+                    }
+                )
+
+    return items[:20]
+
+
+async def lori_regulatory_fetch_source(source: Dict[str, Any]) -> List[Dict[str, Any]]:
+    source_format = str(source.get("source_format") or "").lower()
+    source_name = str(source.get("source_name") or "").lower()
+
+    if "federal register" in source_name or source_format == "api":
+        return await lori_regulatory_fetch_federal_register(source)
+
+    if source.get("feed_url") or source_format == "rss":
+        return await lori_regulatory_fetch_rss(source)
+
+    return []
+
+
+def lori_regulatory_priority_for_item(item: Dict[str, Any]) -> str:
+    text = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+
+    if any(word in text for word in ["final rule", "effective", "emergency", "enforcement"]):
+        return "High"
+
+    if any(word in text for word in ["proposed rule", "notice", "comment", "guidance"]):
+        return "Watch"
+
+    return "Informational"
+
+
+def lori_regulatory_build_operational_impact(item: Dict[str, Any]) -> str:
+    return (
+        "This update may require review for potential impact on driver operations, "
+        "station readiness, safety procedures, DOT/FMCSA compliance planning, "
+        "company policy, supervisor briefing, or leadership awareness."
+    )
+
+
+def lori_regulatory_build_recommended_preparation(item: Dict[str, Any]) -> str:
+    return (
+        "Review the official source, confirm whether the update applies to the operating location, "
+        "identify affected drivers or supervisors, determine whether policy or training updates are needed, "
+        "and prepare a leadership briefing if operational impact is confirmed."
+    )
+
+
+@app.get("/regulatory-alerts")
+async def get_regulatory_alerts(
+    api_key: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    limit: int = Query(10),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 50))
+
+    query = (
+        "lori_regulatory_alerts?"
+        "select=*"
+        "&order=created_at.desc"
+        f"&limit={limit}"
+    )
+
+    if state:
+        query += f"&state_code=eq.{state.upper()}"
+
+    alerts = await lori_regulatory_supabase_get(query)
+
+    latest_logs = await lori_regulatory_supabase_get(
+        "lori_regulatory_scan_logs?select=*&order=created_at.desc&limit=1"
+    )
+
+    latest_log = latest_logs[0] if latest_logs else None
+
+    if alerts:
+        status_message = "New or stored regulatory alerts are available for review."
+        result = "Regulatory Update Requires Review"
+    else:
+        status_message = "No new verified regulatory updates found in the current stored alert set."
+        result = "No New Verified Updates Found"
+
+    return {
+        "status": "success",
+        "result": result,
+        "message": status_message,
+        "last_checked": latest_log.get("scan_completed_at") if latest_log else None,
+        "latest_scan": latest_log,
+        "alerts_count": len(alerts),
+        "alerts": alerts,
+        "disclaimer": (
+            "LORI provides operational decision support. Regulatory alerts, transportation laws, "
+            "DOT/FMCSA updates, state law changes, labor/HR updates, and compliance-sensitive matters "
+            "must be verified against official sources and reviewed by appropriate compliance, HR, "
+            "labor relations, or legal personnel before formal action."
+        ),
+    }
+
+
+@app.get("/regulatory-scan-log")
+async def get_regulatory_scan_log(
+    api_key: Optional[str] = Query(None),
+    limit: int = Query(10),
+):
+    lori_regulatory_require_key(api_key)
+
+    limit = max(1, min(limit, 50))
+
+    logs = await lori_regulatory_supabase_get(
+        f"lori_regulatory_scan_logs?select=*&order=created_at.desc&limit={limit}"
+    )
+
+    return {
+        "status": "success",
+        "scan_logs": logs,
+    }
+
+
+@app.post("/regulatory-scan")
+async def run_regulatory_scan(
+    api_key: Optional[str] = Query(None),
+    operating_state: Optional[str] = Query("MD"),
+    station_code: Optional[str] = Query("JESSUP-01"),
+):
+    lori_regulatory_require_key(api_key)
+
+    scan_log_payload = {
+        "scan_started_at": lori_regulatory_now_iso(),
+        "scan_status": "Started",
+        "operating_state": operating_state.upper() if operating_state else None,
+        "station_code": station_code or "JESSUP-01",
+        "federal_check_status": "Started",
+        "state_check_status": "Started",
+        "dot_fmcsa_check_status": "Started",
+        "labor_hr_check_status": "Pending",
+        "sources_checked": 0,
+        "alerts_found": 0,
+        "new_alerts_found": 0,
+        "result_summary": "Regulatory scan started.",
+    }
+
+    created_log = await lori_regulatory_supabase_post(
+        "lori_regulatory_scan_logs",
+        scan_log_payload,
+    )
+
+    scan_log_id = created_log[0]["id"] if created_log else None
+
+    sources = await lori_regulatory_supabase_get(
+        "lori_regulatory_sources?is_active=eq.true&select=*"
+    )
+
+    sources_checked = 0
+    alerts_found = 0
+    new_alerts_found = 0
+    errors: List[str] = []
+    stored_alerts: List[Dict[str, Any]] = []
+
+    for source in sources:
+        try:
+            source_state = source.get("state_code")
+            source_type = source.get("source_type")
+
+            if source_type == "State" and source_state and operating_state:
+                if source_state.upper() != operating_state.upper():
+                    continue
+
+            items = await lori_regulatory_fetch_source(source)
+            sources_checked += 1
+            alerts_found += len(items)
+
+            for item in items:
+                content_hash = lori_regulatory_hash(
+                    source.get("id"),
+                    item.get("title"),
+                    item.get("url"),
+                    item.get("published_at"),
+                )
+
+                exists = await lori_regulatory_alert_exists(content_hash)
+                if exists:
+                    continue
+
+                priority = lori_regulatory_priority_for_item(item)
+
+                alert_payload = {
+                    "source_id": source.get("id"),
+                    "alert_title": item.get("title"),
+                    "alert_summary": item.get("summary"),
+                    "alert_body": item.get("summary"),
+                    "source_type": source.get("source_type"),
+                    "agency": source.get("agency"),
+                    "jurisdiction": source.get("jurisdiction"),
+                    "state_code": source.get("state_code"),
+                    "category": source.get("category"),
+                    "published_at": item.get("published_at"),
+                    "source_url": item.get("url"),
+                    "alert_priority": priority,
+                    "alert_status": "New",
+                    "applies_to": [
+                        "Drivers",
+                        "Supervisors",
+                        "Station Leadership",
+                        "Fleet Operations",
+                    ],
+                    "operational_impact": lori_regulatory_build_operational_impact(item),
+                    "recommended_preparation": lori_regulatory_build_recommended_preparation(item),
+                    "source_verification_status": "Official source found - leadership verification recommended",
+                    "content_hash": content_hash,
+                    "raw_payload": item.get("raw"),
+                }
+
+                inserted_alert = await lori_regulatory_supabase_post(
+                    "lori_regulatory_alerts",
+                    alert_payload,
+                )
+
+                if inserted_alert:
+                    new_alerts_found += 1
+                    stored_alerts.append(inserted_alert[0])
+
+        except Exception as exc:
+            errors.append(f"{source.get('source_name', 'Unknown source')}: {str(exc)}")
+
+    if new_alerts_found > 0:
+        scan_status = "Completed - New Alerts Found"
+        result_summary = f"Regulatory scan completed. {new_alerts_found} new alert(s) found."
+    else:
+        scan_status = "Completed - No New Verified Updates Found"
+        result_summary = "Regulatory scan completed. No new verified updates found from configured sources."
+
+    federal_status = "Checked" if sources_checked > 0 else "No active federal sources checked"
+    state_status = "Checked" if operating_state else "No operating state selected"
+    dot_status = "Checked" if sources_checked > 0 else "No DOT/FMCSA sources checked"
+
+    update_payload = {
+        "scan_completed_at": lori_regulatory_now_iso(),
+        "scan_status": scan_status,
+        "federal_check_status": federal_status,
+        "state_check_status": state_status,
+        "dot_fmcsa_check_status": dot_status,
+        "labor_hr_check_status": "Pending source connection",
+        "sources_checked": sources_checked,
+        "alerts_found": alerts_found,
+        "new_alerts_found": new_alerts_found,
+        "result_summary": result_summary,
+        "error_message": "\n".join(errors) if errors else None,
+    }
+
+    if scan_log_id:
+        await lori_regulatory_supabase_patch(
+            "lori_regulatory_scan_logs",
+            scan_log_id,
+            update_payload,
+        )
+
+    return {
+        "status": "success",
+        "scan_status": scan_status,
+        "operating_state": operating_state,
+        "station_code": station_code,
+        "sources_checked": sources_checked,
+        "alerts_found": alerts_found,
+        "new_alerts_found": new_alerts_found,
+        "result_summary": result_summary,
+        "new_alerts": stored_alerts,
+        "errors": errors,
+        "disclaimer": (
+            "LORI provides operational decision support. Regulatory alerts must be verified against "
+            "official federal, state, DOT/FMCSA, HR, compliance, labor relations, or legal sources before formal action."
+        ),
+    }
