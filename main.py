@@ -16696,3 +16696,919 @@ async def route_contract_safeguard_status(
         "reviews": reviews,
         "acknowledgements": acknowledgements,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# SOP BUILDER ENGINE
+# Creates SOP drafts, sections, reviews, versions, acknowledgements,
+# and action links from station operations, driver, employee, safety,
+# compliance, route configuration, and policy documents.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime, date
+import os
+import httpx
+
+
+SUPABASE_URL_SOP = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_SOP = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_sop_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_sop_upper(value: Any) -> str:
+    return lori_sop_clean(value).upper()
+
+
+def lori_sop_safe_uuid(value: Any):
+    cleaned = lori_sop_clean(value)
+    return cleaned if cleaned else None
+
+
+def lori_sop_today() -> str:
+    return date.today().isoformat()
+
+
+async def lori_sop_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_sop_patch_rows(
+    table: str,
+    match_query: str,
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not SUPABASE_URL_SOP or not SUPABASE_SERVICE_ROLE_KEY_SOP:
+        raise RuntimeError("Missing Supabase environment variables.")
+
+    url = f"{SUPABASE_URL_SOP}/rest/v1/{table}?{match_query}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_SOP,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_SOP}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(url, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase PATCH failed: {response.status_code} {response.text}")
+
+    try:
+        return response.json()
+    except Exception:
+        return []
+
+
+def lori_sop_number(station_code: str, sop_type: str) -> str:
+    station = lori_sop_upper(station_code or "GLOBAL")
+    sop_type_short = lori_sop_upper(sop_type or "SOP").replace(" ", "-")[:18]
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M")
+    return f"SOP-{station}-{sop_type_short}-{timestamp}"
+
+
+def lori_sop_review_flags(
+    sop_type: str,
+    source_document: Optional[Dict[str, Any]],
+    user_instructions: str,
+) -> Dict[str, bool]:
+    combined = " ".join([
+        lori_sop_clean(sop_type),
+        lori_sop_clean(user_instructions),
+        lori_sop_clean((source_document or {}).get("document_type")),
+        lori_sop_clean((source_document or {}).get("document_category")),
+        lori_sop_clean((source_document or {}).get("document_title")),
+    ]).lower()
+
+    requires_safety_review = any(k in combined for k in ["safety", "accident", "incident", "dot", "osha"])
+    requires_compliance_review = any(k in combined for k in ["compliance", "regulatory", "policy", "audit"])
+    requires_hr_review = any(k in combined for k in ["employee", "staff", "discipline", "attendance", "counseling", "training"])
+    requires_labor_review = any(k in combined for k in ["union", "cba", "collective bargaining", "labor", "seniority", "grievance"])
+    requires_legal_review = any(k in combined for k in ["contract", "agreement", "owner-operator", "contractor", "legal"])
+
+    if source_document:
+        requires_safety_review = requires_safety_review or bool(source_document.get("safety_related")) or bool(source_document.get("accident_related"))
+        requires_compliance_review = requires_compliance_review or bool(source_document.get("compliance_related")) or bool(source_document.get("policy_related"))
+        requires_hr_review = requires_hr_review or bool(source_document.get("hr_review_required"))
+        requires_labor_review = requires_labor_review or bool(source_document.get("labor_review_required")) or bool(source_document.get("union_related"))
+        requires_legal_review = requires_legal_review or bool(source_document.get("legal_review_required")) or bool(source_document.get("contract_related"))
+
+    risk_level = "High" if requires_labor_review or requires_legal_review else ("Elevated" if requires_safety_review or requires_compliance_review or requires_hr_review else "Standard")
+
+    return {
+        "risk_level": risk_level,
+        "requires_hr_review": requires_hr_review,
+        "requires_labor_review": requires_labor_review,
+        "requires_legal_review": requires_legal_review,
+        "requires_safety_review": requires_safety_review,
+        "requires_compliance_review": requires_compliance_review,
+    }
+
+
+def lori_sop_generate_sections(
+    request: Dict[str, Any],
+    source_document: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    sop_type = lori_sop_clean(request.get("sop_type") or "Station Operations SOP")
+    subject_area = lori_sop_clean(request.get("subject_area") or sop_type)
+    department = lori_sop_clean(request.get("department") or "Operations")
+    audience = lori_sop_clean(request.get("audience") or "Authorized staff")
+    trigger_reason = lori_sop_clean(request.get("trigger_reason") or "Operational need")
+    instructions = lori_sop_clean(request.get("user_instructions"))
+    source_title = lori_sop_clean((source_document or {}).get("document_title"))
+    source_text = lori_sop_clean((source_document or {}).get("extracted_text"))
+
+    source_note = f"This SOP is supported by source document: {source_title}." if source_title else "No source document was selected. This SOP is generated from the user instructions and operating context."
+
+    if source_text:
+        source_summary = source_text[:1200]
+    else:
+        source_summary = "No extracted source text is available. Authorized review is required before publication."
+
+    base_procedure = [
+        "Confirm the active operating context, station, department, and audience before using this SOP.",
+        "Review the source document, policy, workflow, safety issue, route change, or compliance trigger connected to this SOP.",
+        "Confirm who owns the process and who is authorized to approve changes.",
+        "Follow the step-by-step procedure below and document any exceptions.",
+        "Escalate unclear, high-risk, HR, labor, legal, safety, DOT, or compliance issues before final action.",
+        "Record completion, acknowledgement, or follow-up action in LORI when required."
+    ]
+
+    if "route" in sop_type.lower() or "route" in subject_area.lower():
+        base_procedure.extend([
+            "Review the proposed route or work area change in Route Configuration.",
+            "Confirm workload, stop count, mileage, delivery windows, vehicle needs, helper needs, and driver impact.",
+            "Run the Contract & Labor Safeguard before implementation.",
+            "Send unresolved risks to Action Center or authorized leadership review.",
+            "Do not implement final route changes until required approvals are complete."
+        ])
+
+    if "safety" in sop_type.lower() or "accident" in subject_area.lower():
+        base_procedure.extend([
+            "Secure the area and address immediate safety concerns.",
+            "Document the incident, involved persons, time, location, and known facts.",
+            "Notify the supervisor, safety lead, HR, or required authority based on company policy.",
+            "Attach accident, incident, training, or corrective action documents to the correct employee or driver file.",
+            "Track follow-up actions until closed."
+        ])
+
+    if "driver" in sop_type.lower():
+        base_procedure.extend([
+            "Verify driver identity, route assignment, credentials, training status, and supervisor ownership.",
+            "Attach relevant documents to Driver 360.",
+            "Review safety, counseling, performance, route, and compliance history before final action.",
+            "Escalate contract, union, labor, or pay-related issues when applicable."
+        ])
+
+    if "employee" in sop_type.lower() or "staff" in sop_type.lower():
+        base_procedure.extend([
+            "Verify employee identity, department, role, supervisor, and station assignment.",
+            "Attach relevant files to the Employee / Staff File lane.",
+            "Escalate HR, training, safety, attendance, disciplinary, or return-to-work issues when required."
+        ])
+
+    procedure_text = "\n".join([f"{idx + 1}. {step}" for idx, step in enumerate(base_procedure)])
+
+    return [
+        {
+            "section_order": 1,
+            "section_title": "Purpose",
+            "section_type": "Purpose",
+            "section_text": f"This SOP defines the required process for {subject_area}. It was triggered by: {trigger_reason}. The purpose is to create a clear, repeatable, reviewable procedure for {department}.",
+            "required": True,
+        },
+        {
+            "section_order": 2,
+            "section_title": "Scope",
+            "section_type": "Scope",
+            "section_text": f"This SOP applies to {audience} at {lori_sop_clean(request.get('station_name')) or 'the selected operating location'}. It applies to the operating context selected in LORI and should not be used for another station unless approved.",
+            "required": True,
+        },
+        {
+            "section_order": 3,
+            "section_title": "Source Documents and Inputs",
+            "section_type": "Source",
+            "section_text": f"{source_note}\n\nSource preview:\n{source_summary}",
+            "required": True,
+        },
+        {
+            "section_order": 4,
+            "section_title": "Roles and Responsibilities",
+            "section_type": "Responsibilities",
+            "section_text": "The process owner is responsible for making sure the SOP is followed. Supervisors are responsible for review, escalation, documentation, and follow-up. Employees, drivers, contractors, or staff covered by the SOP are responsible for following the approved procedure and acknowledging training when required.",
+            "required": True,
+        },
+        {
+            "section_order": 5,
+            "section_title": "Step-by-Step Procedure",
+            "section_type": "Procedure",
+            "section_text": procedure_text,
+            "required": True,
+        },
+        {
+            "section_order": 6,
+            "section_title": "Required Review and Approval",
+            "section_type": "Approval",
+            "section_text": "Before this SOP is published or used as final company procedure, it must be reviewed by the required supervisor, safety, compliance, HR, labor relations, legal, or executive approver based on the risk type. LORI is a decision-support tool and does not replace authorized company approval.",
+            "required": True,
+        },
+        {
+            "section_order": 7,
+            "section_title": "Documentation and Audit Trail",
+            "section_type": "Documentation",
+            "section_text": "All relevant documents, approvals, acknowledgements, action items, exceptions, and follow-up notes must be stored in LORI. Documents should be attached to the correct station, driver, employee, route, policy, or action record.",
+            "required": True,
+        },
+        {
+            "section_order": 8,
+            "section_title": "Exceptions and Escalation",
+            "section_type": "Escalation",
+            "section_text": "Any exception, unclear instruction, safety concern, labor issue, contract concern, pay impact, compliance risk, or policy conflict must be escalated before final action. Do not proceed when the SOP conflicts with law, company policy, labor agreement, contract, safety rule, or authorized leadership direction.",
+            "required": True,
+        },
+        {
+            "section_order": 9,
+            "section_title": "Training and Acknowledgement",
+            "section_type": "Training",
+            "section_text": "Covered users should be trained on this SOP before use. Acknowledgement may be required for drivers, employees, supervisors, contractors, or department staff based on the SOP type and company requirements.",
+            "required": True,
+        },
+        {
+            "section_order": 10,
+            "section_title": "LORI Decision Support Notice",
+            "section_type": "Disclaimer",
+            "section_text": "LORI provides operational decision support only. SOPs must be reviewed and approved by authorized company leadership before use. HR, labor, legal, safety, compliance, DOT, and contract-related matters require appropriate authorized review.",
+            "required": True,
+        },
+    ]
+
+
+@app.get("/sop-builder-summary")
+async def sop_builder_summary(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    requests = await lori_sop_get_rows(
+        "lori_sop_builder_requests",
+        "select=*&order=created_at.desc&limit=5000",
+    )
+    sops = await lori_sop_get_rows(
+        "lori_sop_library",
+        "select=*&order=created_at.desc&limit=5000",
+    )
+
+    if station_code:
+        requests = [r for r in requests if lori_sop_upper(r.get("station_code")) == lori_sop_upper(station_code)]
+        sops = [s for s in sops if lori_sop_upper(s.get("station_code")) == lori_sop_upper(station_code)]
+
+    return {
+        "status": "success",
+        "sop_requests_count": len(requests),
+        "sop_library_count": len(sops),
+        "draft_sops_count": len([s for s in sops if s.get("sop_status") == "Draft"]),
+        "in_review_count": len([s for s in sops if s.get("sop_status") == "In Review"]),
+        "approved_count": len([s for s in sops if s.get("sop_status") == "Approved"]),
+        "published_count": len([s for s in sops if s.get("sop_status") == "Published"]),
+        "high_risk_count": len([s for s in sops if s.get("risk_level") == "High"]),
+        "requires_review_count": len([
+            s for s in sops
+            if s.get("requires_hr_review")
+            or s.get("requires_labor_review")
+            or s.get("requires_legal_review")
+            or s.get("requires_safety_review")
+            or s.get("requires_compliance_review")
+        ]),
+    }
+
+
+@app.get("/sop-source-document-options")
+async def sop_source_document_options(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    document_type: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    docs = await lori_sop_get_rows(
+        "lori_document_library",
+        "select=id,document_title,intake_lane,document_type,document_category,station_code,driver_name,employee_name,route_id,extraction_status,referenced_by_modules,created_at&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        docs = [d for d in docs if lori_sop_upper(d.get("station_code")) == lori_sop_upper(station_code)]
+
+    if document_type:
+        docs = [d for d in docs if lori_sop_clean(d.get("document_type")).lower() == document_type.lower()]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "documents_count": len(docs[:limit]),
+        "documents": docs[:limit],
+    }
+
+
+@app.post("/sop-build-request-create")
+async def sop_build_request_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request_title = lori_sop_clean(payload.get("request_title"))
+
+    if not request_title:
+        return {"status": "error", "message": "request_title is required."}
+
+    source_document_id = lori_sop_safe_uuid(payload.get("source_document_id"))
+    source_document_title = lori_sop_clean(payload.get("source_document_title"))
+
+    if source_document_id and not source_document_title:
+        docs = await lori_sop_get_rows(
+            "lori_document_library",
+            f"select=*&id=eq.{quote(source_document_id)}&limit=1",
+        )
+        if docs:
+            source_document_title = docs[0].get("document_title")
+
+    request_payload = {
+        "request_title": request_title,
+        "request_status": "Draft",
+        "sop_type": lori_sop_clean(payload.get("sop_type") or "Station Operations SOP"),
+        "sop_priority": lori_sop_clean(payload.get("sop_priority") or "Standard"),
+
+        "company_name": lori_sop_clean(payload.get("company_name")),
+        "region_code": lori_sop_upper(payload.get("region_code")),
+        "region_name": lori_sop_clean(payload.get("region_name")),
+        "operating_state": lori_sop_upper(payload.get("operating_state")),
+        "city": lori_sop_clean(payload.get("city")),
+        "station_code": lori_sop_upper(payload.get("station_code")),
+        "station_name": lori_sop_clean(payload.get("station_name")),
+        "primary_zip": lori_sop_clean(payload.get("primary_zip")),
+        "route_group": lori_sop_clean(payload.get("route_group")),
+        "route_id": lori_sop_clean(payload.get("route_id")),
+
+        "subject_area": lori_sop_clean(payload.get("subject_area")),
+        "department": lori_sop_clean(payload.get("department")),
+        "audience": lori_sop_clean(payload.get("audience")),
+        "trigger_reason": lori_sop_clean(payload.get("trigger_reason")),
+
+        "source_document_id": source_document_id,
+        "source_document_title": source_document_title,
+
+        "user_instructions": lori_sop_clean(payload.get("user_instructions")),
+        "desired_output_style": lori_sop_clean(payload.get("desired_output_style") or "Clear operational SOP"),
+        "requested_by": lori_sop_clean(payload.get("requested_by") or "LORI User"),
+
+        "ai_generation_status": "Not Started",
+        "review_status": "Not Reviewed",
+        "publication_status": "Unpublished",
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_sop_builder_requests",
+        request_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "SOP build request created.",
+        "request": created[0] if created else request_payload,
+    }
+
+
+@app.post("/sop-generate-draft")
+async def sop_generate_draft(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request_id = lori_sop_clean(payload.get("request_id"))
+
+    if not request_id:
+        return {"status": "error", "message": "request_id is required."}
+
+    requests = await lori_sop_get_rows(
+        "lori_sop_builder_requests",
+        f"select=*&id=eq.{quote(request_id)}&limit=1",
+    )
+
+    if not requests:
+        return {"status": "not_found", "message": "SOP request not found."}
+
+    request = requests[0]
+
+    source_document = None
+
+    if request.get("source_document_id"):
+        docs = await lori_sop_get_rows(
+            "lori_document_library",
+            f"select=*&id=eq.{quote(str(request.get('source_document_id')))}&limit=1",
+        )
+        source_document = docs[0] if docs else None
+
+    review_flags = lori_sop_review_flags(
+        sop_type=request.get("sop_type"),
+        source_document=source_document,
+        user_instructions=request.get("user_instructions") or "",
+    )
+
+    sop_title = lori_sop_clean(payload.get("sop_title") or request.get("request_title")).replace("Request — ", "").replace("Request - ", "")
+
+    sections = lori_sop_generate_sections(request, source_document)
+
+    full_sop_text = "\n\n".join([
+        f"{section['section_order']}. {section['section_title']}\n{section['section_text']}"
+        for section in sections
+    ])
+
+    sop_payload = {
+        "sop_request_id": request_id,
+        "sop_title": sop_title,
+        "sop_number": lori_sop_number(request.get("station_code"), request.get("sop_type")),
+        "sop_status": "Draft",
+        "sop_type": request.get("sop_type"),
+        "version_number": "1.0",
+
+        "company_name": request.get("company_name"),
+        "region_code": request.get("region_code"),
+        "region_name": request.get("region_name"),
+        "operating_state": request.get("operating_state"),
+        "city": request.get("city"),
+        "station_code": request.get("station_code"),
+        "station_name": request.get("station_name"),
+        "route_group": request.get("route_group"),
+        "route_id": request.get("route_id"),
+
+        "department": request.get("department"),
+        "audience": request.get("audience"),
+        "owner_name": payload.get("owner_name") or "Operations Leadership",
+
+        "effective_date": payload.get("effective_date") or None,
+        "review_due_date": payload.get("review_due_date") or None,
+        "expiration_date": payload.get("expiration_date") or None,
+
+        "purpose": sections[0]["section_text"],
+        "scope": sections[1]["section_text"],
+        "policy_reference": source_document.get("document_title") if source_document else request.get("source_document_title"),
+        "source_document_id": request.get("source_document_id"),
+        "source_document_title": source_document.get("document_title") if source_document else request.get("source_document_title"),
+
+        "full_sop_text": full_sop_text,
+        "executive_summary": f"Draft SOP for {request.get('subject_area') or request.get('sop_type')} serving {request.get('audience') or 'the selected audience'}.",
+        **review_flags,
+        "created_by": "LORI SOP Builder",
+    }
+
+    created_sop = await lori_policy_supabase_post(
+        "lori_sop_library",
+        sop_payload,
+    )
+
+    sop = created_sop[0] if created_sop else sop_payload
+    sop_id = sop.get("id")
+
+    created_sections = []
+
+    for section in sections:
+        section_payload = {
+            "sop_id": sop_id,
+            **section,
+        }
+        created = await lori_policy_supabase_post(
+            "lori_sop_sections",
+            section_payload,
+        )
+        if created:
+            created_sections.append(created[0])
+
+    if source_document and sop_id:
+        await lori_policy_supabase_post(
+            "lori_sop_source_documents",
+            {
+                "sop_id": sop_id,
+                "document_id": source_document.get("id"),
+                "source_title": source_document.get("document_title"),
+                "source_type": source_document.get("document_type"),
+                "source_relevance": "Primary source document used to generate SOP draft.",
+                "source_status": "Linked",
+            },
+        )
+
+    await lori_policy_supabase_post(
+        "lori_sop_versions",
+        {
+            "sop_id": sop_id,
+            "version_number": "1.0",
+            "version_status": "Draft",
+            "version_summary": "Initial SOP draft generated by LORI SOP Builder.",
+            "full_sop_text": full_sop_text,
+            "changed_by": payload.get("requested_by") or request.get("requested_by") or "LORI SOP Builder",
+            "change_reason": "Initial generation",
+        },
+    )
+
+    review_steps = []
+
+    if review_flags.get("requires_safety_review"):
+        review_steps.append(("Safety Review", "Safety Leader"))
+    if review_flags.get("requires_compliance_review"):
+        review_steps.append(("Compliance Review", "Compliance Owner"))
+    if review_flags.get("requires_hr_review"):
+        review_steps.append(("HR Review", "HR / People Leader"))
+    if review_flags.get("requires_labor_review"):
+        review_steps.append(("Labor Review", "Labor Relations"))
+    if review_flags.get("requires_legal_review"):
+        review_steps.append(("Legal Review", "Legal / Contract Owner"))
+
+    review_steps.insert(0, ("Supervisor Review", "Operations Supervisor"))
+
+    created_reviews = []
+
+    for review_type, role in review_steps:
+        created = await lori_policy_supabase_post(
+            "lori_sop_reviews",
+            {
+                "sop_id": sop_id,
+                "review_type": review_type,
+                "reviewer_role": role,
+                "review_status": "Pending",
+                "required": True,
+            },
+        )
+        if created:
+            created_reviews.append(created[0])
+
+    await lori_sop_patch_rows(
+        "lori_sop_builder_requests",
+        f"id=eq.{quote(request_id)}",
+        {
+            "request_status": "Completed",
+            "ai_generation_status": "Completed",
+            "review_status": "Pending Review",
+            "publication_status": "Unpublished",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "SOP draft generated.",
+        "sop": sop,
+        "sections_count": len(created_sections),
+        "sections": created_sections,
+        "reviews_count": len(created_reviews),
+        "reviews": created_reviews,
+        "decision_support_note": sop.get("decision_support_note"),
+    }
+
+
+@app.get("/sop-library")
+async def sop_library(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    sop_status: Optional[str] = Query(None),
+    sop_type: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    sops = await lori_sop_get_rows(
+        "lori_sop_library",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        sops = [s for s in sops if lori_sop_upper(s.get("station_code")) == lori_sop_upper(station_code)]
+
+    if sop_status:
+        sops = [s for s in sops if lori_sop_clean(s.get("sop_status")).lower() == sop_status.lower()]
+
+    if sop_type:
+        sops = [s for s in sops if lori_sop_clean(s.get("sop_type")).lower() == sop_type.lower()]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "sops_count": len(sops[:limit]),
+        "sops": sops[:limit],
+    }
+
+
+@app.get("/sop-detail")
+async def sop_detail(
+    api_key: Optional[str] = Query(None),
+    sop_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    sops = await lori_sop_get_rows(
+        "lori_sop_library",
+        f"select=*&id=eq.{quote(sop_id)}&limit=1",
+    )
+
+    if not sops:
+        return {"status": "not_found", "message": "SOP not found."}
+
+    sections = await lori_sop_get_rows(
+        "lori_sop_sections",
+        f"select=*&sop_id=eq.{quote(sop_id)}&order=section_order.asc&limit=500",
+    )
+
+    sources = await lori_sop_get_rows(
+        "lori_sop_source_documents",
+        f"select=*&sop_id=eq.{quote(sop_id)}&order=created_at.desc&limit=100",
+    )
+
+    reviews = await lori_sop_get_rows(
+        "lori_sop_reviews",
+        f"select=*&sop_id=eq.{quote(sop_id)}&order=created_at.asc&limit=100",
+    )
+
+    versions = await lori_sop_get_rows(
+        "lori_sop_versions",
+        f"select=*&sop_id=eq.{quote(sop_id)}&order=created_at.desc&limit=100",
+    )
+
+    acknowledgements = await lori_sop_get_rows(
+        "lori_sop_acknowledgements",
+        f"select=*&sop_id=eq.{quote(sop_id)}&order=created_at.desc&limit=500",
+    )
+
+    action_links = await lori_sop_get_rows(
+        "lori_sop_action_links",
+        f"select=*&sop_id=eq.{quote(sop_id)}&order=created_at.desc&limit=100",
+    )
+
+    return {
+        "status": "success",
+        "sop": sops[0],
+        "sections_count": len(sections),
+        "sections": sections,
+        "sources_count": len(sources),
+        "sources": sources,
+        "reviews_count": len(reviews),
+        "reviews": reviews,
+        "versions_count": len(versions),
+        "versions": versions,
+        "acknowledgements_count": len(acknowledgements),
+        "acknowledgements": acknowledgements,
+        "action_links_count": len(action_links),
+        "action_links": action_links,
+    }
+
+
+@app.post("/sop-review-update")
+async def sop_review_update(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    review_id = lori_sop_clean(payload.get("review_id"))
+
+    if not review_id:
+        return {"status": "error", "message": "review_id is required."}
+
+    update_payload = {
+        "reviewer_name": lori_sop_clean(payload.get("reviewer_name")),
+        "reviewer_email": lori_sop_clean(payload.get("reviewer_email")),
+        "reviewer_role": lori_sop_clean(payload.get("reviewer_role")),
+        "review_status": lori_sop_clean(payload.get("review_status") or "Approved"),
+        "review_notes": lori_sop_clean(payload.get("review_notes")),
+        "reviewed_at": datetime.utcnow().isoformat(),
+    }
+
+    updated = await lori_sop_patch_rows(
+        "lori_sop_reviews",
+        f"id=eq.{quote(review_id)}",
+        update_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "SOP review updated.",
+        "review": updated[0] if updated else update_payload,
+    }
+
+
+@app.post("/sop-status-update")
+async def sop_status_update(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    sop_id = lori_sop_clean(payload.get("sop_id"))
+    new_status = lori_sop_clean(payload.get("sop_status"))
+
+    if not sop_id:
+        return {"status": "error", "message": "sop_id is required."}
+
+    if not new_status:
+        return {"status": "error", "message": "sop_status is required."}
+
+    update_payload = {
+        "sop_status": new_status,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    if new_status == "Approved":
+        update_payload["approved_by"] = lori_sop_clean(payload.get("approved_by") or "LORI Admin")
+        update_payload["approved_at"] = datetime.utcnow().isoformat()
+
+    if new_status == "Published":
+        update_payload["published_by"] = lori_sop_clean(payload.get("published_by") or "LORI Admin")
+        update_payload["published_at"] = datetime.utcnow().isoformat()
+
+    updated = await lori_sop_patch_rows(
+        "lori_sop_library",
+        f"id=eq.{quote(sop_id)}",
+        update_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": f"SOP status updated to {new_status}.",
+        "sop": updated[0] if updated else update_payload,
+    }
+
+
+@app.post("/sop-acknowledgement-create")
+async def sop_acknowledgement_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    sop_id = lori_sop_clean(payload.get("sop_id"))
+
+    if not sop_id:
+        return {"status": "error", "message": "sop_id is required."}
+
+    acknowledgement_payload = {
+        "sop_id": sop_id,
+        "person_type": lori_sop_clean(payload.get("person_type")),
+        "person_name": lori_sop_clean(payload.get("person_name")),
+        "employee_id": lori_sop_clean(payload.get("employee_id")),
+        "driver_id": lori_sop_clean(payload.get("driver_id")),
+        "email": lori_sop_clean(payload.get("email")),
+        "station_code": lori_sop_upper(payload.get("station_code")),
+        "route_id": lori_sop_clean(payload.get("route_id")),
+        "department": lori_sop_clean(payload.get("department")),
+        "role_title": lori_sop_clean(payload.get("role_title")),
+        "acknowledgement_status": lori_sop_clean(payload.get("acknowledgement_status") or "Acknowledged"),
+        "acknowledged_by": lori_sop_clean(payload.get("acknowledged_by") or payload.get("person_name") or "LORI User"),
+        "acknowledged_at": datetime.utcnow().isoformat(),
+        "acknowledgement_notes": lori_sop_clean(payload.get("acknowledgement_notes")),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_sop_acknowledgements",
+        acknowledgement_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "SOP acknowledgement recorded.",
+        "acknowledgement": created[0] if created else acknowledgement_payload,
+    }
+
+
+@app.post("/sop-action-link-create")
+async def sop_action_link_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    sop_id = lori_sop_clean(payload.get("sop_id"))
+
+    if not sop_id:
+        return {"status": "error", "message": "sop_id is required."}
+
+    action_payload = {
+        "sop_id": sop_id,
+        "target_module": lori_sop_clean(payload.get("target_module") or "Action Center"),
+        "target_record_id": lori_sop_safe_uuid(payload.get("target_record_id")),
+        "action_title": lori_sop_clean(payload.get("action_title") or "Review SOP"),
+        "action_owner": lori_sop_clean(payload.get("action_owner") or "Operations Leadership"),
+        "action_status": lori_sop_clean(payload.get("action_status") or "Open"),
+        "due_date": payload.get("due_date") or None,
+        "notes": lori_sop_clean(payload.get("notes")),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_sop_action_links",
+        action_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "SOP action link created.",
+        "action_link": created[0] if created else action_payload,
+    }
+
+
+@app.get("/sop-export-html")
+async def sop_export_html(
+    api_key: Optional[str] = Query(None),
+    sop_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    detail = await sop_detail(api_key=api_key, sop_id=sop_id)
+
+    if detail.get("status") != "success":
+        return detail
+
+    sop = detail.get("sop") or {}
+    sections = detail.get("sections") or []
+    reviews = detail.get("reviews") or []
+
+    section_html = "\n".join([
+        f"""
+        <section style="margin-bottom: 22px;">
+          <h2>{section.get('section_order')}. {section.get('section_title')}</h2>
+          <p style="white-space: pre-wrap;">{section.get('section_text') or ''}</p>
+        </section>
+        """
+        for section in sections
+    ])
+
+    review_html = "\n".join([
+        f"""
+        <tr>
+          <td>{review.get('review_type') or ''}</td>
+          <td>{review.get('reviewer_role') or ''}</td>
+          <td>{review.get('review_status') or ''}</td>
+          <td>{review.get('review_notes') or ''}</td>
+        </tr>
+        """
+        for review in reviews
+    ])
+
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>{sop.get('sop_title')}</title>
+    </head>
+    <body style="font-family: Arial, sans-serif; padding: 36px; color: #111827;">
+      <div style="border-bottom: 3px solid #111827; padding-bottom: 16px; margin-bottom: 24px;">
+        <h1 style="margin: 0;">{sop.get('sop_title')}</h1>
+        <p><strong>SOP Number:</strong> {sop.get('sop_number') or ''}</p>
+        <p><strong>Status:</strong> {sop.get('sop_status') or ''} | <strong>Version:</strong> {sop.get('version_number') or ''}</p>
+        <p><strong>Station:</strong> {sop.get('station_code') or ''} — {sop.get('station_name') or ''}</p>
+        <p><strong>Audience:</strong> {sop.get('audience') or ''}</p>
+      </div>
+
+      <div style="background:#f3f4f6; padding:16px; border-radius:10px; margin-bottom:24px;">
+        <h2>Executive Summary</h2>
+        <p>{sop.get('executive_summary') or ''}</p>
+        <p><strong>Decision Support Notice:</strong> {sop.get('decision_support_note') or ''}</p>
+      </div>
+
+      {section_html}
+
+      <h2>Review Status</h2>
+      <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+        <thead>
+          <tr>
+            <th>Review Type</th>
+            <th>Reviewer Role</th>
+            <th>Status</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {review_html}
+        </tbody>
+      </table>
+    </body>
+    </html>
+    """
+
+    return {
+        "status": "success",
+        "sop_id": sop_id,
+        "html": html,
+    }
