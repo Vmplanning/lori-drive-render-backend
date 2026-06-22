@@ -12787,3 +12787,96 @@ async def operating_station_readiness(
         "readiness_items": readiness_items,
         "message": "Station is fully operations-ready." if full_operations_ready else "Station exists, but additional setup is required before full operations.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# STATION DUPLICATE CHECK
+# Prevents duplicate facility/station setup records.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, Optional, List
+
+
+@app.post("/operating-station-duplicate-check")
+async def operating_station_duplicate_check(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    company_name = lori_station_setup_clean(payload.get("company_name"))
+    operating_state = lori_station_setup_upper(payload.get("operating_state") or payload.get("state_code"))
+    city = lori_station_setup_clean(payload.get("city"))
+    station_name = lori_station_setup_clean(payload.get("station_name"))
+    station_code = lori_station_setup_upper(payload.get("station_code"))
+    primary_zip = lori_station_setup_clean(payload.get("primary_zip") or payload.get("zip_code"))
+
+    stations = await lori_station_setup_get_rows(
+        "lori_operating_stations",
+        "select=*&order=station_code.asc&limit=2000",
+    )
+
+    matches = []
+
+    for station in stations:
+        existing_code = lori_station_setup_upper(station.get("station_code"))
+        existing_name = lori_station_setup_clean(station.get("station_name"))
+        existing_company = lori_station_setup_clean(station.get("company_name"))
+        existing_state = lori_station_setup_upper(station.get("operating_state"))
+        existing_city = lori_station_setup_clean(station.get("city"))
+        existing_zip = lori_station_setup_clean(station.get("primary_zip"))
+
+        match_reasons = []
+
+        if station_code and existing_code == station_code:
+            match_reasons.append("Same station code")
+
+        if (
+            station_name
+            and city
+            and operating_state
+            and existing_name.lower() == station_name.lower()
+            and existing_city.lower() == city.lower()
+            and existing_state == operating_state
+        ):
+            match_reasons.append("Same station name, city, and state")
+
+        if (
+            company_name
+            and city
+            and operating_state
+            and primary_zip
+            and existing_company.lower() == company_name.lower()
+            and existing_city.lower() == city.lower()
+            and existing_state == operating_state
+            and existing_zip == primary_zip
+        ):
+            match_reasons.append("Same company, city, state, and ZIP")
+
+        if (
+            city
+            and operating_state
+            and primary_zip
+            and existing_city.lower() == city.lower()
+            and existing_state == operating_state
+            and existing_zip == primary_zip
+        ):
+            match_reasons.append("Same city, state, and ZIP")
+
+        if match_reasons:
+            matches.append({
+                "station": station,
+                "match_reasons": match_reasons,
+                "display_label": f"{existing_code} — {existing_name} — {existing_city}, {existing_state} {existing_zip}",
+            })
+
+    duplicate_detected = len(matches) > 0
+
+    return {
+        "status": "success",
+        "duplicate_detected": duplicate_detected,
+        "matches_count": len(matches),
+        "matches": matches,
+        "message": "Possible duplicate station found." if duplicate_detected else "No duplicate station found.",
+        "recommended_action": "Use the existing station instead of creating a duplicate." if duplicate_detected else "Safe to continue station setup.",
+    }
