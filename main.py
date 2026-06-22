@@ -8052,3 +8052,1080 @@ async def route_recommendation_send_to_leadership(
         "briefing_item": briefing[0] if briefing else {},
         "answer_text": "Route recommendation added to Leadership Briefing Queue.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# PUSH NOTIFICATION CENTER BACKEND
+# Drafts, templates, recipient groups, approval workflow,
+# delivery queue, acknowledgments, audit history.
+# Live email/SMS sending will be connected in a later upgrade.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime, date
+import json
+
+
+def lori_comm_clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_comm_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+
+    if isinstance(value, bool):
+        return value
+
+    if str(value).strip().lower() in {"true", "yes", "y", "1", "required"}:
+        return True
+
+    if str(value).strip().lower() in {"false", "no", "n", "0", "not required"}:
+        return False
+
+    return default
+
+
+async def lori_comm_get_rows(
+    table: str,
+    query: str = "select=*&order=created_at.desc&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_comm_log_event(
+    campaign_id: Optional[str],
+    event_type: str,
+    event_summary: str,
+    event_status: str = "Logged",
+    event_details: Optional[Dict[str, Any]] = None,
+    performed_by: str = "LORI Push Notification Center",
+):
+    payload = {
+        "campaign_id": campaign_id,
+        "event_type": event_type,
+        "event_status": event_status,
+        "event_summary": event_summary,
+        "event_details": event_details or {},
+        "performed_by": performed_by,
+    }
+
+    return await lori_policy_supabase_post(
+        "lori_comm_audit_events",
+        payload,
+    )
+
+
+def lori_comm_build_memo(
+    to_line: str,
+    from_line: str,
+    subject_line: str,
+    message_body: str,
+) -> str:
+    today = date.today().isoformat()
+
+    return f"""MEMORANDUM
+
+To: {to_line}
+From: {from_line}
+Date: {today}
+Subject: {subject_line}
+
+{message_body}
+"""
+
+
+@app.get("/comm-summary")
+async def comm_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    templates = await lori_comm_get_rows("lori_comm_templates")
+    groups = await lori_comm_get_rows("lori_comm_recipient_groups")
+    campaigns = await lori_comm_get_rows("lori_comm_campaigns")
+    recipients = await lori_comm_get_rows("lori_comm_recipients")
+    logs = await lori_comm_get_rows("lori_comm_delivery_logs")
+    acknowledgments = await lori_comm_get_rows("lori_comm_acknowledgments")
+
+    draft_messages = [
+        c for c in campaigns
+        if lori_comm_clean_text(c.get("campaign_status")).lower() == "draft"
+    ]
+
+    scheduled_messages = [
+        c for c in campaigns
+        if lori_comm_clean_text(c.get("campaign_status")).lower() == "scheduled"
+    ]
+
+    queued_messages = [
+        c for c in campaigns
+        if lori_comm_clean_text(c.get("campaign_status")).lower() in {"queued", "ready to send"}
+    ]
+
+    sent_messages = [
+        c for c in campaigns
+        if lori_comm_clean_text(c.get("campaign_status")).lower() == "sent"
+    ]
+
+    failed_logs = [
+        l for l in logs
+        if lori_comm_clean_text(l.get("delivery_status")).lower() == "failed"
+    ]
+
+    pending_ack = [
+        a for a in acknowledgments
+        if lori_comm_clean_text(a.get("acknowledgment_status")).lower() == "pending"
+    ]
+
+    safety_alerts = [
+        c for c in campaigns
+        if "safety" in lori_comm_clean_text(c.get("message_type")).lower()
+    ]
+
+    memorandums = [
+        c for c in campaigns
+        if "memo" in lori_comm_clean_text(c.get("message_type")).lower()
+        or lori_comm_clean_text(c.get("memo_body")) != ""
+    ]
+
+    return {
+        "status": "success",
+        "templates_count": len(templates),
+        "recipient_groups_count": len(groups),
+        "campaigns_count": len(campaigns),
+        "recipients_count": len(recipients),
+        "delivery_logs_count": len(logs),
+        "acknowledgments_count": len(acknowledgments),
+        "draft_messages_count": len(draft_messages),
+        "scheduled_messages_count": len(scheduled_messages),
+        "queued_messages_count": len(queued_messages),
+        "sent_messages_count": len(sent_messages),
+        "failed_deliveries_count": len(failed_logs),
+        "pending_acknowledgments_count": len(pending_ack),
+        "safety_alerts_count": len(safety_alerts),
+        "memorandums_count": len(memorandums),
+        "recent_campaigns": campaigns[:5],
+        "answer_text": "Push Notification Center backend is ready for templates, campaigns, recipient groups, approval workflow, delivery queue, acknowledgments, and audit tracking. Live sending is not enabled yet.",
+    }
+
+
+@app.get("/comm-templates")
+async def comm_templates(
+    api_key: Optional[str] = Query(None),
+    template_type: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_comm_get_rows(
+        "lori_comm_templates",
+        "select=*&order=template_name.asc&limit=500",
+    )
+
+    if template_type:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("template_type")).lower() == template_type.lower()
+        ]
+
+    return {
+        "status": "success",
+        "templates_count": len(rows[:limit]),
+        "templates": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/comm-recipient-groups")
+async def comm_recipient_groups(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    group_type: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_comm_get_rows(
+        "lori_comm_recipient_groups",
+        "select=*&order=group_name.asc&limit=500",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if group_type:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("group_type")).lower() == group_type.lower()
+        ]
+
+    return {
+        "status": "success",
+        "groups_count": len(rows[:limit]),
+        "groups": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/comm-recipient-group-members")
+async def comm_recipient_group_members(
+    api_key: Optional[str] = Query(None),
+    group_id: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    limit: int = Query(300),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_comm_get_rows(
+        "lori_comm_recipient_group_members",
+        "select=*&order=recipient_name.asc&limit=1000",
+    )
+
+    if group_id:
+        rows = [
+            r for r in rows
+            if str(r.get("group_id")) == group_id
+        ]
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    return {
+        "status": "success",
+        "members_count": len(rows[:limit]),
+        "members": rows[:max(1, min(limit, 500))],
+    }
+
+
+@app.get("/comm-campaigns")
+async def comm_campaigns(
+    api_key: Optional[str] = Query(None),
+    campaign_status: Optional[str] = Query(None),
+    message_type: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if campaign_status:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("campaign_status")).lower() == campaign_status.lower()
+        ]
+
+    if message_type:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("message_type")).lower() == message_type.lower()
+        ]
+
+    if priority:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("priority")).lower() == priority.lower()
+        ]
+
+    return {
+        "status": "success",
+        "campaigns_count": len(rows[:limit]),
+        "campaigns": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/comm-campaign-detail")
+async def comm_campaign_detail(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        f"select=*&id=eq.{quote(campaign_id)}&limit=1",
+    )
+
+    if not campaigns:
+        return {
+            "status": "not_found",
+            "message": "Communication campaign not found.",
+            "campaign_id": campaign_id,
+        }
+
+    recipients = await lori_comm_get_rows(
+        "lori_comm_recipients",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&order=recipient_name.asc&limit=1000",
+    )
+
+    delivery_logs = await lori_comm_get_rows(
+        "lori_comm_delivery_logs",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&order=created_at.desc&limit=1000",
+    )
+
+    acknowledgments = await lori_comm_get_rows(
+        "lori_comm_acknowledgments",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&order=created_at.desc&limit=1000",
+    )
+
+    attachments = await lori_comm_get_rows(
+        "lori_comm_attachments",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&order=created_at.desc&limit=100",
+    )
+
+    audit_events = await lori_comm_get_rows(
+        "lori_comm_audit_events",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&order=created_at.desc&limit=200",
+    )
+
+    return {
+        "status": "success",
+        "campaign": campaigns[0],
+        "recipients_count": len(recipients),
+        "recipients": recipients,
+        "delivery_logs_count": len(delivery_logs),
+        "delivery_logs": delivery_logs,
+        "acknowledgments_count": len(acknowledgments),
+        "acknowledgments": acknowledgments,
+        "attachments_count": len(attachments),
+        "attachments": attachments,
+        "audit_events_count": len(audit_events),
+        "audit_events": audit_events,
+    }
+
+
+@app.post("/comm-campaign-create")
+async def comm_campaign_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    message_title = lori_comm_clean_text(payload.get("message_title") or payload.get("title"))
+
+    if not message_title:
+        return {
+            "status": "error",
+            "message": "message_title is required.",
+        }
+
+    subject_line = lori_comm_clean_text(payload.get("subject_line") or message_title)
+    message_body = lori_comm_clean_text(payload.get("message_body") or payload.get("body") or "")
+    sms_body = lori_comm_clean_text(payload.get("sms_body") or message_body[:280])
+
+    memo_body = lori_comm_clean_text(payload.get("memo_body") or "")
+
+    if not memo_body:
+        memo_body = lori_comm_build_memo(
+            to_line=lori_comm_clean_text(payload.get("audience_type") or "Drivers and Staff"),
+            from_line=lori_comm_clean_text(payload.get("from_line") or "Operations Leadership"),
+            subject_line=subject_line,
+            message_body=message_body,
+        )
+
+    campaign_payload = {
+        "message_title": message_title,
+        "message_type": lori_comm_clean_text(payload.get("message_type") or "General Staff Notice"),
+        "priority": lori_comm_clean_text(payload.get("priority") or "Routine"),
+        "delivery_method": lori_comm_clean_text(payload.get("delivery_method") or "Email"),
+        "audience_type": lori_comm_clean_text(payload.get("audience_type") or "Custom Group"),
+        "station_code": lori_comm_clean_text(payload.get("station_code") or "JESSUP-01"),
+        "operating_state": lori_comm_clean_text(payload.get("operating_state") or "MD"),
+        "route_id": lori_comm_clean_text(payload.get("route_id") or ""),
+        "route_group": lori_comm_clean_text(payload.get("route_group") or ""),
+        "supervisor_name": lori_comm_clean_text(payload.get("supervisor_name") or ""),
+        "shift_name": lori_comm_clean_text(payload.get("shift_name") or ""),
+        "subject_line": subject_line,
+        "message_body": message_body,
+        "sms_body": sms_body,
+        "memo_body": memo_body,
+        "attachment_count": int(payload.get("attachment_count") or 0),
+        "requires_acknowledgment": lori_comm_bool(payload.get("requires_acknowledgment"), False),
+        "schedule_type": lori_comm_clean_text(payload.get("schedule_type") or "Send Now"),
+        "scheduled_send_at": payload.get("scheduled_send_at"),
+        "approval_status": "Draft",
+        "campaign_status": "Draft",
+        "source_module": lori_comm_clean_text(payload.get("source_module") or ""),
+        "source_reference_id": lori_comm_clean_text(payload.get("source_reference_id") or ""),
+        "internal_notes": lori_comm_clean_text(payload.get("internal_notes") or ""),
+        "created_by": lori_comm_clean_text(payload.get("created_by") or "LORI Push Notification Center"),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_comm_campaigns",
+        campaign_payload,
+    )
+
+    campaign = created[0] if created else {}
+
+    await lori_comm_log_event(
+        campaign_id=campaign.get("id"),
+        event_type="Campaign Created",
+        event_summary=f"Communication campaign created: {message_title}",
+        event_details={"live_send": False, "source": "comm-campaign-create"},
+    )
+
+    return {
+        "status": "success",
+        "message": "Communication campaign created as draft.",
+        "campaign": campaign,
+        "answer_text": "Communication campaign created as draft. No live text or email was sent.",
+    }
+
+
+@app.post("/comm-campaign-add-recipient")
+async def comm_campaign_add_recipient(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        f"select=*&id=eq.{quote(campaign_id)}&limit=1",
+    )
+
+    if not campaigns:
+        return {
+            "status": "not_found",
+            "message": "Campaign not found.",
+        }
+
+    recipient_name = lori_comm_clean_text(payload.get("recipient_name"))
+
+    if not recipient_name:
+        return {
+            "status": "error",
+            "message": "recipient_name is required.",
+        }
+
+    recipient_payload = {
+        "campaign_id": campaign_id,
+        "recipient_name": recipient_name,
+        "recipient_role": lori_comm_clean_text(payload.get("recipient_role") or ""),
+        "employee_id": lori_comm_clean_text(payload.get("employee_id") or ""),
+        "station_code": lori_comm_clean_text(payload.get("station_code") or "JESSUP-01"),
+        "route_id": lori_comm_clean_text(payload.get("route_id") or ""),
+        "supervisor_name": lori_comm_clean_text(payload.get("supervisor_name") or ""),
+        "shift_name": lori_comm_clean_text(payload.get("shift_name") or ""),
+        "email_address": lori_comm_clean_text(payload.get("email_address") or ""),
+        "phone_number": lori_comm_clean_text(payload.get("phone_number") or ""),
+        "preferred_delivery_method": lori_comm_clean_text(payload.get("preferred_delivery_method") or "Email"),
+        "recipient_status": "Selected",
+        "sms_consent_status": lori_comm_clean_text(payload.get("sms_consent_status") or "Unknown"),
+        "email_consent_status": lori_comm_clean_text(payload.get("email_consent_status") or "Unknown"),
+        "opt_out_status": lori_comm_clean_text(payload.get("opt_out_status") or "Not Opted Out"),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_comm_recipients",
+        recipient_payload,
+    )
+
+    recipients = await lori_comm_get_rows(
+        "lori_comm_recipients",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        campaign_id,
+        {
+            "recipient_count": len(recipients),
+            "pending_acknowledgment_count": len(recipients) if campaigns[0].get("requires_acknowledgment") else 0,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=campaign_id,
+        event_type="Recipient Added",
+        event_summary=f"Recipient added: {recipient_name}",
+        event_details={"recipient_name": recipient_name},
+    )
+
+    return {
+        "status": "success",
+        "message": "Recipient added to campaign.",
+        "recipient": created[0] if created else {},
+        "recipient_count": len(recipients),
+    }
+
+
+@app.post("/comm-campaign-add-group")
+async def comm_campaign_add_group(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+    group_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        f"select=*&id=eq.{quote(campaign_id)}&limit=1",
+    )
+
+    if not campaigns:
+        return {
+            "status": "not_found",
+            "message": "Campaign not found.",
+        }
+
+    members = await lori_comm_get_rows(
+        "lori_comm_recipient_group_members",
+        f"select=*&group_id=eq.{quote(group_id)}&member_status=eq.Active&limit=1000",
+    )
+
+    if not members:
+        return {
+            "status": "error",
+            "message": "No active members found for this recipient group.",
+        }
+
+    created_recipients = []
+
+    existing = await lori_comm_get_rows(
+        "lori_comm_recipients",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    existing_keys = {
+        f"{r.get('employee_id')}|{r.get('email_address')}|{r.get('phone_number')}"
+        for r in existing
+    }
+
+    for m in members:
+        key = f"{m.get('employee_id')}|{m.get('email_address')}|{m.get('phone_number')}"
+
+        if key in existing_keys:
+            continue
+
+        recipient_payload = {
+            "campaign_id": campaign_id,
+            "recipient_name": m.get("recipient_name"),
+            "recipient_role": m.get("recipient_role"),
+            "employee_id": m.get("employee_id"),
+            "station_code": m.get("station_code") or "JESSUP-01",
+            "route_id": m.get("route_id"),
+            "supervisor_name": m.get("supervisor_name"),
+            "email_address": m.get("email_address"),
+            "phone_number": m.get("phone_number"),
+            "preferred_delivery_method": campaigns[0].get("delivery_method") or "Email",
+            "recipient_status": "Selected",
+            "sms_consent_status": "Demo Consent",
+            "email_consent_status": "Demo Consent",
+            "opt_out_status": "Not Opted Out",
+        }
+
+        created = await lori_policy_supabase_post(
+            "lori_comm_recipients",
+            recipient_payload,
+        )
+
+        if created:
+            created_recipients.append(created[0])
+
+    recipients = await lori_comm_get_rows(
+        "lori_comm_recipients",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        campaign_id,
+        {
+            "recipient_count": len(recipients),
+            "pending_acknowledgment_count": len(recipients) if campaigns[0].get("requires_acknowledgment") else 0,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=campaign_id,
+        event_type="Recipient Group Added",
+        event_summary=f"Recipient group added to campaign. Members added: {len(created_recipients)}",
+        event_details={"group_id": group_id, "members_added": len(created_recipients)},
+    )
+
+    return {
+        "status": "success",
+        "message": "Recipient group added to campaign.",
+        "members_added": len(created_recipients),
+        "recipient_count": len(recipients),
+        "recipients": created_recipients,
+    }
+
+
+@app.post("/comm-campaign-submit-for-approval")
+async def comm_campaign_submit_for_approval(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        f"select=*&id=eq.{quote(campaign_id)}&limit=1",
+    )
+
+    if not campaigns:
+        return {
+            "status": "not_found",
+            "message": "Campaign not found.",
+        }
+
+    recipients = await lori_comm_get_rows(
+        "lori_comm_recipients",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    if not recipients:
+        return {
+            "status": "error",
+            "message": "Add at least one recipient before submitting for approval.",
+        }
+
+    updated = await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        campaign_id,
+        {
+            "approval_status": "Pending Review",
+            "campaign_status": "Pending Review",
+            "recipient_count": len(recipients),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=campaign_id,
+        event_type="Submitted for Approval",
+        event_summary="Communication campaign submitted for leadership review.",
+        event_details={"recipient_count": len(recipients)},
+    )
+
+    return {
+        "status": "success",
+        "message": "Campaign submitted for approval.",
+        "campaign": updated[0] if updated else {},
+    }
+
+
+@app.post("/comm-campaign-approve")
+async def comm_campaign_approve(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    approved_by = lori_comm_clean_text(payload.get("approved_by") or "Operations Leadership")
+    approval_notes = lori_comm_clean_text(payload.get("approval_notes") or "Approved for communication queue.")
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        f"select=*&id=eq.{quote(campaign_id)}&limit=1",
+    )
+
+    if not campaigns:
+        return {
+            "status": "not_found",
+            "message": "Campaign not found.",
+        }
+
+    updated = await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        campaign_id,
+        {
+            "approval_status": "Approved",
+            "campaign_status": "Approved",
+            "approved_by": approved_by,
+            "approved_at": datetime.utcnow().isoformat(),
+            "approval_notes": approval_notes,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=campaign_id,
+        event_type="Campaign Approved",
+        event_summary=f"Campaign approved by {approved_by}.",
+        event_details={"approved_by": approved_by, "approval_notes": approval_notes},
+        performed_by=approved_by,
+    )
+
+    return {
+        "status": "success",
+        "message": "Campaign approved.",
+        "campaign": updated[0] if updated else {},
+    }
+
+
+@app.post("/comm-campaign-reject")
+async def comm_campaign_reject(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    rejected_by = lori_comm_clean_text(payload.get("rejected_by") or "Operations Leadership")
+    rejection_reason = lori_comm_clean_text(payload.get("rejection_reason") or "Returned for edits.")
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        f"select=*&id=eq.{quote(campaign_id)}&limit=1",
+    )
+
+    if not campaigns:
+        return {
+            "status": "not_found",
+            "message": "Campaign not found.",
+        }
+
+    updated = await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        campaign_id,
+        {
+            "approval_status": "Rejected",
+            "campaign_status": "Returned for Edits",
+            "approval_notes": rejection_reason,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=campaign_id,
+        event_type="Campaign Rejected",
+        event_summary=f"Campaign rejected/returned by {rejected_by}.",
+        event_details={"rejected_by": rejected_by, "rejection_reason": rejection_reason},
+        performed_by=rejected_by,
+    )
+
+    return {
+        "status": "success",
+        "message": "Campaign returned for edits.",
+        "campaign": updated[0] if updated else {},
+    }
+
+
+@app.post("/comm-campaign-queue")
+async def comm_campaign_queue(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        f"select=*&id=eq.{quote(campaign_id)}&limit=1",
+    )
+
+    if not campaigns:
+        return {
+            "status": "not_found",
+            "message": "Campaign not found.",
+        }
+
+    campaign = campaigns[0]
+
+    if lori_comm_clean_text(campaign.get("approval_status")).lower() != "approved":
+        return {
+            "status": "error",
+            "message": "Campaign must be approved before it can be queued.",
+            "approval_status": campaign.get("approval_status"),
+        }
+
+    recipients = await lori_comm_get_rows(
+        "lori_comm_recipients",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    if not recipients:
+        return {
+            "status": "error",
+            "message": "Campaign has no recipients.",
+        }
+
+    existing_logs = await lori_comm_get_rows(
+        "lori_comm_delivery_logs",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    existing_log_keys = {
+        f"{l.get('recipient_id')}|{l.get('delivery_method')}"
+        for l in existing_logs
+    }
+
+    created_logs = []
+    created_acks = []
+
+    delivery_method = lori_comm_clean_text(campaign.get("delivery_method") or "Email")
+
+    for r in recipients:
+        method_list = []
+
+        if delivery_method.lower() in {"text and email", "sms and email"}:
+            method_list = ["Text Message", "Email"]
+        elif delivery_method.lower() in {"text message", "sms", "text"}:
+            method_list = ["Text Message"]
+        else:
+            method_list = ["Email"]
+
+        for method in method_list:
+            key = f"{r.get('id')}|{method}"
+
+            if key in existing_log_keys:
+                continue
+
+            log_payload = {
+                "campaign_id": campaign_id,
+                "recipient_id": r.get("id"),
+                "delivery_method": method,
+                "delivery_status": "Queued - Live Send Not Enabled",
+                "provider_name": "Pending Provider",
+                "failure_reason": "Live sending provider has not been connected yet.",
+            }
+
+            created = await lori_policy_supabase_post(
+                "lori_comm_delivery_logs",
+                log_payload,
+            )
+
+            if created:
+                created_logs.append(created[0])
+
+        if campaign.get("requires_acknowledgment"):
+            existing_ack = await lori_comm_get_rows(
+                "lori_comm_acknowledgments",
+                f"select=*&campaign_id=eq.{quote(campaign_id)}&recipient_id=eq.{quote(str(r.get('id')))}&limit=1",
+            )
+
+            if not existing_ack:
+                ack_payload = {
+                    "campaign_id": campaign_id,
+                    "recipient_id": r.get("id"),
+                    "acknowledgment_required": True,
+                    "acknowledgment_status": "Pending",
+                    "acknowledgment_method": "Pending",
+                }
+
+                created_ack = await lori_policy_supabase_post(
+                    "lori_comm_acknowledgments",
+                    ack_payload,
+                )
+
+                if created_ack:
+                    created_acks.append(created_ack[0])
+
+    updated = await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        campaign_id,
+        {
+            "campaign_status": "Queued",
+            "recipient_count": len(recipients),
+            "sent_count": 0,
+            "failed_count": 0,
+            "acknowledged_count": 0,
+            "pending_acknowledgment_count": len(recipients) if campaign.get("requires_acknowledgment") else 0,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=campaign_id,
+        event_type="Campaign Queued",
+        event_summary="Campaign queued for future live sending. No live text or email was sent.",
+        event_details={
+            "live_send": False,
+            "recipients": len(recipients),
+            "delivery_logs_created": len(created_logs),
+            "acknowledgments_created": len(created_acks),
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "Campaign queued. No live text or email was sent because live providers are not connected yet.",
+        "campaign": updated[0] if updated else {},
+        "recipients_count": len(recipients),
+        "delivery_logs_created": len(created_logs),
+        "acknowledgments_created": len(created_acks),
+        "answer_text": "Campaign queued for future live sending. No live text or email was sent yet.",
+    }
+
+
+@app.get("/comm-delivery-logs")
+async def comm_delivery_logs(
+    api_key: Optional[str] = Query(None),
+    campaign_id: Optional[str] = Query(None),
+    delivery_status: Optional[str] = Query(None),
+    limit: int = Query(300),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_comm_get_rows(
+        "lori_comm_delivery_logs",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if campaign_id:
+        rows = [
+            r for r in rows
+            if str(r.get("campaign_id")) == campaign_id
+        ]
+
+    if delivery_status:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("delivery_status")).lower() == delivery_status.lower()
+        ]
+
+    return {
+        "status": "success",
+        "delivery_logs_count": len(rows[:limit]),
+        "delivery_logs": rows[:max(1, min(limit, 500))],
+    }
+
+
+@app.get("/comm-acknowledgments")
+async def comm_acknowledgments(
+    api_key: Optional[str] = Query(None),
+    campaign_id: Optional[str] = Query(None),
+    acknowledgment_status: Optional[str] = Query(None),
+    limit: int = Query(300),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_comm_get_rows(
+        "lori_comm_acknowledgments",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if campaign_id:
+        rows = [
+            r for r in rows
+            if str(r.get("campaign_id")) == campaign_id
+        ]
+
+    if acknowledgment_status:
+        rows = [
+            r for r in rows
+            if lori_comm_clean_text(r.get("acknowledgment_status")).lower() == acknowledgment_status.lower()
+        ]
+
+    return {
+        "status": "success",
+        "acknowledgments_count": len(rows[:limit]),
+        "acknowledgments": rows[:max(1, min(limit, 500))],
+    }
+
+
+@app.post("/comm-acknowledge")
+async def comm_acknowledge(
+    api_key: Optional[str] = Query(None),
+    acknowledgment_id: str = Query(...),
+    payload: Dict[str, Any] = Body(default={}),
+):
+    lori_regulatory_require_key(api_key)
+
+    acknowledgments = await lori_comm_get_rows(
+        "lori_comm_acknowledgments",
+        f"select=*&id=eq.{quote(acknowledgment_id)}&limit=1",
+    )
+
+    if not acknowledgments:
+        return {
+            "status": "not_found",
+            "message": "Acknowledgment record not found.",
+        }
+
+    ack = acknowledgments[0]
+    campaign_id = ack.get("campaign_id")
+
+    updated = await lori_policy_supabase_patch(
+        "lori_comm_acknowledgments",
+        acknowledgment_id,
+        {
+            "acknowledgment_status": "Acknowledged",
+            "acknowledged_at": datetime.utcnow().isoformat(),
+            "acknowledgment_method": lori_comm_clean_text(payload.get("acknowledgment_method") or "Manual"),
+            "acknowledgment_note": lori_comm_clean_text(payload.get("acknowledgment_note") or "Acknowledged."),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    all_acks = await lori_comm_get_rows(
+        "lori_comm_acknowledgments",
+        f"select=*&campaign_id=eq.{quote(str(campaign_id))}&limit=1000",
+    )
+
+    acknowledged_count = len([
+        a for a in all_acks
+        if lori_comm_clean_text(a.get("acknowledgment_status")).lower() == "acknowledged"
+    ])
+
+    pending_count = len(all_acks) - acknowledged_count
+
+    await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        str(campaign_id),
+        {
+            "acknowledged_count": acknowledged_count,
+            "pending_acknowledgment_count": pending_count,
+            "campaign_status": "Complete" if pending_count == 0 else "Acknowledgment Pending",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=str(campaign_id),
+        event_type="Acknowledgment Completed",
+        event_summary="Recipient acknowledgment was marked complete.",
+        event_details={"acknowledgment_id": acknowledgment_id},
+    )
+
+    return {
+        "status": "success",
+        "message": "Acknowledgment marked complete.",
+        "acknowledgment": updated[0] if updated else {},
+        "acknowledged_count": acknowledged_count,
+        "pending_acknowledgment_count": pending_count,
+    }
+
+
+@app.get("/comm-audit-events")
+async def comm_audit_events(
+    api_key: Optional[str] = Query(None),
+    campaign_id: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_comm_get_rows(
+        "lori_comm_audit_events",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if campaign_id:
+        rows = [
+            r for r in rows
+            if str(r.get("campaign_id")) == campaign_id
+        ]
+
+    return {
+        "status": "success",
+        "audit_events_count": len(rows[:limit]),
+        "audit_events": rows[:max(1, min(limit, 500))],
+    }
