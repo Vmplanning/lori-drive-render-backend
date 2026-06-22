@@ -12359,3 +12359,431 @@ async def operating_context_validate(
         "station_summary": station_summary,
         "message": "Operating context is valid." if context_valid else "Operating context mismatch detected. Please correct state, city, station, ZIP, or time zone before continuing.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# NEW FACILITY / STATION SETUP BACKEND
+# Creates new station setup contexts for nationwide operations.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+import re
+from datetime import datetime
+
+
+def lori_station_setup_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_station_setup_upper(value: Any) -> str:
+    return lori_station_setup_clean(value).upper()
+
+
+def lori_station_setup_code_city(city: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z]", "", city or "").upper()
+    if len(cleaned) >= 3:
+        return cleaned[:3]
+    if cleaned:
+        return cleaned.ljust(3, "X")
+    return "STA"
+
+
+async def lori_station_setup_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_station_setup_generate_code(state_code: str, city: str) -> str:
+    state_code = lori_station_setup_upper(state_code)
+    city_code = lori_station_setup_code_city(city)
+
+    base_code = f"{state_code}-{city_code}"
+    stations = await lori_station_setup_get_rows(
+        "lori_operating_stations",
+        "select=station_code&limit=1000",
+    )
+
+    existing_codes = {
+        lori_station_setup_upper(row.get("station_code"))
+        for row in stations
+    }
+
+    for number in range(1, 100):
+        candidate = f"{base_code}-{number:02d}"
+        if candidate not in existing_codes:
+            return candidate
+
+    return f"{base_code}-{datetime.utcnow().strftime('%H%M%S')}"
+
+
+@app.get("/station-setup-options")
+async def station_setup_options(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    states = await lori_station_setup_get_rows(
+        "lori_us_operating_states",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    regions = await lori_station_setup_get_rows(
+        "lori_operating_regions",
+        "select=*&order=region_name.asc&limit=100",
+    )
+
+    stations = await lori_station_setup_get_rows(
+        "lori_operating_stations",
+        "select=*&order=station_code.asc&limit=1000",
+    )
+
+    route_groups = [
+        "Delivery Operations",
+        "Pickup Operations",
+        "Linehaul",
+        "Shuttle Routes",
+        "Warehouse Transfer",
+        "Last Mile Delivery",
+        "Local Delivery",
+        "Regional Delivery",
+        "Long Haul",
+        "Refrigerated Delivery",
+        "Bulk Freight",
+        "Mixed Freight",
+        "Service Routes",
+        "All Routes",
+    ]
+
+    time_zones = [
+        {"value": "America/New_York", "label": "America/New_York — Eastern Time"},
+        {"value": "America/Chicago", "label": "America/Chicago — Central Time"},
+        {"value": "America/Denver", "label": "America/Denver — Mountain Time"},
+        {"value": "America/Phoenix", "label": "America/Phoenix — Arizona Time"},
+        {"value": "America/Los_Angeles", "label": "America/Los_Angeles — Pacific Time"},
+        {"value": "America/Anchorage", "label": "America/Anchorage — Alaska Time"},
+        {"value": "Pacific/Honolulu", "label": "Pacific/Honolulu — Hawaii Time"},
+        {"value": "America/Indiana/Indianapolis", "label": "America/Indiana/Indianapolis — Indiana Eastern Time"},
+        {"value": "America/Boise", "label": "America/Boise — Mountain / Idaho Time"},
+        {"value": "America/Detroit", "label": "America/Detroit — Michigan Eastern Time"},
+    ]
+
+    compliance_profiles = [
+        "Federal + State + Company Policy Review",
+        "Federal Only",
+        "State-Specific Review",
+        "Company Policy Review",
+        "DOT / Safety Review",
+        "Labor / HR Review",
+        "Station-Specific Policy Review",
+        "Route Configuration Review",
+        "Messaging / Communication Review",
+        "Manual Review Required",
+    ]
+
+    regulatory_profiles = [
+        "Federal / FMCSA Review Required",
+        "State DOT Review Required",
+        "Local Jurisdiction Review May Apply",
+        "Labor / HR Review Required",
+        "Company Policy Review Required",
+        "Manual Regulatory Review Required",
+    ]
+
+    return {
+        "status": "success",
+        "states": states,
+        "regions": regions,
+        "stations": stations,
+        "route_groups": route_groups,
+        "time_zones": time_zones,
+        "compliance_profiles": compliance_profiles,
+        "regulatory_profiles": regulatory_profiles,
+        "message": "Station setup options loaded.",
+    }
+
+
+@app.post("/operating-station-create")
+async def operating_station_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    company_name = lori_station_setup_clean(payload.get("company_name") or "Demo Logistics")
+    operating_state = lori_station_setup_upper(payload.get("operating_state") or payload.get("state_code"))
+    city = lori_station_setup_clean(payload.get("city"))
+    station_name = lori_station_setup_clean(payload.get("station_name"))
+    station_code = lori_station_setup_upper(payload.get("station_code"))
+    primary_zip = lori_station_setup_clean(payload.get("primary_zip") or payload.get("zip_code"))
+    route_group = lori_station_setup_clean(payload.get("route_group") or "Delivery Operations")
+    time_zone = lori_station_setup_clean(payload.get("time_zone"))
+    region_name = lori_station_setup_clean(payload.get("region_name"))
+    region_code = lori_station_setup_upper(payload.get("region_code"))
+    county = lori_station_setup_clean(payload.get("county"))
+    address_line_1 = lori_station_setup_clean(payload.get("address_line_1"))
+    latitude = payload.get("latitude")
+    longitude = payload.get("longitude")
+
+    missing = []
+
+    required = {
+        "company_name": company_name,
+        "operating_state": operating_state,
+        "city": city,
+        "station_name": station_name,
+        "primary_zip": primary_zip,
+        "route_group": route_group,
+    }
+
+    for key, value in required.items():
+        if not value:
+            missing.append(key)
+
+    if missing:
+        return {
+            "status": "error",
+            "message": "Missing required station setup fields.",
+            "missing_fields": missing,
+        }
+
+    states = await lori_station_setup_get_rows(
+        "lori_us_operating_states",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    regions = await lori_station_setup_get_rows(
+        "lori_operating_regions",
+        "select=*&order=region_name.asc&limit=100",
+    )
+
+    state_record = None
+
+    for state in states:
+        if lori_station_setup_upper(state.get("state_code")) == operating_state:
+            state_record = state
+            break
+
+    if not state_record:
+        return {
+            "status": "error",
+            "message": f"{operating_state} is not a supported U.S. operating state or jurisdiction.",
+        }
+
+    if not region_name:
+        region_name = lori_station_setup_clean(state_record.get("default_region"))
+
+    if not time_zone:
+        time_zone = lori_station_setup_clean(state_record.get("default_time_zone"))
+
+    if not region_code:
+        for region in regions:
+            if lori_station_setup_clean(region.get("region_name")).lower() == region_name.lower():
+                region_code = lori_station_setup_upper(region.get("region_code"))
+                break
+
+    if not region_code:
+        region_code = lori_station_setup_upper(region_name.replace(" ", "_"))
+
+    if not station_code:
+        station_code = await lori_station_setup_generate_code(operating_state, city)
+
+    existing = await lori_station_setup_get_rows(
+        "lori_operating_stations",
+        f"select=*&station_code=eq.{station_code}&limit=1",
+    )
+
+    if existing:
+        return {
+            "status": "duplicate",
+            "message": f"Station code {station_code} already exists.",
+            "existing_station": existing[0],
+            "recommended_action": "Use the existing station or choose a different station code.",
+        }
+
+    station_payload = {
+        "company_name": company_name,
+        "region_code": region_code,
+        "region_name": region_name,
+        "station_code": station_code,
+        "station_name": station_name,
+        "station_status": "Setup Required",
+        "station_type": lori_station_setup_clean(payload.get("station_type") or "Distribution / Delivery Station"),
+        "operating_state": operating_state,
+        "city": city,
+        "county": county,
+        "primary_zip": primary_zip,
+        "time_zone": time_zone,
+        "address_line_1": address_line_1,
+        "address_line_2": lori_station_setup_clean(payload.get("address_line_2")),
+        "latitude": latitude,
+        "longitude": longitude,
+        "route_groups": [route_group],
+        "supported_modules": [
+            "Route Configuration",
+            "Push Notifications",
+            "Driver 360",
+            "Compliance & Policy Center",
+            "Regulatory Watch",
+            "KPI Action Plans",
+            "Action Center",
+            "Leadership Dashboard",
+            "Data Intake",
+            "Reports",
+            "SOP Builder",
+        ],
+        "map_ready": False,
+        "route_scoring_ready": False,
+        "push_notification_ready": False,
+        "compliance_profile_ready": False,
+        "notes": "New facility setup context created. Maps, route scoring, driver data, ZIP coverage detail, push recipients, and compliance documents must be configured before full operations.",
+    }
+
+    created_station = await lori_policy_supabase_post(
+        "lori_operating_stations",
+        station_payload,
+    )
+
+    station = created_station[0] if created_station else station_payload
+
+    zip_payload = {
+        "station_code": station_code,
+        "station_name": station_name,
+        "operating_state": operating_state,
+        "city": city,
+        "zip_code": primary_zip,
+        "route_group": route_group,
+        "route_id": None,
+        "driver_name": None,
+        "coverage_type": "Station ZIP Coverage",
+        "coverage_status": "Setup Required",
+        "map_ready": False,
+        "geojson": {},
+        "notes": "Initial ZIP coverage created for new station setup. Upload or configure full ZIP/service area geography before map-level route validation.",
+    }
+
+    created_zip = await lori_policy_supabase_post(
+        "lori_station_zip_coverage",
+        zip_payload,
+    )
+
+    setup_context = {
+        "company_name": company_name,
+        "region_code": region_code,
+        "region_name": region_name,
+        "operating_state": operating_state,
+        "city": city,
+        "station_code": station_code,
+        "station_name": station_name,
+        "primary_zip": primary_zip,
+        "route_group": route_group,
+        "time_zone": time_zone,
+        "compliance_profile": lori_station_setup_clean(payload.get("compliance_profile") or "Federal + State + Company Policy Review"),
+        "state_regulatory_profile": lori_station_setup_clean(payload.get("state_regulatory_profile") or f"{operating_state} DOT / FMCSA / State Review Required"),
+    }
+
+    return {
+        "status": "success",
+        "message": "New facility/station setup context created.",
+        "station": station,
+        "zip_coverage": created_zip[0] if created_zip else zip_payload,
+        "setup_context": setup_context,
+        "context_can_be_saved": True,
+        "operational_modules_limited": True,
+        "route_configuration_ready": False,
+        "map_ready": False,
+        "route_scoring_ready": False,
+        "push_notification_ready": False,
+        "compliance_profile_ready": False,
+        "required_next_steps": [
+            "Upload or configure station route geometry.",
+            "Upload stop addresses or stop coordinates.",
+            "Configure ZIP coverage and work-area boundaries.",
+            "Upload route scoring or driver performance data.",
+            "Add drivers and supervisors.",
+            "Add push notification recipients.",
+            "Upload state/company/station policy documents.",
+            "Review state compliance profile with authorized leadership.",
+        ],
+        "decision_support_note": "This station is saved as Setup Required. LORI can store the context, but full route maps, route configuration, push notifications, route scoring, and compliance workflows require additional station setup data.",
+    }
+
+
+@app.get("/operating-station-readiness")
+async def operating_station_readiness(
+    api_key: Optional[str] = Query(None),
+    station_code: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    station_code = lori_station_setup_upper(station_code)
+
+    stations = await lori_station_setup_get_rows(
+        "lori_operating_stations",
+        f"select=*&station_code=eq.{station_code}&limit=1",
+    )
+
+    if not stations:
+        return {
+            "status": "not_found",
+            "message": f"Station {station_code} is not configured in LORI.",
+        }
+
+    station = stations[0]
+
+    zip_rows = await lori_station_setup_get_rows(
+        "lori_station_zip_coverage",
+        f"select=*&station_code=eq.{station_code}&limit=500",
+    )
+
+    readiness_items = [
+        {
+            "area": "Station Record",
+            "ready": True,
+            "message": "Station record exists.",
+        },
+        {
+            "area": "ZIP Coverage",
+            "ready": len(zip_rows) > 0,
+            "message": f"{len(zip_rows)} ZIP coverage record(s) configured.",
+        },
+        {
+            "area": "Route Maps",
+            "ready": bool(station.get("map_ready")),
+            "message": "Route maps are ready." if station.get("map_ready") else "Route map data still needs to be configured.",
+        },
+        {
+            "area": "Route Scoring",
+            "ready": bool(station.get("route_scoring_ready")),
+            "message": "Route scoring is ready." if station.get("route_scoring_ready") else "Route scoring data still needs to be uploaded.",
+        },
+        {
+            "area": "Push Notifications",
+            "ready": bool(station.get("push_notification_ready")),
+            "message": "Push notification recipients are ready." if station.get("push_notification_ready") else "Push recipients still need to be configured.",
+        },
+        {
+            "area": "Compliance Profile",
+            "ready": bool(station.get("compliance_profile_ready")),
+            "message": "Compliance profile is ready." if station.get("compliance_profile_ready") else "Compliance profile requires authorized review.",
+        },
+    ]
+
+    ready_count = len([item for item in readiness_items if item["ready"]])
+    total_count = len(readiness_items)
+
+    full_operations_ready = ready_count == total_count
+
+    return {
+        "status": "success",
+        "station": station,
+        "zip_coverages_count": len(zip_rows),
+        "zip_coverages": zip_rows,
+        "readiness_score": round((ready_count / total_count) * 100, 2),
+        "full_operations_ready": full_operations_ready,
+        "readiness_items": readiness_items,
+        "message": "Station is fully operations-ready." if full_operations_ready else "Station exists, but additional setup is required before full operations.",
+    }
