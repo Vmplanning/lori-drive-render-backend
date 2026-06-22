@@ -15060,3 +15060,885 @@ async def access_change_history(
         "history_count": len(rows[:limit]),
         "history": rows[:limit],
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# CENTRAL DOCUMENT & DATA INTAKE ENGINE
+# Station / Operations Uploads
+# Driver File Uploads
+# Employee / Staff File Uploads
+# Central document library used by Route Configuration, Driver 360,
+# Compliance, KPI, Counseling, Contract Safeguard, Action Center, etc.
+# ============================================================
+
+from fastapi import Body, Query, UploadFile, File, Form
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime
+import os
+import io
+import csv
+import uuid
+import zipfile
+import xml.etree.ElementTree as ET
+import httpx
+import openpyxl
+
+
+SUPABASE_URL_DOCS = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_DOCS = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_doc_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_doc_upper(value: Any) -> str:
+    return lori_doc_clean(value).upper()
+
+
+def lori_doc_bool_from_text(*values: Any, keywords: List[str]) -> bool:
+    combined = " ".join([lori_doc_clean(v).lower() for v in values if v is not None])
+    return any(keyword.lower() in combined for keyword in keywords)
+
+
+def lori_doc_slug(value: Any) -> str:
+    cleaned = lori_doc_clean(value).lower()
+    keep = []
+    for char in cleaned:
+        if char.isalnum():
+            keep.append(char)
+        elif char in [" ", "-", "_", "/", "."]:
+            keep.append("-")
+    slug = "".join(keep).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "document"
+
+
+async def lori_doc_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_doc_upload_to_storage(
+    bucket: str,
+    storage_path: str,
+    contents: bytes,
+    content_type: str = "application/octet-stream",
+) -> Dict[str, Any]:
+    if not SUPABASE_URL_DOCS or not SUPABASE_SERVICE_ROLE_KEY_DOCS:
+        raise RuntimeError("Missing Supabase environment variables.")
+
+    safe_path = quote(storage_path, safe="/")
+    url = f"{SUPABASE_URL_DOCS}/storage/v1/object/{bucket}/{safe_path}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_DOCS,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_DOCS}",
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(url, headers=headers, content=contents)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase storage upload failed: {response.status_code} {response.text}")
+
+    try:
+        return response.json()
+    except Exception:
+        return {"status": "uploaded", "path": storage_path}
+
+
+def lori_doc_extract_text_from_docx(contents: bytes) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(contents)) as docx:
+            xml_content = docx.read("word/document.xml")
+        root = ET.fromstring(xml_content)
+        text_parts = []
+        for element in root.iter():
+            if element.tag.endswith("}t") and element.text:
+                text_parts.append(element.text)
+        return "\n".join(text_parts).strip()
+    except Exception as exc:
+        return f"DOCX extraction failed: {str(exc)}"
+
+
+def lori_doc_extract_text_and_rows(file_ext: str, contents: bytes) -> Dict[str, Any]:
+    file_ext = file_ext.lower().strip(".")
+    extracted_text = ""
+    parsed_rows_count = 0
+    extraction_status = "Not Extracted"
+    parse_status = "Not Parsed"
+    extraction_notes = ""
+
+    try:
+        if file_ext in ["txt"]:
+            extracted_text = contents.decode("utf-8-sig", errors="ignore")
+            extraction_status = "Extracted"
+            parse_status = "Text Extracted"
+            extraction_notes = "TXT text extracted."
+
+        elif file_ext in ["csv"]:
+            text = contents.decode("utf-8-sig", errors="ignore")
+            reader = csv.DictReader(io.StringIO(text))
+            rows = [row for row in reader]
+            parsed_rows_count = len(rows)
+            preview_lines = text.splitlines()[:80]
+            extracted_text = "\n".join(preview_lines)
+            extraction_status = "Extracted"
+            parse_status = "Parsed"
+            extraction_notes = f"CSV parsed with {parsed_rows_count} data rows."
+
+        elif file_ext in ["xlsx", "xlsm"]:
+            workbook = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
+            sheet = workbook.active
+            rows = list(sheet.iter_rows(values_only=True))
+            parsed_rows_count = max(0, len(rows) - 1)
+            preview = []
+            for row in rows[:80]:
+                preview.append("\t".join([str(v) if v is not None else "" for v in row]))
+            extracted_text = "\n".join(preview)
+            extraction_status = "Extracted"
+            parse_status = "Parsed"
+            extraction_notes = f"Excel file parsed with {parsed_rows_count} data rows."
+
+        elif file_ext in ["docx"]:
+            extracted_text = lori_doc_extract_text_from_docx(contents)
+            extraction_status = "Extracted" if extracted_text and not extracted_text.startswith("DOCX extraction failed") else "Needs Review"
+            parse_status = "Text Extracted" if extraction_status == "Extracted" else "Needs Review"
+            extraction_notes = "DOCX text extracted." if extraction_status == "Extracted" else extracted_text
+
+        elif file_ext in ["pdf"]:
+            extracted_text = ""
+            extraction_status = "Not Extracted"
+            parse_status = "PDF Stored"
+            extraction_notes = "PDF uploaded and stored. PDF text extraction is staged for a later backend step."
+
+        else:
+            extracted_text = ""
+            extraction_status = "Not Extracted"
+            parse_status = "Stored"
+            extraction_notes = f"File type {file_ext} uploaded and stored. Automatic extraction not configured yet."
+
+    except Exception as exc:
+        extracted_text = ""
+        extraction_status = "Failed Extraction"
+        parse_status = "Failed"
+        extraction_notes = str(exc)
+
+    return {
+        "extraction_status": extraction_status,
+        "parse_status": parse_status,
+        "extracted_text": extracted_text[:250000] if extracted_text else "",
+        "parsed_rows_count": parsed_rows_count,
+        "extraction_notes": extraction_notes,
+    }
+
+
+def lori_doc_flags(
+    intake_lane: str,
+    document_type: str,
+    document_category: str,
+    applies_to: str,
+    driver_type: str = "",
+    employee_role: str = "",
+) -> Dict[str, bool]:
+    values = [intake_lane, document_type, document_category, applies_to, driver_type, employee_role]
+
+    contract_related = lori_doc_bool_from_text(
+        *values,
+        keywords=[
+            "contract", "agreement", "owner-operator", "owner operator",
+            "contractor", "collective bargaining", "cba"
+        ],
+    )
+
+    union_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["union", "collective bargaining", "cba", "labor agreement"],
+    )
+
+    contractor_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["contractor", "owner-operator", "owner operator"],
+    )
+
+    owner_operator_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["owner-operator", "owner operator"],
+    )
+
+    pay_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["pay", "compensation", "wage", "overtime", "rate", "guarantee"],
+    )
+
+    route_assignment_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["route assignment", "route", "manifest", "work area", "territory", "stop"],
+    )
+
+    safety_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["safety", "accident", "incident", "injury", "crash", "dot", "fmCSA".lower()],
+    )
+
+    accident_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["accident", "incident", "crash", "collision"],
+    )
+
+    counseling_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["counseling", "disciplinary", "discipline", "corrective action", "warning"],
+    )
+
+    training_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["training", "certification", "credential", "license", "mvr"],
+    )
+
+    compliance_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["compliance", "policy", "regulatory", "dot", "fmCSA".lower(), "osha"],
+    )
+
+    policy_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["policy", "sop", "procedure", "standard operating"],
+    )
+
+    kpi_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["kpi", "performance", "scorecard", "payroll exception", "metrics"],
+    )
+
+    route_configuration_related = route_assignment_related
+
+    notification_related = lori_doc_bool_from_text(
+        *values,
+        keywords=["notification", "message", "push", "sms", "email"],
+    )
+
+    labor_review_required = contract_related or union_related or contractor_related or pay_related
+    hr_review_required = counseling_related or accident_related or training_related or pay_related
+    legal_review_required = contract_related or union_related
+
+    return {
+        "contract_related": contract_related,
+        "union_related": union_related,
+        "contractor_related": contractor_related,
+        "owner_operator_related": owner_operator_related,
+        "pay_related": pay_related,
+        "route_assignment_related": route_assignment_related,
+        "labor_review_required": labor_review_required,
+        "hr_review_required": hr_review_required,
+        "legal_review_required": legal_review_required,
+        "safety_related": safety_related,
+        "accident_related": accident_related,
+        "counseling_related": counseling_related,
+        "training_related": training_related,
+        "compliance_related": compliance_related,
+        "policy_related": policy_related,
+        "kpi_related": kpi_related,
+        "route_configuration_related": route_configuration_related,
+        "notification_related": notification_related,
+    }
+
+
+def lori_doc_default_modules(flags: Dict[str, bool], intake_lane: str) -> List[str]:
+    modules = ["Document Library"]
+
+    if intake_lane == "Station / Operations":
+        modules.extend(["Data Intake", "Leadership Dashboard", "Reports"])
+
+    if intake_lane == "Driver File":
+        modules.extend(["Driver 360", "Counseling", "Safety"])
+
+    if intake_lane == "Employee / Staff File":
+        modules.extend(["Employee / Staff File", "Training", "Safety"])
+
+    if flags.get("route_configuration_related"):
+        modules.append("Route Configuration")
+
+    if flags.get("contract_related") or flags.get("union_related") or flags.get("pay_related"):
+        modules.append("Contract Safeguard")
+
+    if flags.get("compliance_related") or flags.get("policy_related"):
+        modules.append("Compliance & Policy Center")
+
+    if flags.get("kpi_related"):
+        modules.append("KPI Action Plans")
+
+    if flags.get("accident_related") or flags.get("safety_related"):
+        modules.append("Safety Review")
+
+    return sorted(list(set(modules)))
+
+
+@app.get("/document-library-summary")
+async def document_library_summary(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    docs = await lori_doc_get_rows(
+        "lori_document_library",
+        "select=*&order=created_at.desc&limit=5000",
+    )
+
+    if station_code:
+        docs = [
+            d for d in docs
+            if lori_doc_upper(d.get("station_code")) == lori_doc_upper(station_code)
+        ]
+
+    return {
+        "status": "success",
+        "documents_count": len(docs),
+        "station_operations_count": len([d for d in docs if d.get("intake_lane") == "Station / Operations"]),
+        "driver_file_count": len([d for d in docs if d.get("intake_lane") == "Driver File"]),
+        "employee_staff_file_count": len([d for d in docs if d.get("intake_lane") == "Employee / Staff File"]),
+        "contract_related_count": len([d for d in docs if d.get("contract_related")]),
+        "union_related_count": len([d for d in docs if d.get("union_related")]),
+        "safety_related_count": len([d for d in docs if d.get("safety_related")]),
+        "accident_related_count": len([d for d in docs if d.get("accident_related")]),
+        "counseling_related_count": len([d for d in docs if d.get("counseling_related")]),
+        "route_configuration_related_count": len([d for d in docs if d.get("route_configuration_related")]),
+        "kpi_related_count": len([d for d in docs if d.get("kpi_related")]),
+        "extracted_count": len([d for d in docs if d.get("extraction_status") == "Extracted"]),
+    }
+
+
+@app.post("/document-intake-upload")
+async def document_intake_upload(
+    api_key: Optional[str] = Query(None),
+
+    intake_lane: str = Form(...),
+    document_title: str = Form(...),
+    document_type: str = Form("Other"),
+    document_category: str = Form(""),
+    applies_to: str = Form("Station"),
+
+    company_name: str = Form(""),
+    region_code: str = Form(""),
+    region_name: str = Form(""),
+    operating_state: str = Form(""),
+    city: str = Form(""),
+    station_code: str = Form(""),
+    station_name: str = Form(""),
+    primary_zip: str = Form(""),
+    route_group: str = Form(""),
+    route_id: str = Form(""),
+
+    subject_type: str = Form("Station"),
+    driver_name: str = Form(""),
+    driver_id: str = Form(""),
+    driver_type: str = Form(""),
+    employee_name: str = Form(""),
+    employee_id: str = Form(""),
+    employee_role: str = Form(""),
+    department: str = Form(""),
+    supervisor_name: str = Form(""),
+
+    incident_date: Optional[str] = Form(None),
+    effective_date: Optional[str] = Form(None),
+    expiration_date: Optional[str] = Form(None),
+    review_due_date: Optional[str] = Form(None),
+
+    document_owner: str = Form(""),
+    uploaded_by: str = Form("LORI Document Intake"),
+    notes: str = Form(""),
+
+    file: UploadFile = File(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    original_file_name = file.filename or "uploaded_document"
+    file_ext = original_file_name.split(".")[-1].lower() if "." in original_file_name else "unknown"
+    file_content_type = file.content_type or "application/octet-stream"
+    contents = await file.read()
+    file_size = len(contents)
+
+    flags = lori_doc_flags(
+        intake_lane=intake_lane,
+        document_type=document_type,
+        document_category=document_category,
+        applies_to=applies_to,
+        driver_type=driver_type,
+        employee_role=employee_role,
+    )
+
+    modules = lori_doc_default_modules(flags, intake_lane)
+
+    extraction = lori_doc_extract_text_and_rows(file_ext, contents)
+
+    bucket = "lori-central-documents"
+
+    station_part = lori_doc_slug(station_code or "no-station")
+    lane_part = lori_doc_slug(intake_lane)
+    file_part = lori_doc_slug(original_file_name)
+    storage_path = f"{station_part}/{lane_part}/{uuid.uuid4()}-{file_part}"
+
+    storage_result = await lori_doc_upload_to_storage(
+        bucket=bucket,
+        storage_path=storage_path,
+        contents=contents,
+        content_type=file_content_type,
+    )
+
+    sensitivity_level = "Sensitive" if intake_lane in ["Driver File", "Employee / Staff File"] or flags.get("contract_related") or flags.get("accident_related") else "Standard"
+    privacy_classification = "Personnel" if intake_lane in ["Driver File", "Employee / Staff File"] else "Internal"
+
+    document_payload = {
+        "document_title": lori_doc_clean(document_title),
+        "document_status": "Uploaded",
+        "intake_lane": lori_doc_clean(intake_lane),
+        "document_type": lori_doc_clean(document_type),
+        "document_category": lori_doc_clean(document_category),
+        "applies_to": lori_doc_clean(applies_to),
+
+        "company_name": lori_doc_clean(company_name),
+        "region_code": lori_doc_upper(region_code),
+        "region_name": lori_doc_clean(region_name),
+        "operating_state": lori_doc_upper(operating_state),
+        "city": lori_doc_clean(city),
+        "station_code": lori_doc_upper(station_code),
+        "station_name": lori_doc_clean(station_name),
+        "primary_zip": lori_doc_clean(primary_zip),
+        "route_group": lori_doc_clean(route_group),
+        "route_id": lori_doc_clean(route_id),
+
+        "subject_type": lori_doc_clean(subject_type),
+        "driver_name": lori_doc_clean(driver_name),
+        "driver_id": lori_doc_clean(driver_id),
+        "driver_type": lori_doc_clean(driver_type),
+        "employee_name": lori_doc_clean(employee_name),
+        "employee_id": lori_doc_clean(employee_id),
+        "employee_role": lori_doc_clean(employee_role),
+        "department": lori_doc_clean(department),
+        "supervisor_name": lori_doc_clean(supervisor_name),
+
+        **flags,
+
+        "incident_date": incident_date or None,
+        "effective_date": effective_date or None,
+        "expiration_date": expiration_date or None,
+        "review_due_date": review_due_date or None,
+
+        "original_file_name": original_file_name,
+        "file_type": file_ext,
+        "file_size_bytes": file_size,
+        "storage_bucket": bucket,
+        "storage_path": storage_path,
+
+        "extraction_status": extraction["extraction_status"],
+        "parse_status": extraction["parse_status"],
+        "extracted_text": extraction["extracted_text"],
+        "parsed_rows_count": extraction["parsed_rows_count"],
+        "extraction_notes": extraction["extraction_notes"],
+
+        "referenced_by_modules": modules,
+        "searchable_keywords": [
+            lori_doc_clean(document_type).lower(),
+            lori_doc_clean(document_category).lower(),
+            lori_doc_clean(applies_to).lower(),
+            lori_doc_clean(driver_name).lower(),
+            lori_doc_clean(employee_name).lower(),
+            lori_doc_clean(route_id).lower(),
+            lori_doc_clean(station_code).lower(),
+        ],
+        "privacy_classification": privacy_classification,
+        "sensitivity_level": sensitivity_level,
+        "archive_status": "Active",
+
+        "document_owner": lori_doc_clean(document_owner),
+        "uploaded_by": lori_doc_clean(uploaded_by),
+        "notes": lori_doc_clean(notes),
+    }
+
+    created = await lori_policy_supabase_post("lori_document_library", document_payload)
+    document = created[0] if created else document_payload
+
+    extraction_job_payload = {
+        "document_id": document.get("id"),
+        "job_type": "Initial Upload Extraction",
+        "job_status": "Completed" if extraction["extraction_status"] == "Extracted" else "Needs Review",
+        "file_type": file_ext,
+        "extraction_method": "LORI Basic Extraction",
+        "rows_detected": extraction["parsed_rows_count"],
+        "rows_imported": 0,
+        "pages_detected": 0,
+        "extracted_text_preview": extraction["extracted_text"][:1000] if extraction["extracted_text"] else "",
+        "error_message": "" if extraction["extraction_status"] != "Failed Extraction" else extraction["extraction_notes"],
+        "review_required": extraction["extraction_status"] != "Extracted",
+        "started_at": datetime.utcnow().isoformat(),
+        "completed_at": datetime.utcnow().isoformat(),
+    }
+
+    await lori_policy_supabase_post("lori_document_extraction_jobs", extraction_job_payload)
+
+    return {
+        "status": "success",
+        "message": "Document uploaded to LORI Document Library.",
+        "document": document,
+        "storage": {
+            "bucket": bucket,
+            "path": storage_path,
+            "result": storage_result,
+        },
+        "extraction": extraction,
+        "referenced_by_modules": modules,
+        "warning": "PDF extraction is staged. PDF is stored and available for selection, but structured extraction will be added in a later step." if file_ext == "pdf" else None,
+    }
+
+
+@app.get("/document-library")
+async def document_library(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    intake_lane: Optional[str] = Query(None),
+    document_type: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    driver_id: Optional[str] = Query(None),
+    employee_name: Optional[str] = Query(None),
+    employee_id: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    module_name: Optional[str] = Query(None),
+    contract_related: Optional[bool] = Query(None),
+    safety_related: Optional[bool] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    docs = await lori_doc_get_rows(
+        "lori_document_library",
+        "select=*&order=created_at.desc&limit=5000",
+    )
+
+    if station_code:
+        docs = [d for d in docs if lori_doc_upper(d.get("station_code")) == lori_doc_upper(station_code)]
+
+    if intake_lane:
+        docs = [d for d in docs if lori_doc_clean(d.get("intake_lane")).lower() == intake_lane.lower()]
+
+    if document_type:
+        docs = [d for d in docs if lori_doc_clean(d.get("document_type")).lower() == document_type.lower()]
+
+    if driver_name:
+        docs = [d for d in docs if driver_name.lower() in lori_doc_clean(d.get("driver_name")).lower()]
+
+    if driver_id:
+        docs = [d for d in docs if lori_doc_clean(d.get("driver_id")).lower() == driver_id.lower()]
+
+    if employee_name:
+        docs = [d for d in docs if employee_name.lower() in lori_doc_clean(d.get("employee_name")).lower()]
+
+    if employee_id:
+        docs = [d for d in docs if lori_doc_clean(d.get("employee_id")).lower() == employee_id.lower()]
+
+    if route_id:
+        docs = [d for d in docs if lori_doc_clean(d.get("route_id")).lower() == route_id.lower()]
+
+    if module_name:
+        docs = [
+            d for d in docs
+            if module_name in (d.get("referenced_by_modules") or [])
+        ]
+
+    if contract_related is not None:
+        docs = [d for d in docs if bool(d.get("contract_related")) is contract_related]
+
+    if safety_related is not None:
+        docs = [d for d in docs if bool(d.get("safety_related")) is safety_related]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "documents_count": len(docs[:limit]),
+        "documents": docs[:limit],
+    }
+
+
+@app.get("/document-detail")
+async def document_detail(
+    api_key: Optional[str] = Query(None),
+    document_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    docs = await lori_doc_get_rows(
+        "lori_document_library",
+        f"select=*&id=eq.{quote(document_id)}&limit=1",
+    )
+
+    if not docs:
+        return {
+            "status": "not_found",
+            "message": "Document not found.",
+        }
+
+    relationships = await lori_doc_get_rows(
+        "lori_document_relationships",
+        f"select=*&document_id=eq.{quote(document_id)}&order=created_at.desc&limit=500",
+    )
+
+    findings = await lori_doc_get_rows(
+        "lori_document_review_findings",
+        f"select=*&document_id=eq.{quote(document_id)}&order=created_at.desc&limit=500",
+    )
+
+    extraction_jobs = await lori_doc_get_rows(
+        "lori_document_extraction_jobs",
+        f"select=*&document_id=eq.{quote(document_id)}&order=created_at.desc&limit=100",
+    )
+
+    return {
+        "status": "success",
+        "document": docs[0],
+        "relationships_count": len(relationships),
+        "relationships": relationships,
+        "findings_count": len(findings),
+        "findings": findings,
+        "extraction_jobs_count": len(extraction_jobs),
+        "extraction_jobs": extraction_jobs,
+    }
+
+
+@app.post("/document-relationship-create")
+async def document_relationship_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    document_id = lori_doc_clean(payload.get("document_id"))
+    target_module = lori_doc_clean(payload.get("target_module"))
+    relationship_type = lori_doc_clean(payload.get("relationship_type") or f"Attached to {target_module}")
+
+    if not document_id:
+        return {"status": "error", "message": "document_id is required."}
+
+    if not target_module:
+        return {"status": "error", "message": "target_module is required."}
+
+    relationship_payload = {
+        "document_id": document_id,
+        "relationship_type": relationship_type,
+        "target_module": target_module,
+        "target_record_id": payload.get("target_record_id"),
+        "target_reference": lori_doc_clean(payload.get("target_reference")),
+        "company_name": lori_doc_clean(payload.get("company_name")),
+        "station_code": lori_doc_upper(payload.get("station_code")),
+        "route_id": lori_doc_clean(payload.get("route_id")),
+        "driver_id": lori_doc_clean(payload.get("driver_id")),
+        "driver_name": lori_doc_clean(payload.get("driver_name")),
+        "employee_id": lori_doc_clean(payload.get("employee_id")),
+        "employee_name": lori_doc_clean(payload.get("employee_name")),
+        "relationship_status": "Active",
+        "linked_by": lori_doc_clean(payload.get("linked_by") or "LORI Document Intake"),
+        "notes": lori_doc_clean(payload.get("notes")),
+    }
+
+    created = await lori_policy_supabase_post("lori_document_relationships", relationship_payload)
+
+    return {
+        "status": "success",
+        "message": "Document relationship created.",
+        "relationship": created[0] if created else relationship_payload,
+    }
+
+
+@app.post("/document-review-finding-create")
+async def document_review_finding_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    document_id = lori_doc_clean(payload.get("document_id"))
+
+    if not document_id:
+        return {"status": "error", "message": "document_id is required."}
+
+    finding_payload = {
+        "document_id": document_id,
+        "finding_type": lori_doc_clean(payload.get("finding_type") or "Document Review Finding"),
+        "finding_category": lori_doc_clean(payload.get("finding_category")),
+        "risk_level": lori_doc_clean(payload.get("risk_level") or "Medium"),
+        "finding_title": lori_doc_clean(payload.get("finding_title")),
+        "finding_summary": lori_doc_clean(payload.get("finding_summary") or "Finding requires review."),
+        "relevant_excerpt": lori_doc_clean(payload.get("relevant_excerpt")),
+        "operational_impact": lori_doc_clean(payload.get("operational_impact")),
+        "cost_impact": lori_doc_clean(payload.get("cost_impact")),
+        "safety_impact": lori_doc_clean(payload.get("safety_impact")),
+        "compliance_impact": lori_doc_clean(payload.get("compliance_impact")),
+        "labor_impact": lori_doc_clean(payload.get("labor_impact")),
+        "recommended_action": lori_doc_clean(payload.get("recommended_action")),
+        "requires_supervisor_review": bool(payload.get("requires_supervisor_review", False)),
+        "requires_hr_review": bool(payload.get("requires_hr_review", False)),
+        "requires_labor_review": bool(payload.get("requires_labor_review", False)),
+        "requires_legal_review": bool(payload.get("requires_legal_review", False)),
+        "blocks_final_action": bool(payload.get("blocks_final_action", False)),
+        "created_by": lori_doc_clean(payload.get("created_by") or "LORI Document Review Engine"),
+    }
+
+    created = await lori_policy_supabase_post("lori_document_review_findings", finding_payload)
+
+    return {
+        "status": "success",
+        "message": "Document review finding created.",
+        "finding": created[0] if created else finding_payload,
+    }
+
+
+@app.get("/documents-for-driver")
+async def documents_for_driver(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    driver_id: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    return await document_library(
+        api_key=api_key,
+        station_code=station_code,
+        intake_lane="Driver File",
+        driver_name=driver_name,
+        driver_id=driver_id,
+        limit=limit,
+    )
+
+
+@app.get("/documents-for-employee")
+async def documents_for_employee(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    employee_name: Optional[str] = Query(None),
+    employee_id: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    return await document_library(
+        api_key=api_key,
+        station_code=station_code,
+        intake_lane="Employee / Staff File",
+        employee_name=employee_name,
+        employee_id=employee_id,
+        limit=limit,
+    )
+
+
+@app.get("/documents-for-route-configuration")
+async def documents_for_route_configuration(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    limit: int = Query(300),
+):
+    return await document_library(
+        api_key=api_key,
+        station_code=station_code,
+        route_id=route_id,
+        module_name="Route Configuration",
+        limit=limit,
+    )
+
+
+@app.get("/documents-for-contract-safeguard")
+async def documents_for_contract_safeguard(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    driver_id: Optional[str] = Query(None),
+    limit: int = Query(300),
+):
+    lori_regulatory_require_key(api_key)
+
+    docs_response = await document_library(
+        api_key=api_key,
+        station_code=station_code,
+        driver_name=driver_name,
+        driver_id=driver_id,
+        limit=1000,
+    )
+
+    docs = docs_response.get("documents", [])
+
+    docs = [
+        d for d in docs
+        if d.get("contract_related")
+        or d.get("union_related")
+        or d.get("contractor_related")
+        or d.get("owner_operator_related")
+        or d.get("pay_related")
+        or d.get("route_assignment_related")
+    ]
+
+    return {
+        "status": "success",
+        "documents_count": len(docs[:limit]),
+        "documents": docs[:limit],
+    }
+
+
+@app.post("/document-extract-text")
+async def document_extract_text(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    document_id = lori_doc_clean(payload.get("document_id"))
+
+    if not document_id:
+        return {"status": "error", "message": "document_id is required."}
+
+    detail = await document_detail(api_key=api_key, document_id=document_id)
+
+    if detail.get("status") != "success":
+        return detail
+
+    document = detail.get("document") or {}
+
+    if document.get("extracted_text"):
+        return {
+            "status": "success",
+            "message": "Document already has extracted text.",
+            "document_id": document_id,
+            "extraction_status": document.get("extraction_status"),
+            "parse_status": document.get("parse_status"),
+            "extracted_text_preview": document.get("extracted_text", "")[:3000],
+        }
+
+    job_payload = {
+        "document_id": document_id,
+        "job_type": "Manual Extraction Request",
+        "job_status": "Needs Review",
+        "file_type": document.get("file_type"),
+        "extraction_method": "Manual/Advanced Extraction Required",
+        "rows_detected": 0,
+        "rows_imported": 0,
+        "pages_detected": 0,
+        "extracted_text_preview": "",
+        "error_message": "No extracted text is available yet. PDF/OCR advanced extraction will be added in a later step.",
+        "review_required": True,
+        "started_at": datetime.utcnow().isoformat(),
+        "completed_at": datetime.utcnow().isoformat(),
+    }
+
+    created_job = await lori_policy_supabase_post("lori_document_extraction_jobs", job_payload)
+
+    return {
+        "status": "needs_review",
+        "message": "Document does not have extracted text yet. Advanced extraction is required.",
+        "document_id": document_id,
+        "extraction_job": created_job[0] if created_job else job_payload,
+    }
