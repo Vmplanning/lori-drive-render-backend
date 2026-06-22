@@ -14401,3 +14401,662 @@ async def access_audit_log_create(
         "status": "success",
         "message": "Access audit log created.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# USER TRANSFER / ACCESS CHANGE ENGINE
+# Handles station transfers, temporary assignments, access
+# removals, suspensions, and user default context changes.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+import os
+import httpx
+from datetime import date, datetime
+
+
+SUPABASE_URL_TRANSFER = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_TRANSFER = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_transfer_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_transfer_upper(value: Any) -> str:
+    return lori_transfer_clean(value).upper()
+
+
+def lori_transfer_email(value: Any) -> str:
+    return lori_transfer_clean(value).lower()
+
+
+def lori_transfer_today() -> str:
+    return date.today().isoformat()
+
+
+async def lori_transfer_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_transfer_patch_rows(
+    table: str,
+    match_query: str,
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not SUPABASE_URL_TRANSFER or not SUPABASE_SERVICE_ROLE_KEY_TRANSFER:
+        raise RuntimeError("Missing Supabase environment variables.")
+
+    url = f"{SUPABASE_URL_TRANSFER}/rest/v1/{table}?{match_query}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_TRANSFER,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_TRANSFER}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(url, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase PATCH failed: {response.status_code} {response.text}")
+
+    try:
+        return response.json()
+    except Exception:
+        return []
+
+
+async def lori_transfer_find_user(email: str) -> Optional[Dict[str, Any]]:
+    rows = await lori_transfer_get_rows(
+        "lori_user_profiles",
+        f"select=*&email=eq.{quote(lori_transfer_email(email))}&limit=1",
+    )
+    return rows[0] if rows else None
+
+
+async def lori_transfer_find_station(station_code: str) -> Optional[Dict[str, Any]]:
+    rows = await lori_transfer_get_rows(
+        "lori_operating_stations",
+        f"select=*&station_code=eq.{quote(lori_transfer_upper(station_code))}&limit=1",
+    )
+    return rows[0] if rows else None
+
+
+async def lori_transfer_find_rule(transfer_type: str) -> Optional[Dict[str, Any]]:
+    rows = await lori_transfer_get_rows(
+        "lori_user_access_change_rules",
+        f"select=*&transfer_type=eq.{quote(lori_transfer_clean(transfer_type))}&limit=1",
+    )
+    return rows[0] if rows else None
+
+
+@app.get("/access-change-rules")
+async def access_change_rules(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    rules = await lori_transfer_get_rows(
+        "lori_user_access_change_rules",
+        "select=*&order=transfer_type.asc&limit=100",
+    )
+
+    return {
+        "status": "success",
+        "rules_count": len(rules),
+        "rules": rules,
+    }
+
+
+@app.get("/access-change-requests")
+async def access_change_requests(
+    api_key: Optional[str] = Query(None),
+    request_status: Optional[str] = Query(None),
+    user_email: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_transfer_get_rows(
+        "lori_user_access_change_requests",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if request_status:
+        rows = [
+            r for r in rows
+            if lori_transfer_clean(r.get("request_status")).lower() == request_status.lower()
+        ]
+
+    if user_email:
+        rows = [
+            r for r in rows
+            if lori_transfer_email(r.get("user_email")) == lori_transfer_email(user_email)
+        ]
+
+    limit = max(1, min(limit, 500))
+
+    return {
+        "status": "success",
+        "requests_count": len(rows[:limit]),
+        "requests": rows[:limit],
+    }
+
+
+@app.post("/access-change-request-create")
+async def access_change_request_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    user_email = lori_transfer_email(payload.get("user_email"))
+    transfer_type = lori_transfer_clean(payload.get("request_type") or "Permanent Transfer")
+    new_station_code = lori_transfer_upper(payload.get("new_station_code"))
+    transfer_effective_date = lori_transfer_clean(payload.get("transfer_effective_date") or lori_transfer_today())
+    expiration_date = lori_transfer_clean(payload.get("expiration_date"))
+
+    if not user_email:
+        return {"status": "error", "message": "user_email is required."}
+
+    if not new_station_code and transfer_type not in ["Termination / Remove Access", "Leave of Absence / Suspend Access"]:
+        return {"status": "error", "message": "new_station_code is required for station access changes."}
+
+    user = await lori_transfer_find_user(user_email)
+
+    if not user:
+        return {
+            "status": "not_found",
+            "message": "User profile not found. Create the user profile before requesting a transfer.",
+            "user_email": user_email,
+        }
+
+    rule = await lori_transfer_find_rule(transfer_type)
+
+    if not rule:
+        return {
+            "status": "error",
+            "message": f"Transfer type '{transfer_type}' is not configured.",
+        }
+
+    if rule.get("requires_expiration_date") and not expiration_date:
+        return {
+            "status": "error",
+            "message": f"{transfer_type} requires an expiration date.",
+        }
+
+    new_station = None
+    if new_station_code:
+        new_station = await lori_transfer_find_station(new_station_code)
+        if not new_station:
+            return {
+                "status": "not_found",
+                "message": f"New station {new_station_code} was not found in LORI station registry.",
+            }
+
+    request_title = lori_transfer_clean(
+        payload.get("request_title")
+        or f"{transfer_type} — {user.get('full_name')} to {new_station_code or 'Access Removal'}"
+    )
+
+    request_payload = {
+        "request_title": request_title,
+        "request_type": transfer_type,
+        "request_status": "Pending Review",
+        "user_profile_id": user.get("id"),
+        "user_full_name": user.get("full_name"),
+        "user_email": user.get("email"),
+
+        "current_company_name": user.get("company_name"),
+        "current_region_code": user.get("default_region_code"),
+        "current_region_name": user.get("default_region_name"),
+        "current_operating_state": user.get("default_operating_state"),
+        "current_city": user.get("default_city"),
+        "current_station_code": user.get("default_station_code"),
+        "current_station_name": user.get("default_station_name"),
+        "current_route_group": user.get("default_route_group"),
+
+        "new_company_name": new_station.get("company_name") if new_station else None,
+        "new_region_code": new_station.get("region_code") if new_station else None,
+        "new_region_name": new_station.get("region_name") if new_station else None,
+        "new_operating_state": new_station.get("operating_state") if new_station else None,
+        "new_city": new_station.get("city") if new_station else None,
+        "new_station_code": new_station.get("station_code") if new_station else None,
+        "new_station_name": new_station.get("station_name") if new_station else None,
+        "new_route_group": payload.get("new_route_group") or "All Routes",
+
+        "current_role_code": payload.get("current_role_code"),
+        "current_role_name": payload.get("current_role_name"),
+        "new_role_code": payload.get("new_role_code"),
+        "new_role_name": payload.get("new_role_name"),
+
+        "transfer_effective_date": transfer_effective_date,
+        "expiration_date": expiration_date or None,
+        "transfer_reason": lori_transfer_clean(payload.get("transfer_reason")),
+        "requested_by": lori_transfer_clean(payload.get("requested_by") or "LORI Admin"),
+        "approval_notes": lori_transfer_clean(payload.get("approval_notes")),
+        "requires_expiration_date": bool(rule.get("requires_expiration_date")),
+        "requires_admin_approval": bool(rule.get("requires_admin_approval")),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_user_access_change_requests",
+        request_payload,
+    )
+
+    request = created[0] if created else request_payload
+
+    await lori_policy_supabase_post(
+        "lori_user_access_change_approvals",
+        {
+            "access_change_request_id": request.get("id"),
+            "approval_step": "Admin / HR / Regional Approval",
+            "approver_role": "Platform Admin / HR / Regional Manager",
+            "approval_status": "Pending",
+            "required": True,
+            "step_order": 1,
+        },
+    )
+
+    await lori_access_log_event(
+        user_profile_id=user.get("id"),
+        action_type="Transfer Request Created",
+        module_name="User Access Management",
+        company_name=user.get("company_name"),
+        region_name=user.get("default_region_name"),
+        operating_state=user.get("default_operating_state"),
+        station_code=user.get("default_station_code"),
+        route_group=user.get("default_route_group"),
+        access_result="Created",
+        reason=f"{transfer_type} request created.",
+        request_context=request,
+    )
+
+    return {
+        "status": "success",
+        "message": "User transfer/access change request created.",
+        "request": request,
+    }
+
+
+@app.post("/access-change-request-approve")
+async def access_change_request_approve(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request_id = lori_transfer_clean(payload.get("request_id"))
+    approved_by = lori_transfer_clean(payload.get("approved_by") or "LORI Admin")
+    approval_notes = lori_transfer_clean(payload.get("approval_notes"))
+
+    if not request_id:
+        return {"status": "error", "message": "request_id is required."}
+
+    rows = await lori_transfer_get_rows(
+        "lori_user_access_change_requests",
+        f"select=*&id=eq.{quote(request_id)}&limit=1",
+    )
+
+    if not rows:
+        return {"status": "not_found", "message": "Access change request not found."}
+
+    request = rows[0]
+
+    updated = await lori_transfer_patch_rows(
+        "lori_user_access_change_requests",
+        f"id=eq.{quote(request_id)}",
+        {
+            "request_status": "Approved",
+            "approved_by": approved_by,
+            "approval_notes": approval_notes,
+            "approved_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_transfer_patch_rows(
+        "lori_user_access_change_approvals",
+        f"access_change_request_id=eq.{quote(request_id)}",
+        {
+            "approval_status": "Approved",
+            "approval_decision": "Approved",
+            "approval_notes": approval_notes,
+            "approver_name": approved_by,
+            "decided_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_access_log_event(
+        user_profile_id=request.get("user_profile_id"),
+        action_type="Transfer Request Approved",
+        module_name="User Access Management",
+        company_name=request.get("current_company_name"),
+        region_name=request.get("current_region_name"),
+        operating_state=request.get("current_operating_state"),
+        station_code=request.get("current_station_code"),
+        access_result="Approved",
+        reason=approval_notes or "Transfer/access change approved.",
+        request_context=updated[0] if updated else request,
+    )
+
+    return {
+        "status": "success",
+        "message": "Access change request approved.",
+        "request": updated[0] if updated else request,
+    }
+
+
+@app.post("/access-change-request-deny")
+async def access_change_request_deny(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request_id = lori_transfer_clean(payload.get("request_id"))
+    denied_by = lori_transfer_clean(payload.get("denied_by") or "LORI Admin")
+    denial_reason = lori_transfer_clean(payload.get("denial_reason"))
+
+    if not request_id:
+        return {"status": "error", "message": "request_id is required."}
+
+    rows = await lori_transfer_get_rows(
+        "lori_user_access_change_requests",
+        f"select=*&id=eq.{quote(request_id)}&limit=1",
+    )
+
+    if not rows:
+        return {"status": "not_found", "message": "Access change request not found."}
+
+    request = rows[0]
+
+    updated = await lori_transfer_patch_rows(
+        "lori_user_access_change_requests",
+        f"id=eq.{quote(request_id)}",
+        {
+            "request_status": "Denied",
+            "denied_by": denied_by,
+            "denial_reason": denial_reason,
+            "denied_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_access_log_event(
+        user_profile_id=request.get("user_profile_id"),
+        action_type="Transfer Request Denied",
+        module_name="User Access Management",
+        station_code=request.get("current_station_code"),
+        access_result="Denied",
+        reason=denial_reason or "Transfer/access change denied.",
+        request_context=updated[0] if updated else request,
+    )
+
+    return {
+        "status": "success",
+        "message": "Access change request denied.",
+        "request": updated[0] if updated else request,
+    }
+
+
+@app.post("/access-change-request-complete")
+async def access_change_request_complete(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request_id = lori_transfer_clean(payload.get("request_id"))
+    completed_by = lori_transfer_clean(payload.get("completed_by") or "LORI Admin")
+    completion_notes = lori_transfer_clean(payload.get("completion_notes"))
+
+    if not request_id:
+        return {"status": "error", "message": "request_id is required."}
+
+    rows = await lori_transfer_get_rows(
+        "lori_user_access_change_requests",
+        f"select=*&id=eq.{quote(request_id)}&limit=1",
+    )
+
+    if not rows:
+        return {"status": "not_found", "message": "Access change request not found."}
+
+    request = rows[0]
+
+    if request.get("request_status") not in ["Approved", "Pending Review"]:
+        return {
+            "status": "error",
+            "message": f"Request status is {request.get('request_status')}. Only approved requests should be completed.",
+        }
+
+    user_id = request.get("user_profile_id")
+    transfer_type = request.get("request_type")
+    rule = await lori_transfer_find_rule(transfer_type)
+
+    if not rule:
+        return {"status": "error", "message": "Transfer rule not found."}
+
+    effective_date = request.get("transfer_effective_date") or lori_transfer_today()
+    expiration_date = request.get("expiration_date")
+
+    old_access_disabled = False
+    new_access_enabled = False
+    default_context_updated = False
+
+    if rule.get("disables_old_station_access") and request.get("current_station_code"):
+        await lori_transfer_patch_rows(
+            "lori_user_station_access",
+            f"user_profile_id=eq.{quote(str(user_id))}&station_code=eq.{quote(str(request.get('current_station_code')))}",
+            {
+                "access_status": "Transferred",
+                "can_view": False,
+                "can_upload": False,
+                "can_edit": False,
+                "can_approve": False,
+                "can_send_notifications": False,
+                "expiration_date": effective_date,
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+        old_access_disabled = True
+
+    if rule.get("deactivates_user"):
+        await lori_transfer_patch_rows(
+            "lori_user_profiles",
+            f"id=eq.{quote(str(user_id))}",
+            {
+                "user_status": "Inactive",
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+    if rule.get("suspends_user"):
+        await lori_transfer_patch_rows(
+            "lori_user_profiles",
+            f"id=eq.{quote(str(user_id))}",
+            {
+                "user_status": "Suspended",
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+    if rule.get("adds_new_station_access") and request.get("new_station_code"):
+        existing_new_access = await lori_transfer_get_rows(
+            "lori_user_station_access",
+            f"select=*&user_profile_id=eq.{quote(str(user_id))}&station_code=eq.{quote(str(request.get('new_station_code')))}&limit=1",
+        )
+
+        new_access_payload = {
+            "user_profile_id": user_id,
+            "company_name": request.get("new_company_name"),
+            "region_code": request.get("new_region_code"),
+            "region_name": request.get("new_region_name"),
+            "operating_state": request.get("new_operating_state"),
+            "city": request.get("new_city"),
+            "station_code": request.get("new_station_code"),
+            "station_name": request.get("new_station_name"),
+            "route_group": request.get("new_route_group") or "All Routes",
+            "access_scope": "Station",
+            "access_status": "Active",
+            "can_view": True,
+            "can_upload": True,
+            "can_edit": True,
+            "can_approve": True,
+            "can_send_notifications": True,
+            "effective_date": effective_date,
+            "expiration_date": expiration_date or None,
+            "created_by": completed_by,
+        }
+
+        if existing_new_access:
+            await lori_transfer_patch_rows(
+                "lori_user_station_access",
+                f"id=eq.{quote(str(existing_new_access[0].get('id')))}",
+                {
+                    "access_status": "Active",
+                    "can_view": True,
+                    "can_upload": True,
+                    "can_edit": True,
+                    "can_approve": True,
+                    "can_send_notifications": True,
+                    "effective_date": effective_date,
+                    "expiration_date": expiration_date or None,
+                    "updated_at": datetime.utcnow().isoformat(),
+                },
+            )
+        else:
+            await lori_policy_supabase_post(
+                "lori_user_station_access",
+                new_access_payload,
+            )
+
+        new_access_enabled = True
+
+    if rule.get("updates_default_context") and request.get("new_station_code"):
+        await lori_transfer_patch_rows(
+            "lori_user_profiles",
+            f"id=eq.{quote(str(user_id))}",
+            {
+                "company_name": request.get("new_company_name"),
+                "default_region_code": request.get("new_region_code"),
+                "default_region_name": request.get("new_region_name"),
+                "default_operating_state": request.get("new_operating_state"),
+                "default_station_code": request.get("new_station_code"),
+                "default_station_name": request.get("new_station_name"),
+                "default_city": request.get("new_city"),
+                "default_route_group": request.get("new_route_group") or "All Routes",
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+        default_context_updated = True
+
+    history_payload = {
+        "access_change_request_id": request_id,
+        "user_profile_id": user_id,
+        "user_full_name": request.get("user_full_name"),
+        "user_email": request.get("user_email"),
+        "change_type": transfer_type,
+        "change_status": "Completed",
+        "from_company_name": request.get("current_company_name"),
+        "from_region_name": request.get("current_region_name"),
+        "from_operating_state": request.get("current_operating_state"),
+        "from_city": request.get("current_city"),
+        "from_station_code": request.get("current_station_code"),
+        "from_station_name": request.get("current_station_name"),
+        "to_company_name": request.get("new_company_name"),
+        "to_region_name": request.get("new_region_name"),
+        "to_operating_state": request.get("new_operating_state"),
+        "to_city": request.get("new_city"),
+        "to_station_code": request.get("new_station_code"),
+        "to_station_name": request.get("new_station_name"),
+        "old_access_status": "Transferred" if old_access_disabled else "Unchanged",
+        "new_access_status": "Active" if new_access_enabled else "Not Added",
+        "effective_date": effective_date,
+        "expiration_date": expiration_date,
+        "changed_by": completed_by,
+        "change_reason": request.get("transfer_reason"),
+        "notes": completion_notes,
+    }
+
+    await lori_policy_supabase_post(
+        "lori_user_access_change_history",
+        history_payload,
+    )
+
+    updated_request = await lori_transfer_patch_rows(
+        "lori_user_access_change_requests",
+        f"id=eq.{quote(request_id)}",
+        {
+            "request_status": "Completed",
+            "completed_by": completed_by,
+            "completion_notes": completion_notes,
+            "old_access_disabled": old_access_disabled,
+            "new_access_enabled": new_access_enabled,
+            "default_context_updated": default_context_updated,
+            "completed_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_access_log_event(
+        user_profile_id=user_id,
+        action_type="Transfer Request Completed",
+        module_name="User Access Management",
+        company_name=request.get("new_company_name"),
+        region_name=request.get("new_region_name"),
+        operating_state=request.get("new_operating_state"),
+        station_code=request.get("new_station_code"),
+        access_result="Completed",
+        reason=f"{transfer_type} completed.",
+        request_context={
+            "request": updated_request[0] if updated_request else request,
+            "history": history_payload,
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "Access change completed.",
+        "request": updated_request[0] if updated_request else request,
+        "old_access_disabled": old_access_disabled,
+        "new_access_enabled": new_access_enabled,
+        "default_context_updated": default_context_updated,
+        "history": history_payload,
+    }
+
+
+@app.get("/access-change-history")
+async def access_change_history(
+    api_key: Optional[str] = Query(None),
+    user_email: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_transfer_get_rows(
+        "lori_user_access_change_history",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if user_email:
+        rows = [
+            row for row in rows
+            if lori_transfer_email(row.get("user_email")) == lori_transfer_email(user_email)
+        ]
+
+    limit = max(1, min(limit, 500))
+
+    return {
+        "status": "success",
+        "history_count": len(rows[:limit]),
+        "history": rows[:limit],
+    }
