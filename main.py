@@ -7069,3 +7069,986 @@ async def kpi_action_plan_send_to_leadership_briefing(
         "briefing_item": briefing[0] if briefing else {},
         "answer_text": "KPI Action Plan added to Leadership Briefing Queue.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# ROUTE CONFIGURATION CENTER BACKEND
+# Route scenario review, work area maps, recommendations,
+# cost savings, productivity gains, Action Center integration,
+# Leadership Briefing integration, and download package data.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime, date, timedelta
+import json
+import html
+import csv
+import io
+import math
+
+
+def lori_route_clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_route_num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+async def lori_route_get_rows(
+    table: str,
+    query: str = "select=*&order=created_at.desc&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+def lori_route_build_moved_stops_csv(moved_stops: List[Dict[str, Any]]) -> str:
+    output = io.StringIO()
+
+    fieldnames = [
+        "stop_id",
+        "customer",
+        "from_route",
+        "to_route",
+        "freight_type",
+    ]
+
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for stop in moved_stops:
+        writer.writerow({
+            "stop_id": stop.get("stop_id", ""),
+            "customer": stop.get("customer", ""),
+            "from_route": stop.get("from_route", ""),
+            "to_route": stop.get("to_route", ""),
+            "freight_type": stop.get("freight_type", ""),
+        })
+
+    return output.getvalue()
+
+
+def lori_route_build_print_html(
+    recommendation: Dict[str, Any],
+    impact: Optional[Dict[str, Any]] = None,
+    maps: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    impact = impact or {}
+    maps = maps or []
+
+    title = html.escape(lori_route_clean_text(recommendation.get("recommendation_title") or "Route Configuration Review"))
+    decision = html.escape(lori_route_clean_text(recommendation.get("decision") or "Review Needed"))
+    priority = html.escape(lori_route_clean_text(recommendation.get("priority") or "High"))
+
+    current_driver = html.escape(lori_route_clean_text(recommendation.get("current_driver_name") or "Current driver"))
+    current_route = html.escape(lori_route_clean_text(recommendation.get("current_route_id") or "Current route"))
+    receiving_driver = html.escape(lori_route_clean_text(recommendation.get("receiving_driver_name") or "Receiving driver"))
+    receiving_route = html.escape(lori_route_clean_text(recommendation.get("receiving_route_id") or "Receiving route"))
+
+    summary = html.escape(lori_route_clean_text(recommendation.get("recommendation_summary") or "Route reconfiguration recommendation."))
+    reason = html.escape(lori_route_clean_text(recommendation.get("operational_reason") or "Operational reason not provided."))
+    benefit = html.escape(lori_route_clean_text(recommendation.get("expected_business_benefit") or "Expected business benefit not provided."))
+
+    cost = html.escape(lori_route_clean_text(recommendation.get("cost_savings_summary") or "Cost savings not calculated."))
+    productivity = html.escape(lori_route_clean_text(recommendation.get("productivity_summary") or "Productivity impact not calculated."))
+    fuel = html.escape(lori_route_clean_text(recommendation.get("fuel_savings_summary") or "Fuel savings not calculated."))
+    service = html.escape(lori_route_clean_text(recommendation.get("service_impact_summary") or "Service impact not calculated."))
+    safety = html.escape(lori_route_clean_text(recommendation.get("safety_risk_summary") or "Safety risk not calculated."))
+
+    seven = html.escape(lori_route_clean_text(recommendation.get("expected_7_day_result") or "7-day result not provided."))
+    thirty = html.escape(lori_route_clean_text(recommendation.get("expected_30_day_result") or "30-day result not provided."))
+    sixty = html.escape(lori_route_clean_text(recommendation.get("expected_60_day_result") or "60-day result not provided."))
+    ninety = html.escape(lori_route_clean_text(recommendation.get("expected_90_day_result") or "90-day result not provided."))
+
+    if_do = html.escape(lori_route_clean_text(impact.get("if_you_do_this") or "If implemented, leadership should monitor service, cost, miles, utilization, and driver workload."))
+    if_not = html.escape(lori_route_clean_text(impact.get("if_you_do_not_do_this") or "If not implemented, current route pressure may continue."))
+
+    map_rows = ""
+    for m in maps:
+        map_rows += f"""
+        <div class="map-card">
+            <strong>{html.escape(lori_route_clean_text(m.get("map_type")))}</strong>
+            <p>{html.escape(lori_route_clean_text(m.get("visual_summary") or m.get("boundary_summary")))}</p>
+        </div>
+        """
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+    @page {{
+        size: letter;
+        margin: 0.55in;
+    }}
+
+    body {{
+        font-family: Arial, Helvetica, sans-serif;
+        color: #172033;
+        background: #ffffff;
+        margin: 0;
+        padding: 0;
+        line-height: 1.42;
+    }}
+
+    .plan {{
+        max-width: 920px;
+        margin: 0 auto;
+    }}
+
+    .cover {{
+        border-radius: 22px;
+        padding: 34px;
+        background: linear-gradient(135deg, #f6f8ff 0%, #eef3ff 55%, #ffffff 100%);
+        border: 1px solid #dbe5ff;
+        margin-bottom: 22px;
+    }}
+
+    .brand {{
+        font-size: 12px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: #52627a;
+        font-weight: 700;
+        margin-bottom: 22px;
+    }}
+
+    h1 {{
+        font-size: 32px;
+        line-height: 1.08;
+        margin: 0 0 10px 0;
+        color: #111827;
+    }}
+
+    h2 {{
+        font-size: 18px;
+        margin: 0 0 10px 0;
+        color: #111827;
+    }}
+
+    .status {{
+        display: inline-block;
+        background: #1e3a8a;
+        color: #ffffff;
+        padding: 10px 14px;
+        border-radius: 999px;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-weight: 700;
+        margin-bottom: 18px;
+    }}
+
+    .grid {{
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin-top: 18px;
+    }}
+
+    .metric-grid {{
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+        margin-top: 18px;
+    }}
+
+    .card, .metric, .map-card {{
+        background: #ffffff;
+        border: 1px solid #dbe5ff;
+        border-radius: 16px;
+        padding: 14px;
+    }}
+
+    .metric-label {{
+        font-size: 11px;
+        color: #667085;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 700;
+        margin-bottom: 6px;
+    }}
+
+    .metric-value {{
+        font-size: 18px;
+        font-weight: 800;
+        color: #111827;
+    }}
+
+    .section {{
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        padding: 22px;
+        margin-bottom: 16px;
+        page-break-inside: avoid;
+    }}
+
+    .benefit {{
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        border-radius: 18px;
+        padding: 20px;
+        margin-bottom: 16px;
+    }}
+
+    .timeline {{
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+    }}
+
+    .timeline div {{
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 14px;
+    }}
+
+    .footer {{
+        border-top: 1px solid #e5e7eb;
+        padding-top: 14px;
+        margin-top: 20px;
+        color: #667085;
+        font-size: 11px;
+    }}
+
+    @media print {{
+        body {{
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+        }}
+    }}
+</style>
+</head>
+<body>
+<div class="plan">
+    <div class="cover">
+        <div class="brand">LORI Drive Command Center</div>
+        <div class="status">{decision} | {priority} Priority</div>
+        <h1>{title}</h1>
+        <p>{summary}</p>
+
+        <div class="metric-grid">
+            <div class="metric">
+                <div class="metric-label">Current Driver</div>
+                <div class="metric-value">{current_driver}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Current Route</div>
+                <div class="metric-value">{current_route}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Receiving Driver</div>
+                <div class="metric-value">{receiving_driver}</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Receiving Route</div>
+                <div class="metric-value">{receiving_route}</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Why This Reconfiguration Makes Sense</h2>
+        <p>{reason}</p>
+    </div>
+
+    <div class="benefit">
+        <h2>Expected Business Benefit</h2>
+        <p>{benefit}</p>
+        <div class="grid">
+            <div class="card"><strong>Cost Savings</strong><br>{cost}</div>
+            <div class="card"><strong>Productivity</strong><br>{productivity}</div>
+            <div class="card"><strong>Fuel Savings</strong><br>{fuel}</div>
+            <div class="card"><strong>Service Impact</strong><br>{service}</div>
+            <div class="card"><strong>Safety / Fatigue</strong><br>{safety}</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>If You Do This</h2>
+        <p>{if_do}</p>
+        <h2>If You Do Not Do This</h2>
+        <p>{if_not}</p>
+    </div>
+
+    <div class="section">
+        <h2>Expected Results Timeline</h2>
+        <div class="timeline">
+            <div><strong>7 Days</strong><br>{seven}</div>
+            <div><strong>30 Days</strong><br>{thirty}</div>
+            <div><strong>60 Days</strong><br>{sixty}</div>
+            <div><strong>90 Days</strong><br>{ninety}</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Work Area Map Summary</h2>
+        {map_rows}
+    </div>
+
+    <div class="footer">
+        LORI provides route configuration decision support. Route changes, work area changes, driver workload changes, helper assignments, vehicle assignments, customer service commitments, DOT considerations, productivity estimates, cost savings estimates, and safety implications must be reviewed by authorized operations leadership before implementation.
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.get("/route-configuration-summary")
+async def route_configuration_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    uploads = await lori_route_get_rows("lori_route_config_uploads")
+    drivers = await lori_route_get_rows("lori_route_driver_profiles")
+    vehicles = await lori_route_get_rows("lori_route_vehicle_profiles")
+    freight = await lori_route_get_rows("lori_route_freight_profiles")
+    scenarios = await lori_route_get_rows("lori_route_scenarios")
+    impacts = await lori_route_get_rows("lori_route_scenario_impacts")
+    recommendations = await lori_route_get_rows("lori_route_reconfiguration_recommendations")
+    maps = await lori_route_get_rows("lori_route_work_area_maps")
+    downloads = await lori_route_get_rows("lori_route_work_area_downloads")
+
+    overutilized = [d for d in drivers if lori_route_clean_text(d.get("workload_status")).lower() == "overutilized"]
+    underutilized = [d for d in drivers if lori_route_clean_text(d.get("workload_status")).lower() == "underutilized"]
+    high_capacity_risk = [d for d in drivers if lori_route_clean_text(d.get("capacity_risk")).lower() == "high"]
+
+    return {
+        "status": "success",
+        "route_uploads_count": len(uploads),
+        "driver_profiles_count": len(drivers),
+        "vehicle_profiles_count": len(vehicles),
+        "freight_profiles_count": len(freight),
+        "scenarios_count": len(scenarios),
+        "recommendations_count": len(recommendations),
+        "work_area_maps_count": len(maps),
+        "download_packages_count": len(downloads),
+        "overutilized_drivers_count": len(overutilized),
+        "underutilized_drivers_count": len(underutilized),
+        "capacity_risk_count": len(high_capacity_risk),
+        "recent_uploads": uploads[:5],
+        "recent_recommendations": recommendations[:5],
+        "answer_text": "Route Configuration Center is ready. LORI can review driver workload, vehicle fit, freight complexity, route pressure, scenario impacts, work area maps, and download packages.",
+    }
+
+
+@app.get("/route-config-uploads")
+async def route_config_uploads(
+    api_key: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_get_rows(
+        "lori_route_config_uploads",
+        f"select=*&order=created_at.desc&limit={max(1, min(limit, 200))}",
+    )
+
+    return {
+        "status": "success",
+        "uploads_count": len(rows),
+        "uploads": rows,
+    }
+
+
+@app.get("/route-driver-profiles")
+async def route_driver_profiles(
+    api_key: Optional[str] = Query(None),
+    upload_id: Optional[str] = Query(None),
+    workload_status: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_get_rows(
+        "lori_route_driver_profiles",
+        "select=*&order=driver_name.asc&limit=500",
+    )
+
+    if upload_id:
+        rows = [r for r in rows if str(r.get("upload_id")) == upload_id]
+
+    if workload_status:
+        rows = [
+            r for r in rows
+            if lori_route_clean_text(r.get("workload_status")).lower() == workload_status.lower()
+        ]
+
+    return {
+        "status": "success",
+        "drivers_count": len(rows[:limit]),
+        "drivers": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/route-scenarios")
+async def route_scenarios(
+    api_key: Optional[str] = Query(None),
+    upload_id: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_get_rows(
+        "lori_route_scenarios",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if upload_id:
+        rows = [r for r in rows if str(r.get("upload_id")) == upload_id]
+
+    return {
+        "status": "success",
+        "scenarios_count": len(rows[:limit]),
+        "scenarios": rows[:max(1, min(limit, 200))],
+    }
+
+
+@app.get("/route-recommendations")
+async def route_recommendations(
+    api_key: Optional[str] = Query(None),
+    upload_id: Optional[str] = Query(None),
+    decision: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_get_rows(
+        "lori_route_reconfiguration_recommendations",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if upload_id:
+        rows = [r for r in rows if str(r.get("upload_id")) == upload_id]
+
+    if decision:
+        rows = [
+            r for r in rows
+            if lori_route_clean_text(r.get("decision")).lower() == decision.lower()
+        ]
+
+    return {
+        "status": "success",
+        "recommendations_count": len(rows[:limit]),
+        "recommendations": rows[:max(1, min(limit, 200))],
+    }
+
+
+@app.get("/route-recommendation-detail")
+async def route_recommendation_detail(
+    api_key: Optional[str] = Query(None),
+    recommendation_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    recommendations = await lori_route_get_rows(
+        "lori_route_reconfiguration_recommendations",
+        f"select=*&id=eq.{quote(recommendation_id)}&limit=1",
+    )
+
+    if not recommendations:
+        return {
+            "status": "not_found",
+            "message": "Route recommendation not found.",
+            "recommendation_id": recommendation_id,
+        }
+
+    rec = recommendations[0]
+    scenario_id = rec.get("scenario_id")
+
+    scenarios = []
+    impacts = []
+
+    if scenario_id:
+        scenarios = await lori_route_get_rows(
+            "lori_route_scenarios",
+            f"select=*&id=eq.{quote(str(scenario_id))}&limit=1",
+        )
+
+        impacts = await lori_route_get_rows(
+            "lori_route_scenario_impacts",
+            f"select=*&scenario_id=eq.{quote(str(scenario_id))}&limit=5",
+        )
+
+    maps = await lori_route_get_rows(
+        "lori_route_work_area_maps",
+        f"select=*&recommendation_id=eq.{quote(recommendation_id)}&order=map_type.asc&limit=20",
+    )
+
+    downloads = await lori_route_get_rows(
+        "lori_route_work_area_downloads",
+        f"select=*&recommendation_id=eq.{quote(recommendation_id)}&limit=5",
+    )
+
+    print_exports = await lori_route_get_rows(
+        "lori_route_print_exports",
+        f"select=*&recommendation_id=eq.{quote(recommendation_id)}&limit=5",
+    )
+
+    return {
+        "status": "success",
+        "recommendation": rec,
+        "scenario": scenarios[0] if scenarios else {},
+        "impact": impacts[0] if impacts else {},
+        "work_area_maps": maps,
+        "download_packages": downloads,
+        "print_exports": print_exports,
+    }
+
+
+@app.get("/route-work-area-maps")
+async def route_work_area_maps(
+    api_key: Optional[str] = Query(None),
+    recommendation_id: Optional[str] = Query(None),
+    scenario_id: Optional[str] = Query(None),
+    map_type: Optional[str] = Query(None),
+    limit: int = Query(50),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_get_rows(
+        "lori_route_work_area_maps",
+        "select=*&order=created_at.asc&limit=500",
+    )
+
+    if recommendation_id:
+        rows = [r for r in rows if str(r.get("recommendation_id")) == recommendation_id]
+
+    if scenario_id:
+        rows = [r for r in rows if str(r.get("scenario_id")) == scenario_id]
+
+    if map_type:
+        rows = [
+            r for r in rows
+            if lori_route_clean_text(r.get("map_type")).lower() == map_type.lower()
+        ]
+
+    return {
+        "status": "success",
+        "maps_count": len(rows[:limit]),
+        "maps": rows[:max(1, min(limit, 200))],
+    }
+
+
+@app.get("/route-work-area-download-package")
+async def route_work_area_download_package(
+    api_key: Optional[str] = Query(None),
+    recommendation_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    recommendations = await lori_route_get_rows(
+        "lori_route_reconfiguration_recommendations",
+        f"select=*&id=eq.{quote(recommendation_id)}&limit=1",
+    )
+
+    if not recommendations:
+        return {
+            "status": "not_found",
+            "message": "Route recommendation not found.",
+            "recommendation_id": recommendation_id,
+        }
+
+    rec = recommendations[0]
+
+    maps = await lori_route_get_rows(
+        "lori_route_work_area_maps",
+        f"select=*&recommendation_id=eq.{quote(recommendation_id)}&order=map_type.asc&limit=20",
+    )
+
+    downloads = await lori_route_get_rows(
+        "lori_route_work_area_downloads",
+        f"select=*&recommendation_id=eq.{quote(recommendation_id)}&limit=1",
+    )
+
+    current_map = next((m for m in maps if "current" in lori_route_clean_text(m.get("map_type")).lower()), None)
+    proposed_map = next((m for m in maps if "proposed" in lori_route_clean_text(m.get("map_type")).lower()), None)
+    overlay_map = next((m for m in maps if "overlay" in lori_route_clean_text(m.get("map_type")).lower() or "after" in lori_route_clean_text(m.get("map_type")).lower()), None)
+
+    moved_stops = []
+
+    if overlay_map and isinstance(overlay_map.get("moved_stops"), list):
+        moved_stops = overlay_map.get("moved_stops")
+    elif current_map and isinstance(current_map.get("moved_stops"), list):
+        moved_stops = current_map.get("moved_stops")
+
+    moved_stops_csv = lori_route_build_moved_stops_csv(moved_stops)
+
+    package_summary = f"""Route Work Area Download Package
+
+Recommendation:
+{rec.get("recommendation_title")}
+
+Decision:
+{rec.get("decision")}
+
+Current Work Area:
+{current_map.get("map_title") if current_map else "Not available"}
+
+Proposed Work Area:
+{proposed_map.get("map_title") if proposed_map else "Not available"}
+
+Overlay:
+{overlay_map.get("map_title") if overlay_map else "Not available"}
+
+Business Benefit:
+{rec.get("expected_business_benefit")}
+
+Cost Savings:
+{rec.get("cost_savings_summary")}
+
+Productivity:
+{rec.get("productivity_summary")}
+
+Fuel Savings:
+{rec.get("fuel_savings_summary")}
+"""
+
+    return {
+        "status": "success",
+        "recommendation": rec,
+        "download_package": downloads[0] if downloads else {},
+        "current_work_area_map": current_map,
+        "proposed_work_area_map": proposed_map,
+        "before_after_overlay_map": overlay_map,
+        "moved_stops": moved_stops,
+        "moved_stops_csv": moved_stops_csv,
+        "current_geojson": current_map.get("geojson_data") if current_map else {},
+        "proposed_geojson": proposed_map.get("geojson_data") if proposed_map else {},
+        "overlay_geojson": overlay_map.get("geojson_data") if overlay_map else {},
+        "package_summary_text": package_summary,
+        "answer_text": "Route work area download package is ready.",
+    }
+
+
+@app.get("/route-print-review")
+async def route_print_review(
+    api_key: Optional[str] = Query(None),
+    recommendation_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    details = await route_recommendation_detail(
+        api_key=api_key,
+        recommendation_id=recommendation_id,
+    )
+
+    if details.get("status") != "success":
+        return details
+
+    rec = details.get("recommendation") or {}
+    impact = details.get("impact") or {}
+    maps = details.get("work_area_maps") or []
+
+    printable_html = lori_route_build_print_html(rec, impact, maps)
+
+    return {
+        "status": "success",
+        "recommendation_id": recommendation_id,
+        "recommendation_title": rec.get("recommendation_title"),
+        "print_ready": True,
+        "printable_html": printable_html,
+        "answer_text": "Printable Route Configuration Review is ready.",
+    }
+
+
+@app.post("/route-scenario-evaluate")
+async def route_scenario_evaluate(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    scenario_name = lori_route_clean_text(payload.get("scenario_name") or "Manual Route Reconfiguration Scenario")
+
+    current_driver = lori_route_clean_text(payload.get("current_driver_name") or payload.get("current_driver") or "Current Driver")
+    current_route = lori_route_clean_text(payload.get("current_route_id") or payload.get("current_route") or "Current Route")
+    receiving_driver = lori_route_clean_text(payload.get("receiving_driver_name") or payload.get("receiving_driver") or "Receiving Driver")
+    receiving_route = lori_route_clean_text(payload.get("receiving_route_id") or payload.get("receiving_route") or "Receiving Route")
+
+    stops_to_move = int(lori_route_num(payload.get("stops_to_move"), 0))
+    freight_type = lori_route_clean_text(payload.get("freight_type") or "General Freight")
+    freight_complexity = lori_route_clean_text(payload.get("freight_complexity") or "Medium")
+    traffic_condition = lori_route_clean_text(payload.get("traffic_condition") or "Normal")
+
+    estimated_added_miles = lori_route_num(payload.get("estimated_added_miles"), 0)
+    estimated_reduced_miles = lori_route_num(payload.get("estimated_reduced_miles"), 0)
+    estimated_added_time = lori_route_num(payload.get("estimated_added_time_minutes"), 0)
+    estimated_reduced_time = lori_route_num(payload.get("estimated_reduced_time_minutes"), 0)
+
+    current_helper_count = int(lori_route_num(payload.get("current_helper_count"), 0))
+    proposed_helper_count = int(lori_route_num(payload.get("proposed_helper_count"), 0))
+
+    fuel_cost_per_gallon = lori_route_num(payload.get("fuel_cost_per_gallon"), 3.75)
+    estimated_mpg = max(lori_route_num(payload.get("estimated_mpg"), 9), 1)
+    labor_cost_per_hour = lori_route_num(payload.get("labor_cost_per_hour"), 32)
+    helper_cost_per_hour = lori_route_num(payload.get("helper_cost_per_hour"), 22)
+
+    current_util = lori_route_num(payload.get("current_driver_utilization_percent"), 110)
+    receiving_util = lori_route_num(payload.get("receiving_driver_utilization_percent"), 82)
+
+    net_miles_reduced = estimated_reduced_miles - estimated_added_miles
+    fuel_saved = max(net_miles_reduced / estimated_mpg, 0)
+    fuel_savings = round(fuel_saved * fuel_cost_per_gallon, 2)
+
+    net_minutes_saved = estimated_reduced_time - estimated_added_time
+    labor_hours_saved = max(net_minutes_saved / 60, 0)
+    labor_savings = round(labor_hours_saved * labor_cost_per_hour, 2)
+
+    helper_delta = proposed_helper_count - current_helper_count
+    helper_cost_change = round(helper_delta * helper_cost_per_hour * max(estimated_added_time / 60, 1), 2)
+
+    total_savings = round(fuel_savings + labor_savings - helper_cost_change, 2)
+
+    receiving_after_util = receiving_util + (stops_to_move * 1.5)
+    current_after_util = current_util - (stops_to_move * 1.2)
+
+    if receiving_after_util <= 100 and total_savings >= 0:
+        decision = "Recommended"
+        confidence = "Medium-High"
+    elif receiving_after_util <= 110 and total_savings >= -25:
+        decision = "Needs Supervisor Review"
+        confidence = "Medium"
+    else:
+        decision = "Not Recommended"
+        confidence = "Medium"
+
+    scenario_created = await lori_policy_supabase_post(
+        "lori_route_scenarios",
+        {
+            "scenario_name": scenario_name,
+            "scenario_status": "Analyzed",
+            "scenario_type": "What-If Route Reconfiguration",
+            "current_driver_name": current_driver,
+            "current_route_id": current_route,
+            "receiving_driver_name": receiving_driver,
+            "receiving_route_id": receiving_route,
+            "stops_to_move": stops_to_move,
+            "freight_type": freight_type,
+            "freight_complexity": freight_complexity,
+            "current_helper_count": current_helper_count,
+            "proposed_helper_count": proposed_helper_count,
+            "current_vehicle_type": lori_route_clean_text(payload.get("current_vehicle_type") or ""),
+            "proposed_vehicle_type": lori_route_clean_text(payload.get("proposed_vehicle_type") or ""),
+            "estimated_added_miles": estimated_added_miles,
+            "estimated_reduced_miles": estimated_reduced_miles,
+            "estimated_added_time_minutes": estimated_added_time,
+            "estimated_reduced_time_minutes": estimated_reduced_time,
+            "traffic_condition": traffic_condition,
+            "delivery_window_sensitivity": lori_route_clean_text(payload.get("delivery_window_sensitivity") or "Medium"),
+            "fuel_cost_per_gallon": fuel_cost_per_gallon,
+            "estimated_mpg": estimated_mpg,
+            "labor_cost_per_hour": labor_cost_per_hour,
+            "helper_cost_per_hour": helper_cost_per_hour,
+            "overtime_risk": lori_route_clean_text(payload.get("overtime_risk") or "Medium"),
+            "scenario_notes": lori_route_clean_text(payload.get("notes") or "Manual route scenario evaluated by LORI."),
+        },
+    )
+
+    scenario = scenario_created[0] if scenario_created else {}
+    scenario_id = scenario.get("id")
+
+    impact_payload = {
+        "scenario_id": scenario_id,
+        "recommendation": decision,
+        "confidence_level": confidence,
+        "productivity_impact": f"Estimated productivity gain is approximately {round(max((current_util - current_after_util), 0), 1)} utilization points relieved from the overloaded route.",
+        "service_risk": "Low to Medium" if traffic_condition.lower() in {"normal", "light"} else "Medium to High",
+        "safety_fatigue_risk": "Reduced fatigue pressure on the overutilized route." if current_after_util < current_util else "Monitor fatigue risk.",
+        "vehicle_capacity_impact": "Review receiving vehicle capacity before implementation.",
+        "freight_complexity_impact": f"Freight complexity is {freight_complexity}.",
+        "traffic_impact": f"Traffic condition is {traffic_condition}.",
+        "helper_impact": f"Helper count changes from {current_helper_count} to {proposed_helper_count}.",
+        "estimated_labor_hours_saved": round(labor_hours_saved, 2),
+        "estimated_overtime_reduction_hours": round(max(net_minutes_saved / 60, 0), 2),
+        "estimated_miles_reduced": round(net_miles_reduced, 2),
+        "estimated_fuel_saved_gallons": round(fuel_saved, 2),
+        "estimated_fuel_cost_savings": fuel_savings,
+        "estimated_helper_cost_change": helper_cost_change,
+        "estimated_total_cost_savings": total_savings,
+        "estimated_productivity_gain_percent": round(max(current_util - current_after_util, 0), 2),
+        "estimated_stops_per_hour_change": round(stops_to_move / max(estimated_added_time / 60, 1), 2),
+        "estimated_cost_per_stop_reduction": round(total_savings / max(stops_to_move, 1), 2),
+        "if_you_do_this": f"{current_driver}'s route pressure should decrease, {receiving_driver} may absorb {stops_to_move} stops, and the route group may improve workload balance, mileage, fuel use, and overtime exposure.",
+        "if_you_do_not_do_this": f"{current_driver} may remain overutilized, overtime pressure may continue, and service risk may remain elevated.",
+        "decision_reason": f"Decision is {decision} based on utilization shift, estimated cost savings, traffic condition, freight complexity, helper impact, and receiving route capacity.",
+        "required_supervisor_review": True,
+        "recommended_owner": "Operations Leadership",
+        "recommended_next_action": "Review scenario with transportation leadership, confirm delivery windows and vehicle fit, then create an Action Center follow-up if approved.",
+    }
+
+    impact_created = await lori_policy_supabase_post(
+        "lori_route_scenario_impacts",
+        impact_payload,
+    )
+
+    recommendation_payload = {
+        "scenario_id": scenario_id,
+        "recommendation_title": f"{decision}: Move {stops_to_move} Stops from {current_driver} to {receiving_driver}",
+        "recommendation_status": "Draft",
+        "decision": decision,
+        "priority": "High" if decision in {"Recommended", "Needs Supervisor Review"} else "Medium",
+        "current_driver_name": current_driver,
+        "current_route_id": current_route,
+        "receiving_driver_name": receiving_driver,
+        "receiving_route_id": receiving_route,
+        "recommendation_summary": f"Evaluate moving {stops_to_move} {freight_type} stops from {current_driver} to {receiving_driver}.",
+        "operational_reason": "This scenario evaluates workload balance, mileage, fuel, helper usage, vehicle fit, freight complexity, traffic, service risk, and productivity impact.",
+        "expected_7_day_result": "Leadership should see immediate visibility into workload balance and route pressure.",
+        "expected_30_day_result": "Route performance should begin showing better workload balance and less overtime pressure if implemented correctly.",
+        "expected_60_day_result": "Mileage, fuel, and stops-per-hour trends should show measurable improvement if service risk remains controlled.",
+        "expected_90_day_result": "The reconfigured work area should become stable if customer service, safety, and productivity remain acceptable.",
+        "expected_business_benefit": "Expected business benefit includes better workload balance, reduced route pressure, improved productivity, lower fuel/mileage waste, and improved service reliability.",
+        "cost_savings_summary": f"Estimated total cost savings: ${total_savings}.",
+        "productivity_summary": f"Estimated productivity gain: {round(max(current_util - current_after_util, 0), 2)} utilization points relieved from current route.",
+        "fuel_savings_summary": f"Estimated fuel savings: {round(fuel_saved, 2)} gallons / ${fuel_savings}.",
+        "service_impact_summary": impact_payload["service_risk"],
+        "safety_risk_summary": impact_payload["safety_fatigue_risk"],
+        "owner_name": "Operations Leadership",
+        "owner_role": "Leadership",
+    }
+
+    rec_created = await lori_policy_supabase_post(
+        "lori_route_reconfiguration_recommendations",
+        recommendation_payload,
+    )
+
+    recommendation = rec_created[0] if rec_created else {}
+
+    return {
+        "status": "success",
+        "message": "Route scenario evaluated.",
+        "scenario": scenario,
+        "impact": impact_created[0] if impact_created else {},
+        "recommendation": recommendation,
+        "answer_text": f"Route scenario evaluated. Decision: {decision}. Estimated total cost savings: ${total_savings}.",
+    }
+
+
+@app.post("/route-recommendation-send-to-action-center")
+async def route_recommendation_send_to_action_center(
+    api_key: Optional[str] = Query(None),
+    recommendation_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    recs = await lori_route_get_rows(
+        "lori_route_reconfiguration_recommendations",
+        f"select=*&id=eq.{quote(recommendation_id)}&limit=1",
+    )
+
+    if not recs:
+        return {
+            "status": "not_found",
+            "message": "Route recommendation not found.",
+        }
+
+    rec = recs[0]
+
+    action_created = await lori_policy_supabase_post(
+        "lori_action_items",
+        {
+            "action_title": rec.get("recommendation_title"),
+            "action_type": "Route Reconfiguration Review",
+            "action_status": "Open",
+            "priority": rec.get("priority") or "High",
+            "source_module": "Route Configuration Center",
+            "source_type": "Route Reconfiguration Recommendation",
+            "source_reference_id": recommendation_id,
+            "owner_name": rec.get("owner_name") or "Operations Leadership",
+            "owner_role": rec.get("owner_role") or "Leadership",
+            "station_code": "JESSUP-01",
+            "operating_state": "MD",
+            "company_name": "Food Authority",
+            "reason": rec.get("operational_reason"),
+            "recommended_follow_up": rec.get("recommendation_summary"),
+            "documentation_note": "Validate route change, work area impact, service requirements, helper needs, vehicle fit, safety impact, and leadership approval before implementation.",
+            "due_date": (date.today() + timedelta(days=7)).isoformat(),
+            "created_by": "LORI Route Configuration Center",
+        },
+    )
+
+    await lori_policy_supabase_patch(
+        "lori_route_reconfiguration_recommendations",
+        recommendation_id,
+        {
+            "action_center_status": "Sent to Action Center",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "Route recommendation sent to Action Center.",
+        "action_item": action_created[0] if action_created else {},
+        "answer_text": "Route recommendation sent to Action Center.",
+    }
+
+
+@app.post("/route-recommendation-send-to-leadership")
+async def route_recommendation_send_to_leadership(
+    api_key: Optional[str] = Query(None),
+    recommendation_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    recs = await lori_route_get_rows(
+        "lori_route_reconfiguration_recommendations",
+        f"select=*&id=eq.{quote(recommendation_id)}&limit=1",
+    )
+
+    if not recs:
+        return {
+            "status": "not_found",
+            "message": "Route recommendation not found.",
+        }
+
+    rec = recs[0]
+
+    briefing = await lori_policy_supabase_post(
+        "lori_leadership_briefing_queue",
+        {
+            "briefing_title": rec.get("recommendation_title"),
+            "briefing_type": "Route Configuration Leadership Briefing",
+            "briefing_status": "Queued",
+            "priority": rec.get("priority") or "High",
+            "station_code": "JESSUP-01",
+            "operating_state": "MD",
+            "executive_summary": rec.get("recommendation_summary"),
+            "key_risk": rec.get("safety_risk_summary"),
+            "recommended_leadership_action": rec.get("operational_reason"),
+            "supervisor_follow_up": rec.get("expected_business_benefit"),
+            "compliance_note": "Validate route boundaries, customer commitments, driver workload, helper needs, vehicle assignments, DOT considerations, and safety implications before implementation.",
+            "created_by": "LORI Route Configuration Center",
+        },
+    )
+
+    await lori_policy_supabase_patch(
+        "lori_route_reconfiguration_recommendations",
+        recommendation_id,
+        {
+            "leadership_briefing_status": "Sent to Leadership Briefing",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "Route recommendation added to Leadership Briefing Queue.",
+        "briefing_item": briefing[0] if briefing else {},
+        "answer_text": "Route recommendation added to Leadership Briefing Queue.",
+    }
