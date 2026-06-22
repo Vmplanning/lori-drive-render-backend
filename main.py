@@ -12062,3 +12062,300 @@ async def operating_context_resolve(
         },
         "decision_support_note": "LORI provides operational decision support only. Federal, state, local, labor, safety, DOT, HR, and company policy requirements must be reviewed and approved by authorized leadership before implementation.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# OPERATING CONTEXT VALIDATION ENGINE
+# Validates state, city, station, ZIP, and time zone before use.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, Optional, List
+
+
+def lori_context_norm(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_context_upper(value: Any) -> str:
+    return lori_context_norm(value).upper()
+
+
+@app.post("/operating-context-validate")
+async def operating_context_validate(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    selected_company = lori_context_norm(payload.get("company_name"))
+    selected_region = lori_context_norm(payload.get("region_name"))
+    selected_state = lori_context_upper(payload.get("operating_state") or payload.get("state_code"))
+    selected_city = lori_context_norm(payload.get("city"))
+    selected_station_code = lori_context_upper(payload.get("station_code"))
+    selected_station_name = lori_context_norm(payload.get("station_name"))
+    selected_zip = lori_context_norm(payload.get("primary_zip") or payload.get("zip_code"))
+    selected_route_group = lori_context_norm(payload.get("route_group"))
+    selected_time_zone = lori_context_norm(payload.get("time_zone"))
+    selected_compliance_profile = lori_context_norm(payload.get("compliance_profile"))
+    selected_state_reg_profile = lori_context_norm(payload.get("state_regulatory_profile"))
+
+    issues: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    recommended_correction: Dict[str, Any] = {}
+
+    required_fields = {
+        "company_name": selected_company,
+        "region_name": selected_region,
+        "operating_state": selected_state,
+        "city": selected_city,
+        "station_code": selected_station_code,
+        "station_name": selected_station_name,
+        "primary_zip": selected_zip,
+        "route_group": selected_route_group,
+        "time_zone": selected_time_zone,
+        "compliance_profile": selected_compliance_profile,
+        "state_regulatory_profile": selected_state_reg_profile,
+    }
+
+    for field_name, field_value in required_fields.items():
+        if not field_value:
+            issues.append({
+                "type": "missing_required_field",
+                "field": field_name,
+                "message": f"{field_name} is required before LORI can operate.",
+            })
+
+    states = await lori_nationwide_get_rows(
+        "lori_us_operating_states",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    stations = await lori_nationwide_get_rows(
+        "lori_operating_stations",
+        "select=*&order=station_code.asc&limit=1000",
+    )
+
+    zip_rows = await lori_nationwide_get_rows(
+        "lori_station_zip_coverage",
+        "select=*&order=station_code.asc,zip_code.asc&limit=3000",
+    )
+
+    selected_state_record = None
+    selected_station_record = None
+    selected_zip_matches = []
+
+    for state in states:
+        if lori_context_upper(state.get("state_code")) == selected_state:
+            selected_state_record = state
+            break
+
+    for station in stations:
+        if lori_context_upper(station.get("station_code")) == selected_station_code:
+            selected_station_record = station
+            break
+
+    if selected_zip:
+        selected_zip_matches = [
+            z for z in zip_rows
+            if lori_context_norm(z.get("zip_code")) == selected_zip
+        ]
+
+    if selected_state and not selected_state_record:
+        issues.append({
+            "type": "invalid_state",
+            "field": "operating_state",
+            "message": f"{selected_state} is not a supported U.S. operating state or jurisdiction.",
+        })
+
+    if selected_station_code and not selected_station_record:
+        issues.append({
+            "type": "unknown_station",
+            "field": "station_code",
+            "message": f"Station {selected_station_code} is not configured in LORI.",
+        })
+
+    if selected_station_record:
+        station_state = lori_context_upper(selected_station_record.get("operating_state"))
+        station_city = lori_context_norm(selected_station_record.get("city"))
+        station_zip = lori_context_norm(selected_station_record.get("primary_zip"))
+        station_name = lori_context_norm(selected_station_record.get("station_name"))
+        station_region = lori_context_norm(selected_station_record.get("region_name"))
+        station_region_code = lori_context_norm(selected_station_record.get("region_code"))
+        station_time_zone = lori_context_norm(selected_station_record.get("time_zone"))
+        station_company = lori_context_norm(selected_station_record.get("company_name"))
+
+        recommended_correction.update({
+            "company_name": station_company or selected_company,
+            "region_code": station_region_code,
+            "region_name": station_region or selected_region,
+            "operating_state": station_state,
+            "city": station_city,
+            "station_code": selected_station_code,
+            "station_name": station_name,
+            "primary_zip": station_zip,
+            "time_zone": station_time_zone,
+            "route_group": selected_route_group or "Delivery Operations",
+            "compliance_profile": selected_compliance_profile or "Federal + State + Company Policy Review",
+            "state_regulatory_profile": f"{station_state} DOT / FMCSA / State Review Required",
+        })
+
+        if selected_state and station_state and selected_state != station_state:
+            issues.append({
+                "type": "station_state_mismatch",
+                "field": "operating_state",
+                "message": f"{selected_station_code} is configured for {station_state}, but selected state is {selected_state}.",
+                "selected": selected_state,
+                "found": station_state,
+            })
+
+        if selected_city and station_city and selected_city.lower() != station_city.lower():
+            issues.append({
+                "type": "station_city_mismatch",
+                "field": "city",
+                "message": f"{selected_station_code} is configured for {station_city}, but selected city is {selected_city}.",
+                "selected": selected_city,
+                "found": station_city,
+            })
+
+        if selected_zip and station_zip and selected_zip != station_zip:
+            matching_station_zip = [
+                z for z in zip_rows
+                if lori_context_upper(z.get("station_code")) == selected_station_code
+                and lori_context_norm(z.get("zip_code")) == selected_zip
+            ]
+
+            if not matching_station_zip:
+                issues.append({
+                    "type": "station_zip_mismatch",
+                    "field": "primary_zip",
+                    "message": f"{selected_zip} is not configured as a ZIP coverage area for {selected_station_code}. Primary station ZIP is {station_zip}.",
+                    "selected": selected_zip,
+                    "found": station_zip,
+                })
+
+        if selected_time_zone and station_time_zone and selected_time_zone != station_time_zone:
+            warnings.append({
+                "type": "station_time_zone_mismatch",
+                "field": "time_zone",
+                "message": f"{selected_station_code} is configured for {station_time_zone}, but selected time zone is {selected_time_zone}.",
+                "selected": selected_time_zone,
+                "found": station_time_zone,
+            })
+
+    if selected_zip and selected_zip_matches:
+        state_matches = [
+            z for z in selected_zip_matches
+            if lori_context_upper(z.get("operating_state")) == selected_state
+        ]
+
+        city_matches = [
+            z for z in selected_zip_matches
+            if selected_city and lori_context_norm(z.get("city")).lower() == selected_city.lower()
+        ]
+
+        station_matches = [
+            z for z in selected_zip_matches
+            if selected_station_code and lori_context_upper(z.get("station_code")) == selected_station_code
+        ]
+
+        if selected_state and not state_matches:
+            found_states = sorted(list(set([
+                lori_context_upper(z.get("operating_state"))
+                for z in selected_zip_matches
+                if lori_context_upper(z.get("operating_state"))
+            ])))
+
+            issues.append({
+                "type": "zip_state_mismatch",
+                "field": "primary_zip",
+                "message": f"ZIP {selected_zip} is not configured for selected state {selected_state}.",
+                "selected": selected_state,
+                "found": found_states,
+            })
+
+        if selected_city and selected_zip_matches and not city_matches:
+            found_cities = sorted(list(set([
+                lori_context_norm(z.get("city"))
+                for z in selected_zip_matches
+                if lori_context_norm(z.get("city"))
+            ])))
+
+            issues.append({
+                "type": "zip_city_mismatch",
+                "field": "city",
+                "message": f"ZIP {selected_zip} does not match selected city {selected_city} in configured LORI ZIP coverage.",
+                "selected": selected_city,
+                "found": found_cities,
+            })
+
+        if selected_station_code and selected_zip_matches and not station_matches:
+            found_stations = sorted(list(set([
+                lori_context_upper(z.get("station_code"))
+                for z in selected_zip_matches
+                if lori_context_upper(z.get("station_code"))
+            ])))
+
+            warnings.append({
+                "type": "zip_station_not_primary_match",
+                "field": "station_code",
+                "message": f"ZIP {selected_zip} exists in LORI coverage but is not tied to selected station {selected_station_code}.",
+                "selected": selected_station_code,
+                "found": found_stations,
+            })
+
+    if selected_zip and not selected_zip_matches:
+        warnings.append({
+            "type": "zip_not_configured",
+            "field": "primary_zip",
+            "message": f"ZIP {selected_zip} is not currently configured in LORI station ZIP coverage. Upload or configure ZIP coverage before map-level route validation.",
+        })
+
+    if selected_state_record and not selected_station_record:
+        recommended_correction.update({
+            "operating_state": selected_state_record.get("state_code"),
+            "region_name": selected_state_record.get("default_region"),
+            "time_zone": selected_state_record.get("default_time_zone"),
+            "state_regulatory_profile": f"{selected_state_record.get('state_code')} DOT / FMCSA / State Review Required",
+        })
+
+    context_valid = len(issues) == 0
+    save_allowed = context_valid
+
+    if selected_station_record and selected_state:
+        station_summary = f"{selected_station_record.get('station_code')} is configured as {selected_station_record.get('city')}, {selected_station_record.get('operating_state')} {selected_station_record.get('primary_zip')}."
+    else:
+        station_summary = "No matching station record found."
+
+    return {
+        "status": "success",
+        "context_valid": context_valid,
+        "save_allowed": save_allowed,
+        "validation_status": "Valid Context" if context_valid else "Mismatch Detected",
+        "blocking_issues_count": len(issues),
+        "warnings_count": len(warnings),
+        "blocking_issues": issues,
+        "warnings": warnings,
+        "selected_context": {
+            "company_name": selected_company,
+            "region_name": selected_region,
+            "operating_state": selected_state,
+            "city": selected_city,
+            "station_code": selected_station_code,
+            "station_name": selected_station_name,
+            "primary_zip": selected_zip,
+            "route_group": selected_route_group,
+            "time_zone": selected_time_zone,
+            "compliance_profile": selected_compliance_profile,
+            "state_regulatory_profile": selected_state_reg_profile,
+        },
+        "lori_found": {
+            "state": selected_state_record,
+            "station": selected_station_record,
+            "zip_matches": selected_zip_matches,
+        },
+        "recommended_correction": recommended_correction,
+        "station_summary": station_summary,
+        "message": "Operating context is valid." if context_valid else "Operating context mismatch detected. Please correct state, city, station, ZIP, or time zone before continuing.",
+    }
