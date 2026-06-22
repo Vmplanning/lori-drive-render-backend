@@ -15942,3 +15942,757 @@ async def document_extract_text(
         "document_id": document_id,
         "extraction_job": created_job[0] if created_job else job_payload,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# ROUTE CHANGE CONTRACT & LABOR AGREEMENT SAFEGUARD ENGINE
+# Reviews contractor agreements, union agreements, route policies,
+# pay policies, and station documents before route changes.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime
+import re
+
+
+def lori_contract_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_contract_upper(value: Any) -> str:
+    return lori_contract_clean(value).upper()
+
+
+async def lori_contract_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+def lori_contract_contains(text: str, keywords: List[str]) -> bool:
+    text_lower = (text or "").lower()
+    return any(keyword.lower() in text_lower for keyword in keywords)
+
+
+def lori_contract_excerpt(text: str, keywords: List[str], max_len: int = 450) -> str:
+    if not text:
+        return ""
+
+    text_clean = " ".join(text.split())
+    text_lower = text_clean.lower()
+
+    for keyword in keywords:
+        idx = text_lower.find(keyword.lower())
+        if idx >= 0:
+            start = max(0, idx - 160)
+            end = min(len(text_clean), idx + max_len)
+            return text_clean[start:end]
+
+    return text_clean[:max_len]
+
+
+async def lori_contract_get_or_create_from_document_library(document_id: str) -> Optional[Dict[str, Any]]:
+    docs = await lori_contract_get_rows(
+        "lori_document_library",
+        f"select=*&id=eq.{quote(document_id)}&limit=1",
+    )
+
+    if not docs:
+        return None
+
+    doc = docs[0]
+
+    existing = await lori_contract_get_rows(
+        "lori_route_contract_documents",
+        f"select=*&original_file_name=eq.{quote(str(doc.get('original_file_name') or ''))}&station_code=eq.{quote(str(doc.get('station_code') or ''))}&limit=1",
+    )
+
+    if existing:
+        return existing[0]
+
+    contract_doc_payload = {
+        "document_title": doc.get("document_title") or "Document Library Agreement",
+        "document_type": doc.get("document_type") or "Contract / Agreement",
+        "document_status": "Linked from Document Library",
+        "company_name": doc.get("company_name"),
+        "region_code": doc.get("region_code"),
+        "region_name": doc.get("region_name"),
+        "operating_state": doc.get("operating_state"),
+        "city": doc.get("city"),
+        "station_code": doc.get("station_code"),
+        "station_name": doc.get("station_name"),
+        "route_group": doc.get("route_group"),
+        "applies_to": doc.get("applies_to") or "Route Change",
+        "applies_to_driver": doc.get("driver_name"),
+        "applies_to_route_id": doc.get("route_id"),
+        "applies_to_scope": doc.get("applies_to") or "Station",
+        "original_file_name": doc.get("original_file_name"),
+        "file_type": doc.get("file_type"),
+        "storage_bucket": doc.get("storage_bucket"),
+        "storage_path": doc.get("storage_path"),
+        "extraction_status": doc.get("extraction_status"),
+        "extracted_text": doc.get("extracted_text"),
+        "extraction_notes": doc.get("extraction_notes") or "Linked from central LORI Document Library.",
+        "uploaded_by": "LORI Contract Safeguard",
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_route_contract_documents",
+        contract_doc_payload,
+    )
+
+    return created[0] if created else contract_doc_payload
+
+
+def lori_contract_analyze_text(text: str, agreement_type: str = "") -> Dict[str, Any]:
+    findings = []
+
+    route_keywords = ["route", "territory", "work area", "assignment", "reassignment", "stops", "delivery responsibility"]
+    notice_keywords = ["notice", "advance notice", "written notice", "notify", "notification"]
+    approval_keywords = ["approval", "approved", "authorized", "supervisor", "manager review", "written approval"]
+    pay_keywords = ["pay", "compensation", "wage", "rate", "overtime", "minimum hours", "guarantee", "premium"]
+    union_keywords = ["union", "collective bargaining", "cba", "grievance", "seniority", "bid", "bidding"]
+    contractor_keywords = ["contractor", "owner-operator", "owner operator", "subcontractor", "independent contractor"]
+    schedule_keywords = ["schedule", "shift", "hours", "start time", "end time", "dispatch"]
+    vehicle_keywords = ["vehicle", "equipment", "helper", "assistant", "truck"]
+
+    text_has = lambda kws: lori_contract_contains(text, kws)
+
+    contract_risk_score = 0
+    labor_risk_score = 0
+    cost_risk_score = 0
+
+    if not text:
+        findings.append({
+            "finding_type": "Document Text Not Available",
+            "finding_category": "Extraction Needed",
+            "risk_level": "Medium",
+            "clause_title": "No Extracted Text",
+            "clause_reference": "Document extraction",
+            "short_excerpt": "",
+            "finding_summary": "This document is stored, but LORI does not have extracted text to review yet.",
+            "operational_impact": "The route change should not be finalized until the agreement or policy can be reviewed.",
+            "possible_cost_impact": "Unknown until document text is reviewed.",
+            "recommended_action": "Run text extraction or upload a searchable PDF, TXT, DOCX, or policy text.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": True,
+            "requires_labor_review": True,
+            "requires_legal_review": False,
+            "blocks_final_approval": True,
+        })
+        return {
+            "contract_risk": "Medium",
+            "labor_risk": "Medium",
+            "cost_impact_risk": "Medium",
+            "implementation_status": "Supervisor / HR Review Required",
+            "possible_cost_impact": True,
+            "possible_grievance_risk": False,
+            "possible_notice_required": False,
+            "possible_pay_adjustment_required": False,
+            "supervisor_review_required": True,
+            "hr_labor_review_required": True,
+            "legal_contract_review_required": False,
+            "summary": "Document text is not available. Review is incomplete.",
+            "recommended_next_step": "Upload a searchable agreement or have HR/labor/contract owner review the document manually.",
+            "do_not_implement_warning": "Do not implement route changes until agreement review is complete.",
+            "findings": findings,
+        }
+
+    if text_has(route_keywords):
+        contract_risk_score += 1
+        findings.append({
+            "finding_type": "Route Assignment Language Found",
+            "finding_category": "Route / Territory",
+            "risk_level": "Medium",
+            "clause_title": "Route or Work Assignment",
+            "clause_reference": "Route assignment / territory language",
+            "short_excerpt": lori_contract_excerpt(text, route_keywords),
+            "finding_summary": "The document appears to reference route assignment, territory, stops, or delivery responsibility.",
+            "operational_impact": "Moving stops or changing work areas may require supervisor or contract-owner review.",
+            "possible_cost_impact": "Possible if route assignment affects pay, guarantee, workload, or overtime.",
+            "recommended_action": "Review route assignment language before implementing the route change.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": False,
+            "requires_labor_review": False,
+            "requires_legal_review": False,
+            "blocks_final_approval": False,
+        })
+
+    if text_has(notice_keywords):
+        contract_risk_score += 1
+        findings.append({
+            "finding_type": "Notice Requirement Possible",
+            "finding_category": "Notice",
+            "risk_level": "Medium",
+            "clause_title": "Notice / Notification",
+            "clause_reference": "Notice language",
+            "short_excerpt": lori_contract_excerpt(text, notice_keywords),
+            "finding_summary": "The document appears to contain notice or notification language.",
+            "operational_impact": "The company may need to provide notice before changing routes, schedules, or assignments.",
+            "possible_cost_impact": "Potential cost risk if notice requirements are missed.",
+            "recommended_action": "Confirm notice obligations before implementing the change.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": True,
+            "requires_labor_review": False,
+            "requires_legal_review": False,
+            "blocks_final_approval": False,
+        })
+
+    if text_has(approval_keywords):
+        contract_risk_score += 1
+        findings.append({
+            "finding_type": "Approval Requirement Possible",
+            "finding_category": "Approval",
+            "risk_level": "Medium",
+            "clause_title": "Approval / Authorized Review",
+            "clause_reference": "Approval language",
+            "short_excerpt": lori_contract_excerpt(text, approval_keywords),
+            "finding_summary": "The document appears to require approval or authorized review.",
+            "operational_impact": "Route changes should be reviewed before implementation.",
+            "possible_cost_impact": "Low to medium depending on approval requirements.",
+            "recommended_action": "Send this route change to the appropriate supervisor or contract owner.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": False,
+            "requires_labor_review": False,
+            "requires_legal_review": False,
+            "blocks_final_approval": False,
+        })
+
+    if text_has(pay_keywords):
+        cost_risk_score += 2
+        findings.append({
+            "finding_type": "Pay / Compensation Impact Possible",
+            "finding_category": "Cost / Pay",
+            "risk_level": "High",
+            "clause_title": "Pay / Overtime / Compensation",
+            "clause_reference": "Pay language",
+            "short_excerpt": lori_contract_excerpt(text, pay_keywords),
+            "finding_summary": "The document appears to contain pay, compensation, overtime, minimum hours, rate, or guarantee language.",
+            "operational_impact": "Moving stops, changing route workload, or reducing/increasing hours may create pay impact.",
+            "possible_cost_impact": "Additional pay, overtime, guarantee, premium, or compensation adjustment may apply.",
+            "recommended_action": "Have HR, payroll, labor relations, or contract owner review before final approval.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": True,
+            "requires_labor_review": True,
+            "requires_legal_review": False,
+            "blocks_final_approval": True,
+        })
+
+    if text_has(union_keywords):
+        labor_risk_score += 3
+        findings.append({
+            "finding_type": "Union / Seniority / Grievance Risk Possible",
+            "finding_category": "Union / Labor",
+            "risk_level": "High",
+            "clause_title": "Union / CBA / Seniority / Grievance",
+            "clause_reference": "Labor agreement language",
+            "short_excerpt": lori_contract_excerpt(text, union_keywords),
+            "finding_summary": "The document appears to contain union, collective bargaining, grievance, seniority, or bidding language.",
+            "operational_impact": "Route changes may affect bidding rights, seniority, grievance exposure, or labor obligations.",
+            "possible_cost_impact": "Potential grievance, premium pay, back pay, or implementation delay risk.",
+            "recommended_action": "Do not implement until labor relations, HR, or authorized leadership reviews the change.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": True,
+            "requires_labor_review": True,
+            "requires_legal_review": True,
+            "blocks_final_approval": True,
+        })
+
+    if text_has(contractor_keywords):
+        contract_risk_score += 2
+        findings.append({
+            "finding_type": "Contractor / Owner-Operator Language Found",
+            "finding_category": "Contractor Agreement",
+            "risk_level": "High",
+            "clause_title": "Contractor / Owner-Operator",
+            "clause_reference": "Contractor language",
+            "short_excerpt": lori_contract_excerpt(text, contractor_keywords),
+            "finding_summary": "The document appears to reference contractor, owner-operator, subcontractor, or independent contractor arrangements.",
+            "operational_impact": "Changing route responsibility may affect contractor scope, compensation, or contractual obligations.",
+            "possible_cost_impact": "Rate adjustment, contractor dispute, or contract compliance risk may exist.",
+            "recommended_action": "Have the contract owner review before implementing route changes.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": False,
+            "requires_labor_review": False,
+            "requires_legal_review": True,
+            "blocks_final_approval": True,
+        })
+
+    if text_has(schedule_keywords):
+        labor_risk_score += 1
+        findings.append({
+            "finding_type": "Schedule Impact Possible",
+            "finding_category": "Schedule",
+            "risk_level": "Medium",
+            "clause_title": "Schedule / Shift / Hours",
+            "clause_reference": "Schedule language",
+            "short_excerpt": lori_contract_excerpt(text, schedule_keywords),
+            "finding_summary": "The document appears to reference schedules, shifts, start times, hours, or dispatch.",
+            "operational_impact": "Route changes may affect schedule, route duration, or start/end times.",
+            "possible_cost_impact": "Potential overtime or schedule premium risk.",
+            "recommended_action": "Review schedule impact before implementing.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": True,
+            "requires_labor_review": False,
+            "requires_legal_review": False,
+            "blocks_final_approval": False,
+        })
+
+    if text_has(vehicle_keywords):
+        contract_risk_score += 1
+        findings.append({
+            "finding_type": "Vehicle / Helper Assignment Impact Possible",
+            "finding_category": "Equipment / Helper",
+            "risk_level": "Medium",
+            "clause_title": "Vehicle / Helper / Equipment",
+            "clause_reference": "Vehicle or helper language",
+            "short_excerpt": lori_contract_excerpt(text, vehicle_keywords),
+            "finding_summary": "The document appears to reference vehicle, equipment, helper, or assistant assignments.",
+            "operational_impact": "Route changes may require vehicle, helper, or equipment review.",
+            "possible_cost_impact": "Potential helper, equipment, or capacity cost impact.",
+            "recommended_action": "Confirm vehicle/helper requirements before implementation.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": False,
+            "requires_labor_review": False,
+            "requires_legal_review": False,
+            "blocks_final_approval": False,
+        })
+
+    if not findings:
+        findings.append({
+            "finding_type": "No Specific Restriction Found",
+            "finding_category": "General",
+            "risk_level": "Low",
+            "clause_title": "No direct route-change restriction detected",
+            "clause_reference": "Keyword review",
+            "short_excerpt": text[:350],
+            "finding_summary": "LORI did not detect obvious route assignment, union, contractor, pay, notice, or approval language in the available text.",
+            "operational_impact": "Route change may proceed as planning draft, but authorized operations review is still required.",
+            "possible_cost_impact": "No specific cost impact detected from the available text.",
+            "recommended_action": "Proceed with supervisor review before implementation.",
+            "requires_supervisor_review": True,
+            "requires_hr_review": False,
+            "requires_labor_review": False,
+            "requires_legal_review": False,
+            "blocks_final_approval": False,
+        })
+
+    highest_score = max(contract_risk_score, labor_risk_score, cost_risk_score)
+
+    if highest_score >= 3:
+        contract_risk = "High" if contract_risk_score >= 2 else "Medium"
+        labor_risk = "High" if labor_risk_score >= 3 else "Medium"
+        cost_risk = "High" if cost_risk_score >= 2 else "Medium"
+        implementation_status = "Do Not Implement Yet"
+        warning = "Do not implement route changes until authorized HR, labor, legal, contract, or operations leadership review is complete."
+    elif highest_score >= 1:
+        contract_risk = "Medium"
+        labor_risk = "Medium" if labor_risk_score else "Low"
+        cost_risk = "Medium" if cost_risk_score else "Low"
+        implementation_status = "Supervisor Review Required"
+        warning = "Route change should remain in planning until supervisor review is complete."
+    else:
+        contract_risk = "Low"
+        labor_risk = "Low"
+        cost_risk = "Low"
+        implementation_status = "Allowed for Planning Only"
+        warning = "Supervisor review is still required before implementation."
+
+    return {
+        "contract_risk": contract_risk,
+        "labor_risk": labor_risk,
+        "cost_impact_risk": cost_risk,
+        "implementation_status": implementation_status,
+        "possible_cost_impact": cost_risk_score > 0,
+        "possible_grievance_risk": labor_risk_score >= 3,
+        "possible_notice_required": text_has(notice_keywords),
+        "possible_pay_adjustment_required": cost_risk_score > 0,
+        "supervisor_review_required": True,
+        "hr_labor_review_required": labor_risk_score > 0 or cost_risk_score > 0,
+        "legal_contract_review_required": contract_risk_score >= 2 or labor_risk_score >= 3,
+        "summary": "LORI reviewed the available agreement/policy text for route-change impact.",
+        "recommended_next_step": "Send for authorized review before implementation." if highest_score >= 1 else "Proceed as planning draft with supervisor review.",
+        "do_not_implement_warning": warning,
+        "findings": findings,
+    }
+
+
+@app.get("/route-contract-safeguard-documents")
+async def route_contract_safeguard_documents(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    driver_id: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    limit: int = Query(300),
+):
+    lori_regulatory_require_key(api_key)
+
+    docs = await lori_contract_get_rows(
+        "lori_route_contract_documents",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        docs = [d for d in docs if lori_contract_upper(d.get("station_code")) == lori_contract_upper(station_code)]
+
+    if driver_name:
+        docs = [d for d in docs if driver_name.lower() in lori_contract_clean(d.get("applies_to_driver")).lower()]
+
+    if route_id:
+        docs = [d for d in docs if lori_contract_clean(d.get("applies_to_route_id")).lower() == route_id.lower()]
+
+    central_docs_response = await documents_for_contract_safeguard(
+        api_key=api_key,
+        station_code=station_code,
+        driver_name=driver_name,
+        driver_id=driver_id,
+        limit=limit,
+    )
+
+    central_docs = central_docs_response.get("documents", []) if isinstance(central_docs_response, dict) else []
+
+    return {
+        "status": "success",
+        "contract_documents_count": len(docs[:limit]),
+        "contract_documents": docs[:limit],
+        "central_document_library_matches_count": len(central_docs),
+        "central_document_library_matches": central_docs,
+    }
+
+
+@app.post("/route-contract-safeguard-review-create")
+async def route_contract_safeguard_review_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    route_config_project_id = payload.get("route_config_project_id")
+    document_id = payload.get("document_id")
+    central_document_id = payload.get("central_document_id")
+
+    linked_document = None
+
+    if central_document_id and not document_id:
+        linked_document = await lori_contract_get_or_create_from_document_library(str(central_document_id))
+        document_id = linked_document.get("id") if linked_document else None
+
+    if document_id and not linked_document:
+        docs = await lori_contract_get_rows(
+            "lori_route_contract_documents",
+            f"select=*&id=eq.{quote(str(document_id))}&limit=1",
+        )
+        linked_document = docs[0] if docs else None
+
+    project = None
+    if route_config_project_id:
+        projects = await lori_contract_get_rows(
+            "lori_route_config_projects",
+            f"select=*&id=eq.{quote(str(route_config_project_id))}&limit=1",
+        )
+        project = projects[0] if projects else None
+
+    review_payload = {
+        "route_config_project_id": route_config_project_id,
+        "review_title": payload.get("review_title") or "Route Change Contract & Labor Safeguard Review",
+        "review_status": "Draft",
+        "agreement_required_status": payload.get("agreement_required_status") or "Agreement Selected",
+        "company_name": payload.get("company_name") or (project or {}).get("company_name") or (linked_document or {}).get("company_name"),
+        "region_code": payload.get("region_code") or (project or {}).get("region_code") or (linked_document or {}).get("region_code"),
+        "region_name": payload.get("region_name") or (project or {}).get("region_name") or (linked_document or {}).get("region_name"),
+        "operating_state": payload.get("operating_state") or (project or {}).get("operating_state") or (linked_document or {}).get("operating_state"),
+        "city": payload.get("city") or (project or {}).get("city") or (linked_document or {}).get("city"),
+        "station_code": payload.get("station_code") or (project or {}).get("station_code") or (linked_document or {}).get("station_code"),
+        "station_name": payload.get("station_name") or (project or {}).get("station_name") or (linked_document or {}).get("station_name"),
+        "route_group": payload.get("route_group") or (project or {}).get("route_group") or (linked_document or {}).get("route_group"),
+        "current_route_id": payload.get("current_route_id"),
+        "current_driver_name": payload.get("current_driver_name"),
+        "receiving_route_id": payload.get("receiving_route_id"),
+        "receiving_driver_name": payload.get("receiving_driver_name"),
+        "route_change_summary": payload.get("route_change_summary") or "Route change requires contract/labor safeguard review.",
+        "proposed_stop_moves": payload.get("proposed_stop_moves") or 0,
+        "proposed_work_area_change": payload.get("proposed_work_area_change", True),
+        "agreement_type_selected": payload.get("agreement_type_selected") or (linked_document or {}).get("document_type") or "Agreement / Policy",
+        "document_id": document_id,
+        "contract_risk": "Not Reviewed",
+        "labor_risk": "Not Reviewed",
+        "cost_impact_risk": "Not Reviewed",
+        "implementation_status": "Planning Only",
+        "safeguard_summary": "Safeguard review created. Run review before final route change approval.",
+        "recommended_next_step": "Run Contract & Labor Safeguard Review.",
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_route_contract_safeguard_reviews",
+        review_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "Contract & Labor Safeguard review created.",
+        "review": created[0] if created else review_payload,
+        "linked_document": linked_document,
+    }
+
+
+@app.post("/route-contract-safeguard-run")
+async def route_contract_safeguard_run(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    review_id = lori_contract_clean(payload.get("safeguard_review_id") or payload.get("review_id"))
+
+    if not review_id:
+        return {"status": "error", "message": "safeguard_review_id is required."}
+
+    reviews = await lori_contract_get_rows(
+        "lori_route_contract_safeguard_reviews",
+        f"select=*&id=eq.{quote(review_id)}&limit=1",
+    )
+
+    if not reviews:
+        return {"status": "not_found", "message": "Safeguard review not found."}
+
+    review = reviews[0]
+
+    document = None
+    document_id = review.get("document_id")
+
+    if document_id:
+        docs = await lori_contract_get_rows(
+            "lori_route_contract_documents",
+            f"select=*&id=eq.{quote(str(document_id))}&limit=1",
+        )
+        document = docs[0] if docs else None
+
+    text = (document or {}).get("extracted_text") or ""
+    agreement_type = review.get("agreement_type_selected") or (document or {}).get("document_type") or ""
+
+    analysis = lori_contract_analyze_text(text, agreement_type=agreement_type)
+
+    findings_created = []
+
+    for finding in analysis["findings"]:
+        finding_payload = {
+            "safeguard_review_id": review_id,
+            "document_id": document_id,
+            **finding,
+        }
+
+        created = await lori_policy_supabase_post(
+            "lori_route_contract_safeguard_findings",
+            finding_payload,
+        )
+
+        if created:
+            findings_created.append(created[0])
+
+    updated_review_payload = {
+        "review_status": "Reviewed",
+        "contract_risk": analysis["contract_risk"],
+        "labor_risk": analysis["labor_risk"],
+        "cost_impact_risk": analysis["cost_impact_risk"],
+        "implementation_status": analysis["implementation_status"],
+        "possible_cost_impact": analysis["possible_cost_impact"],
+        "possible_grievance_risk": analysis["possible_grievance_risk"],
+        "possible_notice_required": analysis["possible_notice_required"],
+        "possible_pay_adjustment_required": analysis["possible_pay_adjustment_required"],
+        "supervisor_review_required": analysis["supervisor_review_required"],
+        "hr_labor_review_required": analysis["hr_labor_review_required"],
+        "legal_contract_review_required": analysis["legal_contract_review_required"],
+        "safeguard_summary": analysis["summary"],
+        "recommended_next_step": analysis["recommended_next_step"],
+        "do_not_implement_warning": analysis["do_not_implement_warning"],
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    # Use existing transfer patch helper if already present.
+    try:
+        updated = await lori_transfer_patch_rows(
+            "lori_route_contract_safeguard_reviews",
+            f"id=eq.{quote(review_id)}",
+            updated_review_payload,
+        )
+        updated_review = updated[0] if updated else {**review, **updated_review_payload}
+    except Exception:
+        updated_review = {**review, **updated_review_payload}
+
+    return {
+        "status": "success",
+        "message": "Contract & Labor Safeguard review complete.",
+        "review": updated_review,
+        "document_reviewed": document,
+        "findings_created": len(findings_created),
+        "findings": findings_created,
+        "decision_support_note": "LORI provides operational decision support only. Contract, union, labor, pay, policy, legal, DOT, HR, and employment-related questions must be reviewed and approved by authorized company leadership, HR, labor relations, legal counsel, or the appropriate contract owner before implementation.",
+    }
+
+
+@app.get("/route-contract-safeguard-review-detail")
+async def route_contract_safeguard_review_detail(
+    api_key: Optional[str] = Query(None),
+    safeguard_review_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reviews = await lori_contract_get_rows(
+        "lori_route_contract_safeguard_reviews",
+        f"select=*&id=eq.{quote(safeguard_review_id)}&limit=1",
+    )
+
+    if not reviews:
+        return {"status": "not_found", "message": "Safeguard review not found."}
+
+    review = reviews[0]
+
+    findings = await lori_contract_get_rows(
+        "lori_route_contract_safeguard_findings",
+        f"select=*&safeguard_review_id=eq.{quote(safeguard_review_id)}&order=created_at.desc&limit=500",
+    )
+
+    acknowledgements = await lori_contract_get_rows(
+        "lori_route_contract_acknowledgements",
+        f"select=*&safeguard_review_id=eq.{quote(safeguard_review_id)}&order=created_at.desc&limit=100",
+    )
+
+    action_links = await lori_contract_get_rows(
+        "lori_route_contract_action_links",
+        f"select=*&safeguard_review_id=eq.{quote(safeguard_review_id)}&order=created_at.desc&limit=100",
+    )
+
+    document = None
+
+    if review.get("document_id"):
+        docs = await lori_contract_get_rows(
+            "lori_route_contract_documents",
+            f"select=*&id=eq.{quote(str(review.get('document_id')))}&limit=1",
+        )
+        document = docs[0] if docs else None
+
+    return {
+        "status": "success",
+        "review": review,
+        "document": document,
+        "findings_count": len(findings),
+        "findings": findings,
+        "acknowledgements_count": len(acknowledgements),
+        "acknowledgements": acknowledgements,
+        "action_links_count": len(action_links),
+        "action_links": action_links,
+    }
+
+
+@app.post("/route-contract-acknowledgement-create")
+async def route_contract_acknowledgement_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    acknowledgement_payload = {
+        "route_config_project_id": payload.get("route_config_project_id"),
+        "safeguard_review_id": payload.get("safeguard_review_id"),
+        "acknowledgement_type": payload.get("acknowledgement_type") or "No Agreement Applies",
+        "acknowledged_by": payload.get("acknowledged_by") or "LORI User",
+        "acknowledgement_text": payload.get("acknowledgement_text") or "I understand that LORI has not reviewed a contract, union agreement, or route assignment policy for this route change, and this decision still requires authorized operations review before implementation.",
+        "acknowledgement_status": "Accepted",
+        "company_name": payload.get("company_name"),
+        "operating_state": payload.get("operating_state"),
+        "station_code": payload.get("station_code"),
+        "current_route_id": payload.get("current_route_id"),
+        "receiving_route_id": payload.get("receiving_route_id"),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_route_contract_acknowledgements",
+        acknowledgement_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "Contract/labor acknowledgement recorded.",
+        "acknowledgement": created[0] if created else acknowledgement_payload,
+    }
+
+
+@app.post("/route-contract-safeguard-action-link-create")
+async def route_contract_safeguard_action_link_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    safeguard_review_id = payload.get("safeguard_review_id")
+
+    if not safeguard_review_id:
+        return {"status": "error", "message": "safeguard_review_id is required."}
+
+    action_payload = {
+        "safeguard_review_id": safeguard_review_id,
+        "action_center_item_id": payload.get("action_center_item_id"),
+        "action_title": payload.get("action_title") or "Review Contract / Labor Agreement Before Route Change",
+        "action_owner": payload.get("action_owner") or "Operations Leadership / HR / Labor Relations / Contract Manager",
+        "action_status": payload.get("action_status") or "Open",
+        "due_date": payload.get("due_date"),
+        "notes": payload.get("notes") or "Contract/labor safeguard found potential review requirement before route change implementation.",
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_route_contract_action_links",
+        action_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "Safeguard action link created.",
+        "action_link": created[0] if created else action_payload,
+    }
+
+
+@app.get("/route-contract-safeguard-status")
+async def route_contract_safeguard_status(
+    api_key: Optional[str] = Query(None),
+    route_config_project_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reviews = await lori_contract_get_rows(
+        "lori_route_contract_safeguard_reviews",
+        f"select=*&route_config_project_id=eq.{quote(route_config_project_id)}&order=created_at.desc&limit=100",
+    )
+
+    acknowledgements = await lori_contract_get_rows(
+        "lori_route_contract_acknowledgements",
+        f"select=*&route_config_project_id=eq.{quote(route_config_project_id)}&order=created_at.desc&limit=100",
+    )
+
+    high_risk_reviews = [
+        r for r in reviews
+        if r.get("contract_risk") == "High"
+        or r.get("labor_risk") == "High"
+        or r.get("cost_impact_risk") == "High"
+        or r.get("implementation_status") == "Do Not Implement Yet"
+    ]
+
+    review_complete = len(reviews) > 0 or len(acknowledgements) > 0
+    final_approval_allowed = review_complete and len(high_risk_reviews) == 0
+
+    return {
+        "status": "success",
+        "route_config_project_id": route_config_project_id,
+        "safeguard_reviews_count": len(reviews),
+        "acknowledgements_count": len(acknowledgements),
+        "high_risk_reviews_count": len(high_risk_reviews),
+        "review_complete": review_complete,
+        "final_approval_allowed": final_approval_allowed,
+        "implementation_status": "Do Not Implement Yet" if high_risk_reviews else ("Planning Review Complete" if review_complete else "Safeguard Required"),
+        "reviews": reviews,
+        "acknowledgements": acknowledgements,
+    }
