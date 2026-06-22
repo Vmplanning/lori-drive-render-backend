@@ -10846,3 +10846,657 @@ async def single_route_evaluate(
         "top_candidate": best,
         "recommendation": recommendation,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# ROUTE MAP DATA ENGINE BACKEND
+# Map layers, route stops, work-area boundaries, ZIP coverage,
+# crossover findings, and map download packages.
+# ============================================================
+
+from fastapi import Query
+from fastapi.responses import HTMLResponse
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+import html
+
+
+def lori_route_map_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+async def lori_route_map_get_rows(
+    table: str,
+    query: str = "select=*&order=created_at.desc&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+@app.get("/route-map-summary")
+async def route_map_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    layers = await lori_route_map_get_rows(
+        "lori_route_map_layers",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    stops = await lori_route_map_get_rows(
+        "lori_route_stop_points",
+        "select=*&order=route_id.asc,stop_sequence.asc&limit=1000",
+    )
+
+    boundaries = await lori_route_map_get_rows(
+        "lori_route_work_area_boundaries",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    crossovers = await lori_route_map_get_rows(
+        "lori_route_crossover_findings",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    packages = await lori_route_map_get_rows(
+        "lori_route_map_download_packages",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    current_route_layers = [
+        r for r in layers
+        if lori_route_map_clean(r.get("map_type")).lower() == "current route map"
+    ]
+
+    before_after_layers = [
+        r for r in layers
+        if "before" in lori_route_map_clean(r.get("map_type")).lower()
+        or "after" in lori_route_map_clean(r.get("map_type")).lower()
+    ]
+
+    station_layers = [
+        r for r in layers
+        if "station" in lori_route_map_clean(r.get("map_type")).lower()
+    ]
+
+    moved_stops = [
+        r for r in stops
+        if bool(r.get("moved_stop_candidate")) is True
+    ]
+
+    return {
+        "status": "success",
+        "map_layers_count": len(layers),
+        "current_route_layers_count": len(current_route_layers),
+        "before_after_layers_count": len(before_after_layers),
+        "station_layers_count": len(station_layers),
+        "stop_points_count": len(stops),
+        "moved_stops_count": len(moved_stops),
+        "work_area_boundaries_count": len(boundaries),
+        "crossover_findings_count": len(crossovers),
+        "download_packages_count": len(packages),
+        "latest_layer": layers[0] if layers else None,
+        "latest_crossover_finding": crossovers[0] if crossovers else None,
+        "answer_text": "Route Map Data Engine is ready. LORI can provide route map layers, stop points, work-area boundaries, ZIP coverage, crossover findings, and downloadable map packages.",
+    }
+
+
+@app.get("/route-map-layers")
+async def route_map_layers(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    map_type: Optional[str] = Query(None),
+    limit: int = Query(500),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_map_get_rows(
+        "lori_route_map_layers",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if route_id:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("route_id")).lower() == route_id.lower()
+            or lori_route_map_clean(r.get("comparison_route_id")).lower() == route_id.lower()
+        ]
+
+    if map_type:
+        rows = [
+            r for r in rows
+            if map_type.lower() in lori_route_map_clean(r.get("map_type")).lower()
+        ]
+
+    return {
+        "status": "success",
+        "layers_count": len(rows[:limit]),
+        "layers": rows[:max(1, min(limit, 500))],
+    }
+
+
+@app.get("/route-map-layer-detail")
+async def route_map_layer_detail(
+    api_key: Optional[str] = Query(None),
+    layer_id: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not layer_id:
+        return {
+            "status": "error",
+            "message": "layer_id is required.",
+        }
+
+    rows = await lori_route_map_get_rows(
+        "lori_route_map_layers",
+        f"select=*&id=eq.{quote(layer_id)}&limit=1",
+    )
+
+    if not rows:
+        return {
+            "status": "not_found",
+            "message": "Map layer not found.",
+            "layer_id": layer_id,
+        }
+
+    return {
+        "status": "success",
+        "layer": rows[0],
+    }
+
+
+@app.get("/route-stop-points")
+async def route_stop_points(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    moved_only: bool = Query(False),
+    limit: int = Query(1000),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_map_get_rows(
+        "lori_route_stop_points",
+        "select=*&order=route_id.asc,stop_sequence.asc&limit=2000",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if route_id:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("route_id")).lower() == route_id.lower()
+            or lori_route_map_clean(r.get("moved_to_route_id")).lower() == route_id.lower()
+        ]
+
+    if moved_only:
+        rows = [
+            r for r in rows
+            if bool(r.get("moved_stop_candidate")) is True
+        ]
+
+    return {
+        "status": "success",
+        "stop_points_count": len(rows[:limit]),
+        "stop_points": rows[:max(1, min(limit, 1000))],
+    }
+
+
+@app.get("/route-work-area-boundaries")
+async def route_work_area_boundaries(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    zip_code: Optional[str] = Query(None),
+    boundary_type: Optional[str] = Query(None),
+    limit: int = Query(500),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_map_get_rows(
+        "lori_route_work_area_boundaries",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if route_id:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("route_id")).lower() == route_id.lower()
+        ]
+
+    if zip_code:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("zip_code")) == zip_code
+        ]
+
+    if boundary_type:
+        rows = [
+            r for r in rows
+            if boundary_type.lower() in lori_route_map_clean(r.get("boundary_type")).lower()
+        ]
+
+    return {
+        "status": "success",
+        "boundaries_count": len(rows[:limit]),
+        "boundaries": rows[:max(1, min(limit, 500))],
+    }
+
+
+@app.get("/route-crossover-findings")
+async def route_crossover_findings(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    source_route_id: Optional[str] = Query(None),
+    crossed_route_id: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    limit: int = Query(500),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_map_get_rows(
+        "lori_route_crossover_findings",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if source_route_id:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("source_route_id")).lower() == source_route_id.lower()
+        ]
+
+    if crossed_route_id:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("crossed_route_id")).lower() == crossed_route_id.lower()
+        ]
+
+    if severity:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("severity")).lower() == severity.lower()
+        ]
+
+    return {
+        "status": "success",
+        "crossover_findings_count": len(rows[:limit]),
+        "crossover_findings": rows[:max(1, min(limit, 500))],
+    }
+
+
+@app.get("/route-map-download-packages")
+async def route_map_download_packages(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    comparison_route_id: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_map_get_rows(
+        "lori_route_map_download_packages",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if route_id:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("route_id")).lower() == route_id.lower()
+        ]
+
+    if comparison_route_id:
+        rows = [
+            r for r in rows
+            if lori_route_map_clean(r.get("comparison_route_id")).lower() == comparison_route_id.lower()
+        ]
+
+    return {
+        "status": "success",
+        "download_packages_count": len(rows[:limit]),
+        "download_packages": rows[:max(1, min(limit, 100))],
+    }
+
+
+@app.get("/route-map-view-data")
+async def route_map_view_data(
+    api_key: Optional[str] = Query(None),
+    station_code: str = Query("JESSUP-01"),
+    route_id: Optional[str] = Query(None),
+    comparison_route_id: Optional[str] = Query(None),
+    view_type: str = Query("current"),
+):
+    lori_regulatory_require_key(api_key)
+
+    layers = await lori_route_map_get_rows(
+        "lori_route_map_layers",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    stops = await lori_route_map_get_rows(
+        "lori_route_stop_points",
+        "select=*&order=route_id.asc,stop_sequence.asc&limit=2000",
+    )
+
+    boundaries = await lori_route_map_get_rows(
+        "lori_route_work_area_boundaries",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    crossovers = await lori_route_map_get_rows(
+        "lori_route_crossover_findings",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    packages = await lori_route_map_get_rows(
+        "lori_route_map_download_packages",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    layers = [
+        r for r in layers
+        if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+    ]
+
+    stops = [
+        r for r in stops
+        if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+    ]
+
+    boundaries = [
+        r for r in boundaries
+        if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+    ]
+
+    crossovers = [
+        r for r in crossovers
+        if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+    ]
+
+    packages = [
+        r for r in packages
+        if lori_route_map_clean(r.get("station_code")).lower() == station_code.lower()
+    ]
+
+    if route_id:
+        route_id_lower = route_id.lower()
+
+        layers = [
+            r for r in layers
+            if lori_route_map_clean(r.get("route_id")).lower() == route_id_lower
+            or lori_route_map_clean(r.get("comparison_route_id")).lower() == route_id_lower
+            or "station" in lori_route_map_clean(r.get("map_type")).lower()
+        ]
+
+        stops = [
+            r for r in stops
+            if lori_route_map_clean(r.get("route_id")).lower() == route_id_lower
+            or lori_route_map_clean(r.get("moved_to_route_id")).lower() == route_id_lower
+        ]
+
+        boundaries = [
+            r for r in boundaries
+            if lori_route_map_clean(r.get("route_id")).lower() == route_id_lower
+            or lori_route_map_clean(r.get("boundary_type")).lower() == "zip coverage"
+        ]
+
+        crossovers = [
+            r for r in crossovers
+            if lori_route_map_clean(r.get("source_route_id")).lower() == route_id_lower
+            or lori_route_map_clean(r.get("crossed_route_id")).lower() == route_id_lower
+        ]
+
+    if comparison_route_id:
+        comp_lower = comparison_route_id.lower()
+
+        layers = [
+            r for r in layers
+            if lori_route_map_clean(r.get("comparison_route_id")).lower() == comp_lower
+            or lori_route_map_clean(r.get("route_id")).lower() == comp_lower
+            or "station" in lori_route_map_clean(r.get("map_type")).lower()
+        ] or layers
+
+        stops = [
+            r for r in stops
+            if lori_route_map_clean(r.get("route_id")).lower() == comp_lower
+            or lori_route_map_clean(r.get("moved_to_route_id")).lower() == comp_lower
+        ] or stops
+
+        boundaries = [
+            r for r in boundaries
+            if lori_route_map_clean(r.get("route_id")).lower() == comp_lower
+            or lori_route_map_clean(r.get("boundary_type")).lower() == "zip coverage"
+        ] or boundaries
+
+    view_type_lower = view_type.lower()
+
+    if view_type_lower in ["current", "current_route"]:
+        selected_layers = [
+            r for r in layers
+            if "current" in lori_route_map_clean(r.get("map_type")).lower()
+        ]
+    elif view_type_lower in ["before_after", "comparison", "proposed"]:
+        selected_layers = [
+            r for r in layers
+            if "before" in lori_route_map_clean(r.get("map_type")).lower()
+            or "after" in lori_route_map_clean(r.get("map_type")).lower()
+            or "comparison" in lori_route_map_clean(r.get("layer_type")).lower()
+        ]
+    elif view_type_lower in ["station", "full_station"]:
+        selected_layers = [
+            r for r in layers
+            if "station" in lori_route_map_clean(r.get("map_type")).lower()
+        ]
+    else:
+        selected_layers = layers
+
+    if not selected_layers:
+        selected_layers = layers
+
+    return {
+        "status": "success",
+        "view_type": view_type,
+        "station_code": station_code,
+        "route_id": route_id,
+        "comparison_route_id": comparison_route_id,
+        "layers_count": len(selected_layers),
+        "layers": selected_layers,
+        "stop_points_count": len(stops),
+        "stop_points": stops,
+        "boundaries_count": len(boundaries),
+        "boundaries": boundaries,
+        "crossover_findings_count": len(crossovers),
+        "crossover_findings": crossovers,
+        "download_packages_count": len(packages),
+        "download_packages": packages,
+        "map_note": "Map view is based on currently available route geography, ZIP coverage, work area boundaries, crossover findings, and route configuration data.",
+    }
+
+
+@app.get("/route-map-download-html", response_class=HTMLResponse)
+async def route_map_download_html(
+    api_key: Optional[str] = Query(None),
+    station_code: str = Query("JESSUP-01"),
+    route_id: str = Query("R-104"),
+    comparison_route_id: str = Query("R-208"),
+):
+    lori_regulatory_require_key(api_key)
+
+    data = await route_map_view_data(
+        api_key=api_key,
+        station_code=station_code,
+        route_id=route_id,
+        comparison_route_id=comparison_route_id,
+        view_type="comparison",
+    )
+
+    layers = data.get("layers", [])
+    stops = data.get("stop_points", [])
+    boundaries = data.get("boundaries", [])
+    crossovers = data.get("crossover_findings", [])
+
+    layer_items = "".join(
+        f"<li><strong>{html.escape(str(layer.get('map_title', 'Map Layer')))}</strong> — "
+        f"{html.escape(str(layer.get('map_type', '')))} / "
+        f"{html.escape(str(layer.get('layer_label', '')))}</li>"
+        for layer in layers
+    )
+
+    stop_items = "".join(
+        f"<tr><td>{html.escape(str(stop.get('route_id', '')))}</td>"
+        f"<td>{html.escape(str(stop.get('marker_label', '')))}</td>"
+        f"<td>{html.escape(str(stop.get('stop_city', '')))}, {html.escape(str(stop.get('stop_state', '')))}</td>"
+        f"<td>{html.escape(str(stop.get('stop_zip', '')))}</td>"
+        f"<td>{html.escape(str(stop.get('stop_type', '')))}</td></tr>"
+        for stop in stops
+    )
+
+    boundary_items = "".join(
+        f"<li><strong>{html.escape(str(boundary.get('boundary_title', 'Boundary')))}</strong> — "
+        f"{html.escape(str(boundary.get('boundary_type', '')))} "
+        f"{html.escape(str(boundary.get('zip_code', '')))}</li>"
+        for boundary in boundaries
+    )
+
+    crossover_items = "".join(
+        f"<li><strong>{html.escape(str(crossover.get('finding_title', 'Crossover Finding')))}</strong><br>"
+        f"Severity: {html.escape(str(crossover.get('severity', '')))}<br>"
+        f"{html.escape(str(crossover.get('finding_summary', '')))}</li>"
+        for crossover in crossovers
+    )
+
+    html_doc = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>LORI Route Map Package {html.escape(route_id)} to {html.escape(comparison_route_id)}</title>
+      <style>
+        body {{
+          font-family: Arial, sans-serif;
+          margin: 32px;
+          color: #111827;
+          background: #f8fafc;
+        }}
+        .card {{
+          background: white;
+          border: 1px solid #dbe3ef;
+          border-radius: 16px;
+          padding: 20px;
+          margin-bottom: 18px;
+          box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+        }}
+        h1 {{ margin-bottom: 4px; }}
+        h2 {{ margin-top: 0; color: #1f2937; }}
+        .badge {{
+          display: inline-block;
+          padding: 6px 10px;
+          border-radius: 999px;
+          background: #e0f2fe;
+          color: #075985;
+          font-size: 12px;
+          font-weight: 700;
+          margin-right: 8px;
+        }}
+        table {{
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 13px;
+        }}
+        th, td {{
+          border: 1px solid #e5e7eb;
+          padding: 8px;
+          text-align: left;
+        }}
+        th {{
+          background: #f1f5f9;
+        }}
+        .note {{
+          font-size: 12px;
+          color: #64748b;
+          line-height: 1.5;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>LORI Route Map Package</h1>
+        <p>
+          <span class="badge">Station: {html.escape(station_code)}</span>
+          <span class="badge">Route: {html.escape(route_id)}</span>
+          <span class="badge">Comparison: {html.escape(comparison_route_id)}</span>
+        </p>
+        <p class="note">Generated by LORI Drive Command Center. Demonstration Data Only — Not Company Proprietary Data.</p>
+      </div>
+
+      <div class="card">
+        <h2>Map Layers</h2>
+        <ul>{layer_items or "<li>No map layers found.</li>"}</ul>
+      </div>
+
+      <div class="card">
+        <h2>Route Stop Points</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Route</th>
+              <th>Marker</th>
+              <th>City/State</th>
+              <th>ZIP</th>
+              <th>Stop Type</th>
+            </tr>
+          </thead>
+          <tbody>{stop_items or "<tr><td colspan='5'>No stop points found.</td></tr>"}</tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Work Area / ZIP Boundaries</h2>
+        <ul>{boundary_items or "<li>No boundaries found.</li>"}</ul>
+      </div>
+
+      <div class="card">
+        <h2>Crossover Findings</h2>
+        <ul>{crossover_items or "<li>No crossover findings found.</li>"}</ul>
+      </div>
+
+      <div class="card note">
+        LORI map views are operational decision-support visuals based on available route geography, ZIP coverage, work area boundaries, and route configuration data.
+        Final route changes must be reviewed and approved by authorized operations leadership before implementation.
+      </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html_doc)
