@@ -11500,3 +11500,565 @@ async def route_map_download_html(
     """
 
     return HTMLResponse(content=html_doc)
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# NATIONWIDE OPERATING CONTEXT BACKEND
+# U.S. states, regions, stations, ZIP coverage,
+# state compliance profiles, and module operating context.
+# ============================================================
+
+from fastapi import Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+
+
+def lori_nationwide_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+async def lori_nationwide_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+@app.get("/nationwide-context-summary")
+async def nationwide_context_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    states = await lori_nationwide_get_rows(
+        "lori_us_operating_states",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    regions = await lori_nationwide_get_rows(
+        "lori_operating_regions",
+        "select=*&order=region_name.asc&limit=100",
+    )
+
+    stations = await lori_nationwide_get_rows(
+        "lori_operating_stations",
+        "select=*&order=station_code.asc&limit=500",
+    )
+
+    zip_coverages = await lori_nationwide_get_rows(
+        "lori_station_zip_coverage",
+        "select=*&order=station_code.asc,zip_code.asc&limit=1000",
+    )
+
+    compliance_profiles = await lori_nationwide_get_rows(
+        "lori_state_compliance_profiles",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    module_contexts = await lori_nationwide_get_rows(
+        "lori_nationwide_module_contexts",
+        "select=*&order=module_name.asc&limit=100",
+    )
+
+    active_stations = [
+        s for s in stations
+        if lori_nationwide_clean(s.get("station_status")).lower() == "active"
+    ]
+
+    demo_stations = [
+        s for s in stations
+        if lori_nationwide_clean(s.get("station_status")).lower() == "demo"
+    ]
+
+    map_ready = [
+        s for s in stations
+        if bool(s.get("map_ready")) is True
+    ]
+
+    route_scoring_ready = [
+        s for s in stations
+        if bool(s.get("route_scoring_ready")) is True
+    ]
+
+    push_ready = [
+        s for s in stations
+        if bool(s.get("push_notification_ready")) is True
+    ]
+
+    return {
+        "status": "success",
+        "states_count": len(states),
+        "regions_count": len(regions),
+        "stations_count": len(stations),
+        "active_stations_count": len(active_stations),
+        "demo_stations_count": len(demo_stations),
+        "zip_coverages_count": len(zip_coverages),
+        "state_compliance_profiles_count": len(compliance_profiles),
+        "module_contexts_count": len(module_contexts),
+        "map_ready_stations_count": len(map_ready),
+        "route_scoring_ready_stations_count": len(route_scoring_ready),
+        "push_notification_ready_stations_count": len(push_ready),
+        "default_operating_context": {
+            "company_name": "Food Authority",
+            "region": "Mid-Atlantic",
+            "state": "MD",
+            "station_code": "JESSUP-01",
+            "city": "Jessup",
+            "time_zone": "America/New_York",
+        },
+        "answer_text": "Nationwide Operating Context is ready. LORI can support national, regional, state, station, ZIP, route, driver, compliance, and module-level filtering across the United States.",
+    }
+
+
+@app.get("/us-operating-states")
+async def us_operating_states(
+    api_key: Optional[str] = Query(None),
+    state_code: Optional[str] = Query(None),
+    region: Optional[str] = Query(None),
+    active_only: bool = Query(True),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_nationwide_get_rows(
+        "lori_us_operating_states",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    if active_only:
+        rows = [r for r in rows if bool(r.get("active_state")) is True]
+
+    if state_code:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("state_code")).lower() == state_code.lower()
+        ]
+
+    if region:
+        rows = [
+            r for r in rows
+            if region.lower() in lori_nationwide_clean(r.get("default_region")).lower()
+        ]
+
+    return {
+        "status": "success",
+        "states_count": len(rows),
+        "states": rows,
+    }
+
+
+@app.get("/operating-regions")
+async def operating_regions(
+    api_key: Optional[str] = Query(None),
+    region_code: Optional[str] = Query(None),
+    state_code: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_nationwide_get_rows(
+        "lori_operating_regions",
+        "select=*&order=region_name.asc&limit=100",
+    )
+
+    if region_code:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("region_code")).lower() == region_code.lower()
+        ]
+
+    if state_code:
+        state_upper = state_code.upper()
+        rows = [
+            r for r in rows
+            if state_upper in (r.get("covered_states") or [])
+        ]
+
+    return {
+        "status": "success",
+        "regions_count": len(rows),
+        "regions": rows,
+    }
+
+
+@app.get("/operating-stations")
+async def operating_stations(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    operating_state: Optional[str] = Query(None),
+    region_code: Optional[str] = Query(None),
+    company_name: Optional[str] = Query(None),
+    city: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    map_ready: Optional[bool] = Query(None),
+    route_scoring_ready: Optional[bool] = Query(None),
+    push_notification_ready: Optional[bool] = Query(None),
+    limit: int = Query(500),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_nationwide_get_rows(
+        "lori_operating_stations",
+        "select=*&order=station_code.asc&limit=1000",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if operating_state:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("operating_state")).lower() == operating_state.lower()
+        ]
+
+    if region_code:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("region_code")).lower() == region_code.lower()
+        ]
+
+    if company_name:
+        rows = [
+            r for r in rows
+            if company_name.lower() in lori_nationwide_clean(r.get("company_name")).lower()
+        ]
+
+    if city:
+        rows = [
+            r for r in rows
+            if city.lower() in lori_nationwide_clean(r.get("city")).lower()
+        ]
+
+    if status:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("station_status")).lower() == status.lower()
+        ]
+
+    if map_ready is not None:
+        rows = [
+            r for r in rows
+            if bool(r.get("map_ready")) is map_ready
+        ]
+
+    if route_scoring_ready is not None:
+        rows = [
+            r for r in rows
+            if bool(r.get("route_scoring_ready")) is route_scoring_ready
+        ]
+
+    if push_notification_ready is not None:
+        rows = [
+            r for r in rows
+            if bool(r.get("push_notification_ready")) is push_notification_ready
+        ]
+
+    limit = max(1, min(limit, 500))
+
+    return {
+        "status": "success",
+        "stations_count": len(rows[:limit]),
+        "stations": rows[:limit],
+    }
+
+
+@app.get("/station-zip-coverage")
+async def station_zip_coverage(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    operating_state: Optional[str] = Query(None),
+    zip_code: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    route_group: Optional[str] = Query(None),
+    map_ready: Optional[bool] = Query(None),
+    limit: int = Query(1000),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_nationwide_get_rows(
+        "lori_station_zip_coverage",
+        "select=*&order=station_code.asc,zip_code.asc&limit=2000",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    if operating_state:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("operating_state")).lower() == operating_state.lower()
+        ]
+
+    if zip_code:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("zip_code")) == zip_code
+        ]
+
+    if route_id:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("route_id")).lower() == route_id.lower()
+        ]
+
+    if route_group:
+        rows = [
+            r for r in rows
+            if route_group.lower() in lori_nationwide_clean(r.get("route_group")).lower()
+        ]
+
+    if map_ready is not None:
+        rows = [
+            r for r in rows
+            if bool(r.get("map_ready")) is map_ready
+        ]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "zip_coverages_count": len(rows[:limit]),
+        "zip_coverages": rows[:limit],
+    }
+
+
+@app.get("/state-compliance-profiles")
+async def state_compliance_profiles(
+    api_key: Optional[str] = Query(None),
+    state_code: Optional[str] = Query(None),
+    jurisdiction_type: Optional[str] = Query(None),
+    regulatory_watch_enabled: Optional[bool] = Query(None),
+    policy_review_enabled: Optional[bool] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_nationwide_get_rows(
+        "lori_state_compliance_profiles",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    if state_code:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("state_code")).lower() == state_code.lower()
+        ]
+
+    if jurisdiction_type:
+        rows = [
+            r for r in rows
+            if lori_nationwide_clean(r.get("jurisdiction_type")).lower() == jurisdiction_type.lower()
+        ]
+
+    if regulatory_watch_enabled is not None:
+        rows = [
+            r for r in rows
+            if bool(r.get("regulatory_watch_enabled")) is regulatory_watch_enabled
+        ]
+
+    if policy_review_enabled is not None:
+        rows = [
+            r for r in rows
+            if bool(r.get("policy_review_enabled")) is policy_review_enabled
+        ]
+
+    return {
+        "status": "success",
+        "state_compliance_profiles_count": len(rows),
+        "state_compliance_profiles": rows,
+        "decision_support_note": "LORI provides operational decision support only. Federal, state, local, labor, safety, DOT, HR, and company policy requirements must be reviewed and approved by authorized leadership before implementation.",
+    }
+
+
+@app.get("/nationwide-module-contexts")
+async def nationwide_module_contexts(
+    api_key: Optional[str] = Query(None),
+    module_name: Optional[str] = Query(None),
+    supports_national: Optional[bool] = Query(None),
+    supports_state: Optional[bool] = Query(None),
+    supports_station: Optional[bool] = Query(None),
+    supports_route: Optional[bool] = Query(None),
+    supports_driver: Optional[bool] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_nationwide_get_rows(
+        "lori_nationwide_module_contexts",
+        "select=*&order=module_name.asc&limit=100",
+    )
+
+    if module_name:
+        rows = [
+            r for r in rows
+            if module_name.lower() in lori_nationwide_clean(r.get("module_name")).lower()
+        ]
+
+    if supports_national is not None:
+        rows = [r for r in rows if bool(r.get("supports_national")) is supports_national]
+
+    if supports_state is not None:
+        rows = [r for r in rows if bool(r.get("supports_state")) is supports_state]
+
+    if supports_station is not None:
+        rows = [r for r in rows if bool(r.get("supports_station")) is supports_station]
+
+    if supports_route is not None:
+        rows = [r for r in rows if bool(r.get("supports_route")) is supports_route]
+
+    if supports_driver is not None:
+        rows = [r for r in rows if bool(r.get("supports_driver")) is supports_driver]
+
+    return {
+        "status": "success",
+        "module_contexts_count": len(rows),
+        "module_contexts": rows,
+    }
+
+
+@app.get("/operating-context-options")
+async def operating_context_options(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    states = await lori_nationwide_get_rows(
+        "lori_us_operating_states",
+        "select=state_code,state_name,default_region,default_time_zone,active_state&order=state_code.asc&limit=100",
+    )
+
+    regions = await lori_nationwide_get_rows(
+        "lori_operating_regions",
+        "select=region_code,region_name,covered_states,region_status&order=region_name.asc&limit=100",
+    )
+
+    stations = await lori_nationwide_get_rows(
+        "lori_operating_stations",
+        "select=company_name,region_code,region_name,station_code,station_name,station_status,operating_state,city,primary_zip,time_zone,latitude,longitude,map_ready,route_scoring_ready,push_notification_ready,compliance_profile_ready&order=station_code.asc&limit=500",
+    )
+
+    modules = await lori_nationwide_get_rows(
+        "lori_nationwide_module_contexts",
+        "select=module_name,context_level,supports_national,supports_region,supports_state,supports_station,supports_route,supports_driver,module_status&order=module_name.asc&limit=100",
+    )
+
+    return {
+        "status": "success",
+        "states": states,
+        "regions": regions,
+        "stations": stations,
+        "modules": modules,
+        "default_context": {
+            "company_name": "Food Authority",
+            "region_code": "MID_ATLANTIC",
+            "region_name": "Mid-Atlantic",
+            "operating_state": "MD",
+            "station_code": "JESSUP-01",
+            "station_name": "Jessup Delivery Station",
+            "city": "Jessup",
+            "primary_zip": "20794",
+            "time_zone": "America/New_York",
+        },
+    }
+
+
+@app.get("/operating-context-resolve")
+async def operating_context_resolve(
+    api_key: Optional[str] = Query(None),
+    state_code: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    zip_code: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    states = await lori_nationwide_get_rows(
+        "lori_us_operating_states",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    stations = await lori_nationwide_get_rows(
+        "lori_operating_stations",
+        "select=*&order=station_code.asc&limit=500",
+    )
+
+    zips = await lori_nationwide_get_rows(
+        "lori_station_zip_coverage",
+        "select=*&order=station_code.asc,zip_code.asc&limit=1000",
+    )
+
+    profiles = await lori_nationwide_get_rows(
+        "lori_state_compliance_profiles",
+        "select=*&order=state_code.asc&limit=100",
+    )
+
+    selected_state = None
+    selected_station = None
+    selected_zip_rows = []
+
+    if station_code:
+        for station in stations:
+            if lori_nationwide_clean(station.get("station_code")).lower() == station_code.lower():
+                selected_station = station
+                state_code = state_code or station.get("operating_state")
+                break
+
+    if state_code:
+        for state in states:
+            if lori_nationwide_clean(state.get("state_code")).lower() == state_code.lower():
+                selected_state = state
+                break
+
+    if zip_code:
+        selected_zip_rows = [
+            z for z in zips
+            if lori_nationwide_clean(z.get("zip_code")) == zip_code
+        ]
+
+        if selected_zip_rows and not station_code:
+            station_code = selected_zip_rows[0].get("station_code")
+
+    if station_code and not selected_station:
+        for station in stations:
+            if lori_nationwide_clean(station.get("station_code")).lower() == station_code.lower():
+                selected_station = station
+                break
+
+    selected_profile = None
+
+    if state_code:
+        for profile in profiles:
+            if lori_nationwide_clean(profile.get("state_code")).lower() == state_code.lower():
+                selected_profile = profile
+                break
+
+    station_zip_coverages = []
+
+    if selected_station:
+        station_zip_coverages = [
+            z for z in zips
+            if lori_nationwide_clean(z.get("station_code")).lower()
+            == lori_nationwide_clean(selected_station.get("station_code")).lower()
+        ]
+
+    return {
+        "status": "success",
+        "state": selected_state,
+        "station": selected_station,
+        "zip_matches": selected_zip_rows,
+        "station_zip_coverages": station_zip_coverages,
+        "state_compliance_profile": selected_profile,
+        "resolved_context": {
+            "state_code": state_code,
+            "station_code": selected_station.get("station_code") if selected_station else station_code,
+            "station_name": selected_station.get("station_name") if selected_station else None,
+            "city": selected_station.get("city") if selected_station else None,
+            "region_code": selected_station.get("region_code") if selected_station else None,
+            "region_name": selected_station.get("region_name") if selected_station else None,
+            "time_zone": selected_station.get("time_zone") if selected_station else None,
+            "primary_zip": selected_station.get("primary_zip") if selected_station else zip_code,
+        },
+        "decision_support_note": "LORI provides operational decision support only. Federal, state, local, labor, safety, DOT, HR, and company policy requirements must be reviewed and approved by authorized leadership before implementation.",
+    }
