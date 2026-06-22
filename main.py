@@ -9760,3 +9760,372 @@ async def comm_campaign_send_email(
         "skipped": skipped,
         "answer_text": "Email sending completed through Resend. SMS/text remains queued until an SMS provider is connected.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# ROUTE SCORING ENGINE BACKEND
+# Station-wide utilization, driver scorecards,
+# route rebalancing opportunities, and station suggestions.
+# ============================================================
+
+from fastapi import Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+
+
+async def lori_route_scoring_get_rows(
+    table: str,
+    query: str = "select=*&order=created_at.desc&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+def lori_route_scoring_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+async def lori_route_scoring_latest_review() -> Optional[Dict[str, Any]]:
+    reviews = await lori_route_scoring_get_rows(
+        "lori_route_station_reviews",
+        "select=*&order=created_at.desc&limit=1",
+    )
+
+    if reviews:
+        return reviews[0]
+
+    return None
+
+
+@app.get("/route-scoring-summary")
+async def route_scoring_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    latest_review = await lori_route_scoring_latest_review()
+
+    if not latest_review:
+        return {
+            "status": "empty",
+            "message": "No route scoring review found.",
+            "station_reviews_count": 0,
+            "driver_scorecards_count": 0,
+            "opportunities_count": 0,
+            "station_suggestions_count": 0,
+        }
+
+    review_id = str(latest_review.get("id"))
+
+    scorecards = await lori_route_scoring_get_rows(
+        "lori_route_driver_scorecards",
+        f"select=*&station_review_id=eq.{quote(review_id)}&order=utilization_percent.desc&limit=500",
+    )
+
+    opportunities = await lori_route_scoring_get_rows(
+        "lori_route_rebalancing_opportunities",
+        f"select=*&station_review_id=eq.{quote(review_id)}&order=created_at.desc&limit=100",
+    )
+
+    suggestions = await lori_route_scoring_get_rows(
+        "lori_route_station_suggestions",
+        f"select=*&station_review_id=eq.{quote(review_id)}&order=created_at.desc&limit=200",
+    )
+
+    overutilized = [
+        r for r in scorecards
+        if lori_route_scoring_clean(r.get("workload_status")).lower() == "overutilized"
+    ]
+
+    underutilized = [
+        r for r in scorecards
+        if lori_route_scoring_clean(r.get("workload_status")).lower() == "underutilized"
+    ]
+
+    near_capacity = [
+        r for r in scorecards
+        if lori_route_scoring_clean(r.get("workload_status")).lower() == "near capacity"
+    ]
+
+    balanced = [
+        r for r in scorecards
+        if lori_route_scoring_clean(r.get("workload_status")).lower() == "balanced"
+    ]
+
+    can_absorb = [
+        r for r in scorecards
+        if bool(r.get("can_absorb_work")) is True
+    ]
+
+    should_give_up = [
+        r for r in scorecards
+        if bool(r.get("should_give_up_work")) is True
+    ]
+
+    should_not_receive = [
+        r for r in scorecards
+        if bool(r.get("should_not_receive_work")) is True
+    ]
+
+    return {
+        "status": "success",
+        "latest_review": latest_review,
+        "station_review_id": review_id,
+
+        "driver_scorecards_count": len(scorecards),
+        "opportunities_count": len(opportunities),
+        "station_suggestions_count": len(suggestions),
+
+        "overutilized_count": len(overutilized),
+        "underutilized_count": len(underutilized),
+        "near_capacity_count": len(near_capacity),
+        "balanced_count": len(balanced),
+
+        "can_absorb_work_count": len(can_absorb),
+        "should_give_up_work_count": len(should_give_up),
+        "should_not_receive_work_count": len(should_not_receive),
+
+        "top_rebalancing_opportunity": opportunities[0] if opportunities else None,
+        "top_station_suggestions": suggestions[:5],
+
+        "answer_text": "Route scoring engine is ready. LORI identified route utilization, overutilized drivers, underutilized drivers, rebalancing opportunities, and station-wide route suggestions.",
+    }
+
+
+@app.get("/route-station-reviews")
+async def route_station_reviews(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_route_scoring_get_rows(
+        "lori_route_station_reviews",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_route_scoring_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    return {
+        "status": "success",
+        "station_reviews_count": len(rows[:limit]),
+        "station_reviews": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/route-driver-scorecards")
+async def route_driver_scorecards(
+    api_key: Optional[str] = Query(None),
+    station_review_id: Optional[str] = Query(None),
+    workload_status: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    limit: int = Query(500),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not station_review_id:
+        latest_review = await lori_route_scoring_latest_review()
+        if latest_review:
+            station_review_id = str(latest_review.get("id"))
+
+    if not station_review_id:
+        return {
+            "status": "empty",
+            "message": "No station review found.",
+            "scorecards_count": 0,
+            "scorecards": [],
+        }
+
+    rows = await lori_route_scoring_get_rows(
+        "lori_route_driver_scorecards",
+        f"select=*&station_review_id=eq.{quote(station_review_id)}&order=utilization_percent.desc&limit=1000",
+    )
+
+    if workload_status:
+        rows = [
+            r for r in rows
+            if lori_route_scoring_clean(r.get("workload_status")).lower() == workload_status.lower()
+        ]
+
+    if driver_name:
+        rows = [
+            r for r in rows
+            if driver_name.lower() in lori_route_scoring_clean(r.get("driver_name")).lower()
+        ]
+
+    if route_id:
+        rows = [
+            r for r in rows
+            if lori_route_scoring_clean(r.get("route_id")).lower() == route_id.lower()
+        ]
+
+    return {
+        "status": "success",
+        "station_review_id": station_review_id,
+        "scorecards_count": len(rows[:limit]),
+        "scorecards": rows[:max(1, min(limit, 500))],
+    }
+
+
+@app.get("/route-rebalancing-opportunities")
+async def route_rebalancing_opportunities(
+    api_key: Optional[str] = Query(None),
+    station_review_id: Optional[str] = Query(None),
+    recommendation_strength: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not station_review_id:
+        latest_review = await lori_route_scoring_latest_review()
+        if latest_review:
+            station_review_id = str(latest_review.get("id"))
+
+    if not station_review_id:
+        return {
+            "status": "empty",
+            "message": "No station review found.",
+            "opportunities_count": 0,
+            "opportunities": [],
+        }
+
+    rows = await lori_route_scoring_get_rows(
+        "lori_route_rebalancing_opportunities",
+        f"select=*&station_review_id=eq.{quote(station_review_id)}&order=estimated_total_savings.desc&limit=500",
+    )
+
+    if recommendation_strength:
+        rows = [
+            r for r in rows
+            if recommendation_strength.lower() in lori_route_scoring_clean(r.get("recommendation_strength")).lower()
+        ]
+
+    return {
+        "status": "success",
+        "station_review_id": station_review_id,
+        "opportunities_count": len(rows[:limit]),
+        "opportunities": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/route-station-suggestions")
+async def route_station_suggestions(
+    api_key: Optional[str] = Query(None),
+    station_review_id: Optional[str] = Query(None),
+    suggestion_type: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not station_review_id:
+        latest_review = await lori_route_scoring_latest_review()
+        if latest_review:
+            station_review_id = str(latest_review.get("id"))
+
+    if not station_review_id:
+        return {
+            "status": "empty",
+            "message": "No station review found.",
+            "suggestions_count": 0,
+            "suggestions": [],
+        }
+
+    rows = await lori_route_scoring_get_rows(
+        "lori_route_station_suggestions",
+        f"select=*&station_review_id=eq.{quote(station_review_id)}&order=created_at.desc&limit=500",
+    )
+
+    if suggestion_type:
+        rows = [
+            r for r in rows
+            if suggestion_type.lower() in lori_route_scoring_clean(r.get("suggestion_type")).lower()
+        ]
+
+    if priority:
+        rows = [
+            r for r in rows
+            if lori_route_scoring_clean(r.get("priority")).lower() == priority.lower()
+        ]
+
+    return {
+        "status": "success",
+        "station_review_id": station_review_id,
+        "suggestions_count": len(rows[:limit]),
+        "suggestions": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/route-scoring-review-detail")
+async def route_scoring_review_detail(
+    api_key: Optional[str] = Query(None),
+    station_review_id: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not station_review_id:
+        latest_review = await lori_route_scoring_latest_review()
+        if latest_review:
+            station_review_id = str(latest_review.get("id"))
+
+    if not station_review_id:
+        return {
+            "status": "empty",
+            "message": "No station route scoring review found.",
+        }
+
+    reviews = await lori_route_scoring_get_rows(
+        "lori_route_station_reviews",
+        f"select=*&id=eq.{quote(station_review_id)}&limit=1",
+    )
+
+    if not reviews:
+        return {
+            "status": "not_found",
+            "message": "Station review not found.",
+            "station_review_id": station_review_id,
+        }
+
+    scorecards = await lori_route_scoring_get_rows(
+        "lori_route_driver_scorecards",
+        f"select=*&station_review_id=eq.{quote(station_review_id)}&order=utilization_percent.desc&limit=1000",
+    )
+
+    opportunities = await lori_route_scoring_get_rows(
+        "lori_route_rebalancing_opportunities",
+        f"select=*&station_review_id=eq.{quote(station_review_id)}&order=estimated_total_savings.desc&limit=500",
+    )
+
+    suggestions = await lori_route_scoring_get_rows(
+        "lori_route_station_suggestions",
+        f"select=*&station_review_id=eq.{quote(station_review_id)}&order=created_at.desc&limit=500",
+    )
+
+    return {
+        "status": "success",
+        "station_review": reviews[0],
+        "scorecards_count": len(scorecards),
+        "scorecards": scorecards,
+        "opportunities_count": len(opportunities),
+        "opportunities": opportunities,
+        "suggestions_count": len(suggestions),
+        "suggestions": suggestions,
+        "overutilized_drivers": [
+            r for r in scorecards
+            if lori_route_scoring_clean(r.get("workload_status")).lower() == "overutilized"
+        ],
+        "underutilized_drivers": [
+            r for r in scorecards
+            if lori_route_scoring_clean(r.get("workload_status")).lower() == "underutilized"
+        ],
+        "near_capacity_drivers": [
+            r for r in scorecards
+            if lori_route_scoring_clean(r.get("workload_status")).lower() == "near capacity"
+        ],
+    }
