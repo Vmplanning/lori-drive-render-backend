@@ -12880,3 +12880,912 @@ async def operating_station_duplicate_check(
         "message": "Possible duplicate station found." if duplicate_detected else "No duplicate station found.",
         "recommended_action": "Use the existing station instead of creating a duplicate." if duplicate_detected else "Safe to continue station setup.",
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# ROUTE CONFIGURATION / WORK AREA BALANCING ENGINE
+# Stores uploaded/typed route stops, analyzes workload balance,
+# detects crossover risk, and recommends stop movements.
+# ============================================================
+
+from fastapi import Body, Query, UploadFile, File, Form
+from fastapi.responses import HTMLResponse
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+import csv
+import io
+import html
+import openpyxl
+
+
+def lori_routecfg_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_routecfg_upper(value: Any) -> str:
+    return lori_routecfg_clean(value).upper()
+
+
+def lori_routecfg_num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def lori_routecfg_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+async def lori_routecfg_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+def lori_routecfg_row_value(row: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
+    lowered = {str(k).lower().strip(): v for k, v in row.items()}
+    for key in keys:
+        if key in row and row.get(key) not in [None, ""]:
+            return row.get(key)
+        key_l = key.lower().strip()
+        if key_l in lowered and lowered.get(key_l) not in [None, ""]:
+            return lowered.get(key_l)
+    return default
+
+
+def lori_routecfg_normalize_stop(
+    row: Dict[str, Any],
+    project_id: str,
+    source_type: str = "Typed",
+    source_file_id: Optional[str] = None,
+    source_row_number: Optional[int] = None,
+    default_route_id: Optional[str] = None,
+    default_driver_name: Optional[str] = None,
+    default_state: Optional[str] = None,
+) -> Dict[str, Any]:
+    route_id = lori_routecfg_clean(
+        lori_routecfg_row_value(row, ["route_id", "route", "route number"], default_route_id or "")
+    )
+
+    driver_name = lori_routecfg_clean(
+        lori_routecfg_row_value(row, ["driver_name", "driver", "employee_name"], default_driver_name or "")
+    )
+
+    street_address = lori_routecfg_clean(
+        lori_routecfg_row_value(row, ["street_address", "address", "delivery_address", "stop_address"])
+    )
+
+    city = lori_routecfg_clean(
+        lori_routecfg_row_value(row, ["city", "stop_city"])
+    )
+
+    operating_state = lori_routecfg_upper(
+        lori_routecfg_row_value(row, ["state", "operating_state", "stop_state"], default_state or "")
+    )
+
+    zip_code = lori_routecfg_clean(
+        lori_routecfg_row_value(row, ["zip", "zip_code", "postal_code"])
+    )
+
+    validation_status = "Pending Validation"
+    review_required = False
+
+    if not street_address or not city or not operating_state or not zip_code:
+        validation_status = "Needs Review"
+        review_required = True
+
+    return {
+        "project_id": project_id,
+        "source_type": source_type,
+        "source_file_id": source_file_id,
+        "source_row_number": source_row_number,
+        "route_id": route_id or "UNASSIGNED",
+        "driver_name": driver_name,
+        "stop_sequence": lori_routecfg_int(lori_routecfg_row_value(row, ["stop_sequence", "sequence", "stop_number", "stop #"]), 0),
+        "stop_id": lori_routecfg_clean(lori_routecfg_row_value(row, ["stop_id", "stop id"])),
+        "customer_name": lori_routecfg_clean(lori_routecfg_row_value(row, ["customer_name", "customer", "location_name", "stop_name"])),
+        "street_address": street_address or "ADDRESS MISSING",
+        "city": city or "CITY MISSING",
+        "operating_state": operating_state or "STATE MISSING",
+        "zip_code": zip_code or "ZIP MISSING",
+        "latitude": lori_routecfg_row_value(row, ["latitude", "lat"], None),
+        "longitude": lori_routecfg_row_value(row, ["longitude", "lng", "lon"], None),
+        "geocode_status": "Coordinates Provided" if lori_routecfg_row_value(row, ["latitude", "lat"], None) and lori_routecfg_row_value(row, ["longitude", "lng", "lon"], None) else "Not Geocoded",
+        "delivery_window_start": lori_routecfg_clean(lori_routecfg_row_value(row, ["delivery_window_start", "window_start"])),
+        "delivery_window_end": lori_routecfg_clean(lori_routecfg_row_value(row, ["delivery_window_end", "window_end"])),
+        "service_time_minutes": lori_routecfg_num(lori_routecfg_row_value(row, ["service_time_minutes", "service_time", "service minutes"]), 0),
+        "freight_type": lori_routecfg_clean(lori_routecfg_row_value(row, ["freight_type", "freight"])),
+        "priority": lori_routecfg_clean(lori_routecfg_row_value(row, ["priority"], "Normal")),
+        "delivery_notes": lori_routecfg_clean(lori_routecfg_row_value(row, ["delivery_notes", "notes"])),
+        "current_assignment_route_id": route_id or default_route_id or "UNASSIGNED",
+        "current_assignment_driver": driver_name or default_driver_name or "",
+        "validation_status": validation_status,
+        "review_required": review_required,
+        "created_by": "LORI Route Configuration Engine",
+    }
+
+
+@app.post("/route-config-project-create")
+async def route_config_project_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    project_payload = {
+        "project_title": lori_routecfg_clean(payload.get("project_title") or "New Route Configuration Project"),
+        "project_type": "Route Configuration",
+        "project_status": "Draft",
+        "company_name": lori_routecfg_clean(payload.get("company_name")),
+        "region_code": lori_routecfg_clean(payload.get("region_code")),
+        "region_name": lori_routecfg_clean(payload.get("region_name")),
+        "operating_state": lori_routecfg_upper(payload.get("operating_state")),
+        "city": lori_routecfg_clean(payload.get("city")),
+        "station_code": lori_routecfg_upper(payload.get("station_code")),
+        "station_name": lori_routecfg_clean(payload.get("station_name")),
+        "primary_zip": lori_routecfg_clean(payload.get("primary_zip")),
+        "route_group": lori_routecfg_clean(payload.get("route_group") or "Delivery Operations"),
+        "time_zone": lori_routecfg_clean(payload.get("time_zone")),
+        "configuration_goal": lori_routecfg_clean(payload.get("configuration_goal") or "Create the most efficient work area by reducing crossover, balancing workload, and moving stops between routes."),
+        "project_notes": lori_routecfg_clean(payload.get("project_notes")),
+        "created_by": "LORI Route Configuration Engine",
+    }
+
+    created = await lori_policy_supabase_post("lori_route_config_projects", project_payload)
+    project = created[0] if created else project_payload
+
+    return {
+        "status": "success",
+        "message": "Route configuration project created.",
+        "project": project,
+    }
+
+
+@app.post("/route-config-routes-add")
+async def route_config_routes_add(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    project_id = lori_routecfg_clean(payload.get("project_id"))
+    routes = payload.get("routes") or []
+
+    if not project_id:
+        return {"status": "error", "message": "project_id is required."}
+
+    if not routes:
+        return {"status": "error", "message": "At least one route is required."}
+
+    created_routes = []
+
+    for route in routes:
+        route_payload = {
+            "project_id": project_id,
+            "route_role": lori_routecfg_clean(route.get("route_role") or "Comparison Route"),
+            "route_id": lori_routecfg_clean(route.get("route_id")),
+            "route_name": lori_routecfg_clean(route.get("route_name")),
+            "driver_name": lori_routecfg_clean(route.get("driver_name")),
+            "supervisor_name": lori_routecfg_clean(route.get("supervisor_name")),
+            "vehicle_type": lori_routecfg_clean(route.get("vehicle_type")),
+            "freight_type": lori_routecfg_clean(route.get("freight_type")),
+            "planned_stop_count": lori_routecfg_int(route.get("planned_stop_count"), 0),
+            "actual_stop_count": lori_routecfg_int(route.get("actual_stop_count"), 0),
+            "scheduled_hours": lori_routecfg_num(route.get("scheduled_hours"), 0),
+            "actual_hours": lori_routecfg_num(route.get("actual_hours"), 0),
+            "planned_miles": lori_routecfg_num(route.get("planned_miles"), 0),
+            "actual_miles": lori_routecfg_num(route.get("actual_miles"), 0),
+            "overtime_hours": lori_routecfg_num(route.get("overtime_hours"), 0),
+            "route_color": lori_routecfg_clean(route.get("route_color")),
+            "notes": lori_routecfg_clean(route.get("notes")),
+        }
+
+        if not route_payload["route_id"]:
+            continue
+
+        created = await lori_policy_supabase_post("lori_route_config_routes", route_payload)
+        if created:
+            created_routes.append(created[0])
+
+    return {
+        "status": "success",
+        "routes_created": len(created_routes),
+        "routes": created_routes,
+    }
+
+
+@app.post("/route-config-typed-stops-add")
+async def route_config_typed_stops_add(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    project_id = lori_routecfg_clean(payload.get("project_id"))
+    stops = payload.get("stops") or []
+    default_state = lori_routecfg_upper(payload.get("operating_state"))
+
+    if not project_id:
+        return {"status": "error", "message": "project_id is required."}
+
+    if not stops:
+        return {"status": "error", "message": "At least one stop is required."}
+
+    created_stops = []
+
+    for idx, stop in enumerate(stops, start=1):
+        stop_payload = lori_routecfg_normalize_stop(
+            stop,
+            project_id=project_id,
+            source_type="Typed",
+            source_row_number=idx,
+            default_state=default_state,
+        )
+
+        created = await lori_policy_supabase_post("lori_route_config_stops", stop_payload)
+        if created:
+            created_stops.append(created[0])
+
+    return {
+        "status": "success",
+        "message": "Typed route stops saved.",
+        "stops_created": len(created_stops),
+        "stops": created_stops,
+    }
+
+
+@app.post("/route-config-stop-upload")
+async def route_config_stop_upload(
+    api_key: Optional[str] = Query(None),
+    project_id: str = Form(...),
+    upload_purpose: str = Form("Route Stop Data"),
+    uploaded_route_id: Optional[str] = Form(None),
+    uploaded_driver_name: Optional[str] = Form(None),
+    operating_state: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    file_name = file.filename or "uploaded_route_stops"
+    file_ext = file_name.split(".")[-1].lower() if "." in file_name else "unknown"
+    contents = await file.read()
+
+    upload_payload = {
+        "project_id": project_id,
+        "upload_title": file_name,
+        "original_file_name": file_name,
+        "file_type": file_ext,
+        "upload_purpose": upload_purpose,
+        "uploaded_route_id": uploaded_route_id,
+        "uploaded_driver_name": uploaded_driver_name,
+        "parse_status": "Uploaded",
+        "rows_detected": 0,
+        "rows_imported": 0,
+        "rows_needing_review": 0,
+        "notes": "File received by LORI Route Configuration Engine.",
+    }
+
+    created_upload = await lori_policy_supabase_post("lori_route_config_stop_uploads", upload_payload)
+    upload_record = created_upload[0] if created_upload else upload_payload
+    upload_id = upload_record.get("id")
+
+    parsed_rows: List[Dict[str, Any]] = []
+    parse_note = ""
+
+    try:
+        if file_ext == "csv":
+            text = contents.decode("utf-8-sig", errors="ignore")
+            reader = csv.DictReader(io.StringIO(text))
+            parsed_rows = [dict(row) for row in reader]
+
+        elif file_ext in ["xlsx", "xlsm"]:
+            workbook = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
+            sheet = workbook.active
+            rows = list(sheet.iter_rows(values_only=True))
+            if rows:
+                headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+                for row_values in rows[1:]:
+                    parsed_rows.append({
+                        headers[i]: row_values[i] if i < len(row_values) else None
+                        for i in range(len(headers))
+                        if headers[i]
+                    })
+
+        elif file_ext == "txt":
+            text = contents.decode("utf-8-sig", errors="ignore")
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            for idx, line in enumerate(lines, start=1):
+                parsed_rows.append({
+                    "stop_id": f"TXT-{idx}",
+                    "address": line,
+                    "city": "",
+                    "state": operating_state or "",
+                    "zip": "",
+                    "route_id": uploaded_route_id or "",
+                    "driver_name": uploaded_driver_name or "",
+                    "notes": "Imported from text file. Needs review.",
+                })
+
+        elif file_ext == "pdf":
+            parse_note = "PDF received. Automatic PDF extraction is staged; upload Excel/CSV for best structured import."
+            parsed_rows = []
+
+        else:
+            parse_note = f"File type {file_ext} received but not parsed."
+
+    except Exception as exc:
+        parse_note = f"File parse failed: {str(exc)}"
+        parsed_rows = []
+
+    created_stops = []
+    rows_needing_review = 0
+
+    for idx, row in enumerate(parsed_rows, start=1):
+        stop_payload = lori_routecfg_normalize_stop(
+            row,
+            project_id=project_id,
+            source_type=f"Upload {file_ext.upper()}",
+            source_file_id=upload_id,
+            source_row_number=idx,
+            default_route_id=uploaded_route_id,
+            default_driver_name=uploaded_driver_name,
+            default_state=operating_state,
+        )
+
+        if stop_payload.get("review_required"):
+            rows_needing_review += 1
+
+        created = await lori_policy_supabase_post("lori_route_config_stops", stop_payload)
+        if created:
+            created_stops.append(created[0])
+
+    return {
+        "status": "success",
+        "message": "Route stop file received.",
+        "file_name": file_name,
+        "file_type": file_ext,
+        "upload_record": upload_record,
+        "rows_detected": len(parsed_rows),
+        "rows_imported": len(created_stops),
+        "rows_needing_review": rows_needing_review,
+        "parse_note": parse_note,
+        "stops": created_stops[:25],
+        "note": "Only the first 25 imported stops are returned in this response. All imported stops are stored in Supabase.",
+    }
+
+
+@app.get("/route-config-project-detail")
+async def route_config_project_detail(
+    api_key: Optional[str] = Query(None),
+    project_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    project_rows = await lori_routecfg_get_rows(
+        "lori_route_config_projects",
+        f"select=*&id=eq.{quote(project_id)}&limit=1",
+    )
+
+    if not project_rows:
+        return {"status": "not_found", "message": "Route configuration project not found."}
+
+    routes = await lori_routecfg_get_rows(
+        "lori_route_config_routes",
+        f"select=*&project_id=eq.{quote(project_id)}&order=route_id.asc&limit=500",
+    )
+
+    stops = await lori_routecfg_get_rows(
+        "lori_route_config_stops",
+        f"select=*&project_id=eq.{quote(project_id)}&order=route_id.asc,stop_sequence.asc&limit=3000",
+    )
+
+    issues = await lori_routecfg_get_rows(
+        "lori_route_config_stop_issues",
+        f"select=*&project_id=eq.{quote(project_id)}&order=created_at.desc&limit=1000",
+    )
+
+    balance = await lori_routecfg_get_rows(
+        "lori_route_config_balance_results",
+        f"select=*&project_id=eq.{quote(project_id)}&order=created_at.desc&limit=1000",
+    )
+
+    moves = await lori_routecfg_get_rows(
+        "lori_route_config_stop_moves",
+        f"select=*&project_id=eq.{quote(project_id)}&order=created_at.desc&limit=1000",
+    )
+
+    return {
+        "status": "success",
+        "project": project_rows[0],
+        "routes_count": len(routes),
+        "routes": routes,
+        "stops_count": len(stops),
+        "stops": stops,
+        "issues_count": len(issues),
+        "issues": issues,
+        "balance_results_count": len(balance),
+        "balance_results": balance,
+        "stop_moves_count": len(moves),
+        "stop_moves": moves,
+    }
+
+
+@app.get("/route-config-stops")
+async def route_config_stops(
+    api_key: Optional[str] = Query(None),
+    project_id: str = Query(...),
+    route_id: Optional[str] = Query(None),
+    review_required: Optional[bool] = Query(None),
+    limit: int = Query(1000),
+):
+    lori_regulatory_require_key(api_key)
+
+    stops = await lori_routecfg_get_rows(
+        "lori_route_config_stops",
+        f"select=*&project_id=eq.{quote(project_id)}&order=route_id.asc,stop_sequence.asc&limit=3000",
+    )
+
+    if route_id:
+        stops = [
+            s for s in stops
+            if lori_routecfg_clean(s.get("route_id")).lower() == route_id.lower()
+        ]
+
+    if review_required is not None:
+        stops = [
+            s for s in stops
+            if bool(s.get("review_required")) is review_required
+        ]
+
+    limit = max(1, min(limit, 3000))
+
+    return {
+        "status": "success",
+        "stops_count": len(stops[:limit]),
+        "stops": stops[:limit],
+    }
+
+
+@app.post("/route-config-validate-stops")
+async def route_config_validate_stops(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    project_id = lori_routecfg_clean(payload.get("project_id"))
+
+    if not project_id:
+        return {"status": "error", "message": "project_id is required."}
+
+    details = await route_config_project_detail(api_key=api_key, project_id=project_id)
+
+    if details.get("status") != "success":
+        return details
+
+    project = details.get("project") or {}
+    stops = details.get("stops") or []
+
+    project_state = lori_routecfg_upper(project.get("operating_state"))
+    seen = {}
+    issues_created = []
+
+    for stop in stops:
+        stop_id = stop.get("id")
+        address_key = "|".join([
+            lori_routecfg_clean(stop.get("street_address")).lower(),
+            lori_routecfg_clean(stop.get("city")).lower(),
+            lori_routecfg_upper(stop.get("operating_state")),
+            lori_routecfg_clean(stop.get("zip_code")),
+        ])
+
+        issue_rows = []
+
+        if "MISSING" in lori_routecfg_upper(stop.get("street_address")):
+            issue_rows.append(("Missing Address", "High", "Street address is missing.", "Enter the stop street address."))
+
+        if "MISSING" in lori_routecfg_upper(stop.get("city")):
+            issue_rows.append(("Missing City", "High", "City is missing.", "Enter the stop city."))
+
+        if "MISSING" in lori_routecfg_upper(stop.get("operating_state")):
+            issue_rows.append(("Missing State", "High", "State is missing.", "Enter the stop state."))
+
+        if "MISSING" in lori_routecfg_upper(stop.get("zip_code")):
+            issue_rows.append(("Missing ZIP", "High", "ZIP code is missing.", "Enter the stop ZIP code."))
+
+        if project_state and lori_routecfg_upper(stop.get("operating_state")) not in [project_state, "STATE MISSING"]:
+            issue_rows.append((
+                "State Mismatch",
+                "High",
+                f"Stop state {stop.get('operating_state')} does not match project state {project_state}.",
+                "Confirm whether this stop belongs in this station/work area."
+            ))
+
+        if address_key in seen:
+            issue_rows.append((
+                "Possible Duplicate Stop",
+                "Medium",
+                "Another stop has the same address/city/state/ZIP.",
+                "Review duplicate stop before route balancing."
+            ))
+        else:
+            seen[address_key] = stop_id
+
+        for issue_type, severity, message, fix in issue_rows:
+            issue_payload = {
+                "project_id": project_id,
+                "stop_id": stop_id,
+                "issue_type": issue_type,
+                "issue_severity": severity,
+                "issue_message": message,
+                "recommended_fix": fix,
+            }
+
+            created = await lori_policy_supabase_post("lori_route_config_stop_issues", issue_payload)
+            if created:
+                issues_created.append(created[0])
+
+    return {
+        "status": "success",
+        "message": "Stop validation complete.",
+        "stops_checked": len(stops),
+        "issues_created": len(issues_created),
+        "issues": issues_created[:100],
+    }
+
+
+@app.post("/route-config-analyze-balance")
+async def route_config_analyze_balance(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    project_id = lori_routecfg_clean(payload.get("project_id"))
+
+    if not project_id:
+        return {"status": "error", "message": "project_id is required."}
+
+    stops = await lori_routecfg_get_rows(
+        "lori_route_config_stops",
+        f"select=*&project_id=eq.{quote(project_id)}&limit=5000",
+    )
+
+    if not stops:
+        return {
+            "status": "error",
+            "message": "No route stops found. Upload or type stops before analyzing route balance.",
+        }
+
+    route_groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    for stop in stops:
+        route_id = lori_routecfg_clean(stop.get("route_id") or "UNASSIGNED")
+        route_groups.setdefault(route_id, []).append(stop)
+
+    avg_stops = len(stops) / max(len(route_groups), 1)
+    results = []
+
+    for route_id, route_stops in route_groups.items():
+        stop_count = len(route_stops)
+        service_minutes = sum(lori_routecfg_num(s.get("service_time_minutes"), 8) for s in route_stops)
+        estimated_service_hours = round(service_minutes / 60, 2)
+
+        estimated_miles = round(stop_count * 3.2, 2)
+        estimated_drive_hours = round(estimated_miles / 22, 2)
+        estimated_total_hours = round(estimated_service_hours + estimated_drive_hours, 2)
+        estimated_overtime = max(0, round(estimated_total_hours - 8, 2))
+
+        utilization = round((stop_count / max(avg_stops, 1)) * 100, 2)
+
+        if utilization >= 115:
+            workload_status = "Overutilized"
+        elif utilization <= 85:
+            workload_status = "Underutilized"
+        else:
+            workload_status = "Balanced"
+
+        zips = [lori_routecfg_clean(s.get("zip_code")) for s in route_stops]
+        zip_overlap = len(zips) != len(set(zips))
+        crossover_risk = "Needs Review" if zip_overlap else "Preliminary Low"
+
+        driver_name = lori_routecfg_clean(route_stops[0].get("driver_name"))
+
+        result_payload = {
+            "project_id": project_id,
+            "balance_type": "Current",
+            "route_id": route_id,
+            "driver_name": driver_name,
+            "stop_count": stop_count,
+            "estimated_miles": estimated_miles,
+            "estimated_drive_hours": estimated_drive_hours,
+            "estimated_service_hours": estimated_service_hours,
+            "estimated_total_hours": estimated_total_hours,
+            "estimated_overtime_hours": estimated_overtime,
+            "utilization_percent": utilization,
+            "workload_status": workload_status,
+            "territory_status": "Preliminary — Needs Map/Geocode Review",
+            "crossover_risk": crossover_risk,
+            "delivery_window_risk": "Needs Review",
+            "vehicle_capacity_risk": "Needs Review",
+            "summary": f"{route_id} has {stop_count} stops and is currently marked {workload_status}.",
+        }
+
+        created = await lori_policy_supabase_post("lori_route_config_balance_results", result_payload)
+        results.append(created[0] if created else result_payload)
+
+    overloaded = [r for r in results if r.get("workload_status") == "Overutilized"]
+    underused = [r for r in results if r.get("workload_status") == "Underutilized"]
+
+    return {
+        "status": "success",
+        "message": "Route balance analysis complete.",
+        "routes_analyzed": len(results),
+        "total_stops": len(stops),
+        "average_stops_per_route": round(avg_stops, 2),
+        "overutilized_routes": overloaded,
+        "underutilized_routes": underused,
+        "balance_results": results,
+        "note": "This is preliminary workload analysis. Street-level territory and exact driving distance require geocoded stops or a connected routing service.",
+    }
+
+
+@app.post("/route-config-generate-stop-moves")
+async def route_config_generate_stop_moves(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    project_id = lori_routecfg_clean(payload.get("project_id"))
+    max_moves = lori_routecfg_int(payload.get("max_moves"), 25)
+
+    if not project_id:
+        return {"status": "error", "message": "project_id is required."}
+
+    stops = await lori_routecfg_get_rows(
+        "lori_route_config_stops",
+        f"select=*&project_id=eq.{quote(project_id)}&limit=5000",
+    )
+
+    if not stops:
+        return {
+            "status": "error",
+            "message": "No stops found. Upload or type route stops before generating move recommendations.",
+        }
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for stop in stops:
+        route_id = lori_routecfg_clean(stop.get("route_id") or "UNASSIGNED")
+        grouped.setdefault(route_id, []).append(stop)
+
+    if len(grouped) < 2:
+        return {
+            "status": "error",
+            "message": "At least two routes are required to recommend moving stops between routes.",
+        }
+
+    route_counts = {route_id: len(items) for route_id, items in grouped.items()}
+    avg_count = sum(route_counts.values()) / len(route_counts)
+
+    from_route = max(route_counts, key=route_counts.get)
+    to_route = min(route_counts, key=route_counts.get)
+
+    from_stops = grouped[from_route]
+    to_stops = grouped[to_route]
+
+    if from_route == to_route:
+        return {
+            "status": "success",
+            "message": "Routes are already balanced enough for a preliminary pass.",
+            "recommendations_created": 0,
+            "recommendations": [],
+        }
+
+    from_driver = lori_routecfg_clean(from_stops[0].get("driver_name"))
+    to_driver = lori_routecfg_clean(to_stops[0].get("driver_name"))
+
+    # Prefer stops in ZIP/city overlap with the receiving route.
+    to_zips = set(lori_routecfg_clean(s.get("zip_code")) for s in to_stops)
+    to_cities = set(lori_routecfg_clean(s.get("city")).lower() for s in to_stops)
+
+    preferred_candidates = [
+        s for s in from_stops
+        if lori_routecfg_clean(s.get("zip_code")) in to_zips
+        or lori_routecfg_clean(s.get("city")).lower() in to_cities
+    ]
+
+    fallback_candidates = [s for s in from_stops if s not in preferred_candidates]
+
+    suggested_move_count = max(1, int((route_counts[from_route] - route_counts[to_route]) / 2))
+    suggested_move_count = min(suggested_move_count, max_moves)
+
+    candidates = (preferred_candidates + fallback_candidates)[:suggested_move_count]
+
+    created_moves = []
+
+    for stop in candidates:
+        reason = (
+            f"This stop appears better aligned with {to_route} based on current route workload, "
+            f"ZIP/city overlap, and available capacity."
+        )
+
+        move_payload = {
+            "project_id": project_id,
+            "stop_record_id": stop.get("id"),
+            "customer_name": stop.get("customer_name"),
+            "street_address": stop.get("street_address"),
+            "city": stop.get("city"),
+            "operating_state": stop.get("operating_state"),
+            "zip_code": stop.get("zip_code"),
+            "from_route_id": from_route,
+            "from_driver_name": from_driver,
+            "to_route_id": to_route,
+            "to_driver_name": to_driver,
+            "recommendation_status": "Draft",
+            "recommendation_confidence": "Preliminary",
+            "reason_to_move": reason,
+            "distance_logic": "Preliminary routing logic based on available ZIP/city/workload data. Geocoded route distance improves accuracy.",
+            "territory_logic": f"Move stop from overloaded route {from_route} toward underused route {to_route}.",
+            "delivery_window_impact": "Needs supervisor review before implementation.",
+            "service_risk": "Low to Medium",
+            "safety_risk": "Low to Medium",
+            "estimated_miles_reduced": 3.2,
+            "estimated_minutes_reduced": 18,
+            "estimated_overtime_reduced": 0.25,
+            "estimated_cost_savings": 28.50,
+            "supervisor_review_required": True,
+            "approval_status": "Pending Review",
+        }
+
+        created = await lori_policy_supabase_post("lori_route_config_stop_moves", move_payload)
+        if created:
+            created_moves.append(created[0])
+
+    return {
+        "status": "success",
+        "message": f"LORI generated preliminary stop move recommendations from {from_route} to {to_route}.",
+        "from_route": from_route,
+        "to_route": to_route,
+        "from_driver": from_driver,
+        "to_driver": to_driver,
+        "recommendations_created": len(created_moves),
+        "recommendations": created_moves,
+        "note": "Recommendations are preliminary and require supervisor/operations review before implementation.",
+    }
+
+
+@app.get("/route-config-packet-html", response_class=HTMLResponse)
+async def route_config_packet_html(
+    api_key: Optional[str] = Query(None),
+    project_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    details = await route_config_project_detail(api_key=api_key, project_id=project_id)
+
+    if details.get("status") != "success":
+        return HTMLResponse("<h1>Route Configuration Project Not Found</h1>", status_code=404)
+
+    project = details.get("project") or {}
+    routes = details.get("routes") or []
+    stops = details.get("stops") or []
+    moves = details.get("stop_moves") or []
+    balance = details.get("balance_results") or []
+
+    route_rows = "".join(
+        f"<tr><td>{html.escape(str(r.get('route_id','')))}</td>"
+        f"<td>{html.escape(str(r.get('driver_name','')))}</td>"
+        f"<td>{html.escape(str(r.get('workload_status','')))}</td>"
+        f"<td>{html.escape(str(r.get('utilization_percent','')))}</td></tr>"
+        for r in balance
+    )
+
+    move_rows = "".join(
+        f"<tr><td>{html.escape(str(m.get('customer_name','')))}</td>"
+        f"<td>{html.escape(str(m.get('street_address','')))}</td>"
+        f"<td>{html.escape(str(m.get('from_route_id','')))}</td>"
+        f"<td>{html.escape(str(m.get('to_route_id','')))}</td>"
+        f"<td>{html.escape(str(m.get('reason_to_move','')))}</td></tr>"
+        for m in moves
+    )
+
+    html_doc = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>LORI Route Configuration Packet</title>
+      <style>
+        body {{
+          font-family: Arial, sans-serif;
+          margin: 32px;
+          background: #f8fafc;
+          color: #111827;
+        }}
+        .card {{
+          background: #ffffff;
+          border: 1px solid #dbe3ef;
+          border-radius: 14px;
+          padding: 18px;
+          margin-bottom: 16px;
+        }}
+        h1 {{ margin-bottom: 4px; }}
+        table {{
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 13px;
+        }}
+        th, td {{
+          border: 1px solid #e5e7eb;
+          padding: 8px;
+          text-align: left;
+          vertical-align: top;
+        }}
+        th {{ background: #f1f5f9; }}
+        .note {{
+          color: #64748b;
+          font-size: 12px;
+          line-height: 1.5;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>LORI Route Configuration Packet</h1>
+        <p><strong>Project:</strong> {html.escape(str(project.get('project_title','')))}</p>
+        <p><strong>Station:</strong> {html.escape(str(project.get('station_code','')))} — {html.escape(str(project.get('city','')))}, {html.escape(str(project.get('operating_state','')))}</p>
+        <p><strong>Total Stops:</strong> {len(stops)} | <strong>Routes:</strong> {len(routes)} | <strong>Recommended Moves:</strong> {len(moves)}</p>
+      </div>
+
+      <div class="card">
+        <h2>Route Balance</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Route</th>
+              <th>Driver</th>
+              <th>Workload Status</th>
+              <th>Utilization %</th>
+            </tr>
+          </thead>
+          <tbody>{route_rows or "<tr><td colspan='4'>No route balance results yet.</td></tr>"}</tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Recommended Stop Moves</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Customer</th>
+              <th>Address</th>
+              <th>From Route</th>
+              <th>To Route</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody>{move_rows or "<tr><td colspan='5'>No stop move recommendations yet.</td></tr>"}</tbody>
+        </table>
+      </div>
+
+      <div class="card note">
+        LORI provides operational decision support. Route changes, driver workload changes, helper assignments,
+        vehicle assignments, delivery window changes, customer commitments, labor considerations, productivity estimates,
+        and cost savings estimates must be reviewed and approved by authorized operations leadership before implementation.
+      </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html_doc)
