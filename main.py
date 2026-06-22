@@ -13789,3 +13789,615 @@ async def route_config_packet_html(
     """
 
     return HTMLResponse(content=html_doc)
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# USER ROLES + STATION PERMISSIONS ACCESS ENGINE
+# Controls user profile, allowed stations, module access, and
+# permission checks for nationwide multi-station operations.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+
+
+def lori_access_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_access_upper(value: Any) -> str:
+    return lori_access_clean(value).upper()
+
+
+def lori_access_email(value: Any) -> str:
+    return lori_access_clean(value).lower()
+
+
+async def lori_access_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_access_log_event(
+    user_profile_id: Optional[str],
+    action_type: str,
+    module_name: Optional[str] = None,
+    company_name: Optional[str] = None,
+    region_name: Optional[str] = None,
+    operating_state: Optional[str] = None,
+    station_code: Optional[str] = None,
+    route_group: Optional[str] = None,
+    access_result: Optional[str] = None,
+    reason: Optional[str] = None,
+    request_context: Optional[Dict[str, Any]] = None,
+):
+    payload = {
+        "user_profile_id": user_profile_id,
+        "action_type": action_type,
+        "module_name": module_name,
+        "company_name": company_name,
+        "region_name": region_name,
+        "operating_state": operating_state,
+        "station_code": station_code,
+        "route_group": route_group,
+        "access_result": access_result,
+        "reason": reason,
+        "request_context": request_context or {},
+    }
+
+    try:
+        await lori_policy_supabase_post("lori_access_audit_log", payload)
+    except Exception:
+        pass
+
+
+def lori_access_module_to_view_field(module_name: str) -> str:
+    module = lori_access_clean(module_name).lower()
+
+    if "dashboard" in module or "leadership" in module:
+        return "can_view_dashboard"
+    if "report" in module:
+        return "can_view_reports"
+    if "driver" in module:
+        return "can_view_driver_360"
+    if "route" in module:
+        return "can_view_route_configuration"
+    if "data" in module or "intake" in module or "document" in module:
+        return "can_view_data_intake"
+    if "action" in module:
+        return "can_view_action_center"
+    if "kpi" in module:
+        return "can_view_kpi_plans"
+    if "compliance" in module or "policy" in module or "contract" in module or "labor" in module:
+        return "can_view_compliance"
+    if "regulatory" in module:
+        return "can_view_regulatory"
+    if "push" in module or "notification" in module:
+        return "can_view_push_notifications"
+    if "sop" in module:
+        return "can_view_sop_builder"
+    if "ask" in module or "lori" in module:
+        return "can_view_ask_lori"
+
+    return "can_view_dashboard"
+
+
+def lori_access_action_to_field(action: str, module_name: str = "") -> str:
+    action_clean = lori_access_clean(action).lower()
+
+    if action_clean in ["view", "read", "open"]:
+        return lori_access_module_to_view_field(module_name)
+    if action_clean in ["upload", "create_upload", "document_upload"]:
+        return "can_upload_documents"
+    if action_clean in ["send", "send_notification", "message"]:
+        return "can_send_notifications"
+    if action_clean in ["create_action", "action_item"]:
+        return "can_create_action_items"
+    if action_clean in ["approve", "approve_route_change", "final_approval"]:
+        return "can_approve_route_changes"
+    if action_clean in ["manage_context", "change_context"]:
+        return "can_manage_station_context"
+    if action_clean in ["manage_users", "admin_users"]:
+        return "can_manage_users"
+
+    return lori_access_module_to_view_field(module_name)
+
+
+async def lori_access_get_user_bundle(email: str) -> Dict[str, Any]:
+    email_clean = lori_access_email(email)
+
+    users = await lori_access_get_rows(
+        "lori_user_profiles",
+        f"select=*&email=eq.{quote(email_clean)}&limit=1",
+    )
+
+    if not users:
+        return {
+            "found": False,
+            "user": None,
+            "roles": [],
+            "station_access": [],
+            "module_access": [],
+        }
+
+    user = users[0]
+    user_id = user.get("id")
+
+    assignments = await lori_access_get_rows(
+        "lori_user_role_assignments",
+        f"select=*&user_profile_id=eq.{quote(str(user_id))}&assignment_status=eq.Active&limit=500",
+    )
+
+    roles = []
+    for assignment in assignments:
+        role_id = assignment.get("role_id")
+        if not role_id:
+            continue
+
+        role_rows = await lori_access_get_rows(
+            "lori_roles",
+            f"select=*&id=eq.{quote(str(role_id))}&limit=1",
+        )
+
+        if role_rows:
+            roles.append(role_rows[0])
+
+    station_access = await lori_access_get_rows(
+        "lori_user_station_access",
+        f"select=*&user_profile_id=eq.{quote(str(user_id))}&access_status=eq.Active&limit=1000",
+    )
+
+    module_access = await lori_access_get_rows(
+        "lori_user_module_access",
+        f"select=*&user_profile_id=eq.{quote(str(user_id))}&access_status=eq.Active&limit=1000",
+    )
+
+    return {
+        "found": True,
+        "user": user,
+        "roles": roles,
+        "station_access": station_access,
+        "module_access": module_access,
+    }
+
+
+def lori_access_station_allowed(
+    user: Dict[str, Any],
+    station_access: List[Dict[str, Any]],
+    requested_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    requested_company = lori_access_clean(requested_context.get("company_name"))
+    requested_region = lori_access_upper(requested_context.get("region_code"))
+    requested_region_name = lori_access_clean(requested_context.get("region_name"))
+    requested_state = lori_access_upper(requested_context.get("operating_state"))
+    requested_station = lori_access_upper(requested_context.get("station_code"))
+
+    if user.get("can_view_national") or user.get("can_view_all_companies"):
+        return {
+            "allowed": True,
+            "scope": "National",
+            "reason": "User has national or all-company access.",
+            "matched_access": None,
+        }
+
+    for access in station_access:
+        scope = lori_access_clean(access.get("access_scope")).lower()
+
+        access_company = lori_access_clean(access.get("company_name"))
+        access_region = lori_access_upper(access.get("region_code"))
+        access_region_name = lori_access_clean(access.get("region_name"))
+        access_state = lori_access_upper(access.get("operating_state"))
+        access_station = lori_access_upper(access.get("station_code"))
+
+        if not access.get("can_view"):
+            continue
+
+        if scope == "national":
+            return {
+                "allowed": True,
+                "scope": "National",
+                "reason": "User has national access record.",
+                "matched_access": access,
+            }
+
+        if scope == "region":
+            company_match = not requested_company or access_company.lower() == requested_company.lower()
+            region_match = (
+                requested_region and access_region and requested_region == access_region
+            ) or (
+                requested_region_name and access_region_name and requested_region_name.lower() == access_region_name.lower()
+            )
+
+            if company_match and region_match:
+                return {
+                    "allowed": True,
+                    "scope": "Region",
+                    "reason": "User has regional access for this context.",
+                    "matched_access": access,
+                }
+
+        if scope == "state":
+            company_match = not requested_company or access_company.lower() == requested_company.lower()
+            state_match = requested_state and access_state and requested_state == access_state
+
+            if company_match and state_match:
+                return {
+                    "allowed": True,
+                    "scope": "State",
+                    "reason": "User has state-level access for this context.",
+                    "matched_access": access,
+                }
+
+        if scope == "station":
+            company_match = not requested_company or access_company.lower() == requested_company.lower()
+            station_match = requested_station and access_station and requested_station == access_station
+
+            if company_match and station_match:
+                return {
+                    "allowed": True,
+                    "scope": "Station",
+                    "reason": "User has station access for this context.",
+                    "matched_access": access,
+                }
+
+    return {
+        "allowed": False,
+        "scope": "None",
+        "reason": "User does not have access to this station, state, region, or company context.",
+        "matched_access": None,
+    }
+
+
+def lori_access_module_allowed(
+    roles: List[Dict[str, Any]],
+    module_access: List[Dict[str, Any]],
+    module_name: str,
+    action: str = "view",
+) -> Dict[str, Any]:
+    module_name_clean = lori_access_clean(module_name)
+    action_field = lori_access_action_to_field(action, module_name_clean)
+
+    for override in module_access:
+        if lori_access_clean(override.get("module_name")).lower() == module_name_clean.lower():
+            if action.lower() in ["view", "read", "open"] and override.get("can_view"):
+                return {
+                    "allowed": True,
+                    "source": "Module Override",
+                    "reason": "User has module-specific view access.",
+                    "field_checked": "can_view",
+                }
+
+            if action.lower() in ["create", "add"] and override.get("can_create"):
+                return {
+                    "allowed": True,
+                    "source": "Module Override",
+                    "reason": "User has module-specific create access.",
+                    "field_checked": "can_create",
+                }
+
+            if action.lower() in ["edit", "update"] and override.get("can_edit"):
+                return {
+                    "allowed": True,
+                    "source": "Module Override",
+                    "reason": "User has module-specific edit access.",
+                    "field_checked": "can_edit",
+                }
+
+            if action.lower() in ["approve", "final_approval"] and override.get("can_approve"):
+                return {
+                    "allowed": True,
+                    "source": "Module Override",
+                    "reason": "User has module-specific approval access.",
+                    "field_checked": "can_approve",
+                }
+
+            if action.lower() in ["export", "download"] and override.get("can_export"):
+                return {
+                    "allowed": True,
+                    "source": "Module Override",
+                    "reason": "User has module-specific export access.",
+                    "field_checked": "can_export",
+                }
+
+    for role in roles:
+        if role.get(action_field):
+            return {
+                "allowed": True,
+                "source": "Role",
+                "reason": f"Role {role.get('role_name')} allows this action.",
+                "role": role,
+                "field_checked": action_field,
+            }
+
+    return {
+        "allowed": False,
+        "source": "Role",
+        "reason": f"No assigned role allows {action_field}.",
+        "field_checked": action_field,
+    }
+
+
+@app.get("/user-access-profile")
+async def user_access_profile(
+    api_key: Optional[str] = Query(None),
+    email: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    bundle = await lori_access_get_user_bundle(email)
+
+    if not bundle["found"]:
+        return {
+            "status": "not_found",
+            "message": "User profile was not found in LORI access control.",
+            "email": email,
+        }
+
+    user = bundle["user"]
+
+    await lori_access_log_event(
+        user_profile_id=user.get("id"),
+        action_type="User Access Profile Viewed",
+        access_result="Allowed",
+        reason="Profile lookup completed.",
+        request_context={"email": email},
+    )
+
+    return {
+        "status": "success",
+        "user": user,
+        "roles": bundle["roles"],
+        "station_access": bundle["station_access"],
+        "module_access": bundle["module_access"],
+        "default_context": {
+            "company_name": user.get("company_name"),
+            "region_code": user.get("default_region_code"),
+            "region_name": user.get("default_region_name"),
+            "operating_state": user.get("default_operating_state"),
+            "station_code": user.get("default_station_code"),
+            "station_name": user.get("default_station_name"),
+            "city": user.get("default_city"),
+            "route_group": user.get("default_route_group"),
+        },
+        "message": "User access profile loaded.",
+    }
+
+
+@app.get("/user-allowed-stations")
+async def user_allowed_stations(
+    api_key: Optional[str] = Query(None),
+    email: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    bundle = await lori_access_get_user_bundle(email)
+
+    if not bundle["found"]:
+        return {
+            "status": "not_found",
+            "message": "User profile was not found.",
+            "allowed_stations": [],
+        }
+
+    user = bundle["user"]
+    station_access = bundle["station_access"]
+
+    stations = await lori_access_get_rows(
+        "lori_operating_stations",
+        "select=*&order=company_name.asc,operating_state.asc,city.asc,station_code.asc&limit=2000",
+    )
+
+    if user.get("can_view_national") or user.get("can_view_all_companies"):
+        allowed = stations
+    else:
+        allowed = []
+
+        for station in stations:
+            check = lori_access_station_allowed(
+                user=user,
+                station_access=station_access,
+                requested_context={
+                    "company_name": station.get("company_name"),
+                    "region_code": station.get("region_code"),
+                    "region_name": station.get("region_name"),
+                    "operating_state": station.get("operating_state"),
+                    "station_code": station.get("station_code"),
+                },
+            )
+
+            if check["allowed"]:
+                allowed.append(station)
+
+    return {
+        "status": "success",
+        "email": email,
+        "allowed_stations_count": len(allowed),
+        "allowed_stations": allowed,
+        "message": "Allowed stations loaded.",
+    }
+
+
+@app.get("/user-allowed-contexts")
+async def user_allowed_contexts(
+    api_key: Optional[str] = Query(None),
+    email: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    station_response = await user_allowed_stations(api_key=api_key, email=email)
+
+    if station_response.get("status") != "success":
+        return station_response
+
+    contexts = []
+
+    for station in station_response.get("allowed_stations", []):
+        contexts.append({
+            "company_name": station.get("company_name"),
+            "region_code": station.get("region_code"),
+            "region_name": station.get("region_name"),
+            "operating_state": station.get("operating_state"),
+            "city": station.get("city"),
+            "station_code": station.get("station_code"),
+            "station_name": station.get("station_name"),
+            "primary_zip": station.get("primary_zip"),
+            "route_group": "All Routes",
+            "time_zone": station.get("time_zone"),
+            "station_status": station.get("station_status"),
+            "map_ready": station.get("map_ready"),
+            "route_scoring_ready": station.get("route_scoring_ready"),
+            "push_notification_ready": station.get("push_notification_ready"),
+            "compliance_profile_ready": station.get("compliance_profile_ready"),
+        })
+
+    return {
+        "status": "success",
+        "email": email,
+        "allowed_contexts_count": len(contexts),
+        "allowed_contexts": contexts,
+        "message": "Allowed operating contexts loaded.",
+    }
+
+
+@app.post("/permission-check")
+async def permission_check(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    email = lori_access_email(payload.get("email"))
+    module_name = lori_access_clean(payload.get("module_name") or "Dashboard")
+    action = lori_access_clean(payload.get("action") or "view")
+    requested_context = payload.get("requested_context") or {}
+
+    if not email:
+        return {
+            "status": "error",
+            "allowed": False,
+            "message": "email is required.",
+        }
+
+    bundle = await lori_access_get_user_bundle(email)
+
+    if not bundle["found"]:
+        return {
+            "status": "not_found",
+            "allowed": False,
+            "message": "User profile was not found in LORI access control.",
+        }
+
+    user = bundle["user"]
+    roles = bundle["roles"]
+    station_access = bundle["station_access"]
+    module_access = bundle["module_access"]
+
+    station_check = lori_access_station_allowed(
+        user=user,
+        station_access=station_access,
+        requested_context=requested_context,
+    )
+
+    module_check = lori_access_module_allowed(
+        roles=roles,
+        module_access=module_access,
+        module_name=module_name,
+        action=action,
+    )
+
+    allowed = station_check["allowed"] and module_check["allowed"]
+
+    reason = "Access allowed." if allowed else f"{station_check['reason']} {module_check['reason']}"
+
+    await lori_access_log_event(
+        user_profile_id=user.get("id"),
+        action_type="Permission Check",
+        module_name=module_name,
+        company_name=requested_context.get("company_name"),
+        region_name=requested_context.get("region_name"),
+        operating_state=requested_context.get("operating_state"),
+        station_code=requested_context.get("station_code"),
+        route_group=requested_context.get("route_group"),
+        access_result="Allowed" if allowed else "Denied",
+        reason=reason,
+        request_context={
+            "email": email,
+            "module_name": module_name,
+            "action": action,
+            "requested_context": requested_context,
+            "station_check": station_check,
+            "module_check": module_check,
+        },
+    )
+
+    return {
+        "status": "success",
+        "allowed": allowed,
+        "email": email,
+        "module_name": module_name,
+        "action": action,
+        "station_check": station_check,
+        "module_check": module_check,
+        "reason": reason,
+        "user": user,
+        "roles": roles,
+    }
+
+
+@app.get("/module-access-check")
+async def module_access_check(
+    api_key: Optional[str] = Query(None),
+    email: str = Query(...),
+    module_name: str = Query(...),
+    action: str = Query("view"),
+):
+    lori_regulatory_require_key(api_key)
+
+    return await permission_check(
+        api_key=api_key,
+        payload={
+            "email": email,
+            "module_name": module_name,
+            "action": action,
+            "requested_context": {},
+        },
+    )
+
+
+@app.post("/access-audit-log-create")
+async def access_audit_log_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    email = lori_access_email(payload.get("email"))
+    user_profile_id = payload.get("user_profile_id")
+
+    if email and not user_profile_id:
+        bundle = await lori_access_get_user_bundle(email)
+        if bundle["found"]:
+            user_profile_id = bundle["user"].get("id")
+
+    await lori_access_log_event(
+        user_profile_id=user_profile_id,
+        action_type=lori_access_clean(payload.get("action_type") or "Access Event"),
+        module_name=payload.get("module_name"),
+        company_name=payload.get("company_name"),
+        region_name=payload.get("region_name"),
+        operating_state=payload.get("operating_state"),
+        station_code=payload.get("station_code"),
+        route_group=payload.get("route_group"),
+        access_result=payload.get("access_result"),
+        reason=payload.get("reason"),
+        request_context=payload.get("request_context") or payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "Access audit log created.",
+    }
