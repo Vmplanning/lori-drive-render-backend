@@ -10129,3 +10129,720 @@ async def route_scoring_review_detail(
             if lori_route_scoring_clean(r.get("workload_status")).lower() == "near capacity"
         ],
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# SINGLE ROUTE RECONFIGURATION BACKEND
+# Typed input + surrounding route candidate review
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime
+
+
+def lori_single_route_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_single_route_num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def lori_single_route_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+async def lori_single_route_get_rows(
+    table: str,
+    query: str = "select=*&order=created_at.desc&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_single_route_latest_request() -> Optional[Dict[str, Any]]:
+    rows = await lori_single_route_get_rows(
+        "lori_single_route_reconfiguration_requests",
+        "select=*&order=created_at.desc&limit=1",
+    )
+    return rows[0] if rows else None
+
+
+async def lori_single_route_resolve_request(request_ref: str) -> Optional[Dict[str, Any]]:
+    ref = lori_single_route_clean(request_ref)
+
+    if not ref:
+        return None
+
+    rows = await lori_single_route_get_rows(
+        "lori_single_route_reconfiguration_requests",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    for row in rows:
+        if str(row.get("id")) == ref:
+            return row
+
+    partial_matches = [
+        row for row in rows
+        if str(row.get("id", "")).startswith(ref)
+    ]
+
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+
+    for row in rows:
+        if lori_single_route_clean(row.get("request_title")).lower() == ref.lower():
+            return row
+
+    return None
+
+
+def lori_single_route_workload_status(utilization: float) -> str:
+    if utilization >= 105:
+        return "Overutilized"
+    if utilization >= 95:
+        return "Near Capacity"
+    if utilization >= 85:
+        return "Balanced"
+    return "Underutilized"
+
+
+def lori_single_route_candidate_score(
+    utilization: float,
+    stops_per_hour: float,
+    overtime_hours: float,
+    missed_stops: float = 0,
+) -> float:
+    capacity_score = max(0, 100 - utilization)
+    productivity_score = min(100, stops_per_hour * 20)
+    cost_fit_score = max(0, 100 - (overtime_hours * 25))
+    service_score = max(0, 100 - (missed_stops * 20))
+
+    return round(
+        (capacity_score * 0.40)
+        + (productivity_score * 0.25)
+        + (cost_fit_score * 0.25)
+        + (service_score * 0.10),
+        2,
+    )
+
+
+@app.get("/single-route-summary")
+async def single_route_summary(
+    api_key: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    latest_request = await lori_single_route_latest_request()
+
+    requests = await lori_single_route_get_rows(
+        "lori_single_route_reconfiguration_requests",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    candidates = await lori_single_route_get_rows(
+        "lori_single_route_surrounding_candidates",
+        "select=*&order=overall_candidate_score.desc&limit=500",
+    )
+
+    recommendations = await lori_single_route_get_rows(
+        "lori_single_route_recommendations",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    audit = await lori_single_route_get_rows(
+        "lori_single_route_typed_input_audit",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    analyzed = [
+        r for r in requests
+        if lori_single_route_clean(r.get("request_status")).lower() == "analyzed"
+    ]
+
+    typed = [
+        r for r in requests
+        if bool(r.get("typed_data_present")) is True
+    ]
+
+    uploaded = [
+        r for r in requests
+        if bool(r.get("uploaded_data_present")) is True
+    ]
+
+    return {
+        "status": "success",
+        "requests_count": len(requests),
+        "analyzed_requests_count": len(analyzed),
+        "typed_data_requests_count": len(typed),
+        "uploaded_data_requests_count": len(uploaded),
+        "surrounding_candidates_count": len(candidates),
+        "recommendations_count": len(recommendations),
+        "typed_input_audit_count": len(audit),
+        "latest_request": latest_request,
+        "latest_recommendation": recommendations[0] if recommendations else None,
+        "answer_text": "Single Route Reconfiguration is ready for typed route data, surrounding route comparison, and proposed route-change recommendations.",
+    }
+
+
+@app.get("/single-route-requests")
+async def single_route_requests(
+    api_key: Optional[str] = Query(None),
+    request_status: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    rows = await lori_single_route_get_rows(
+        "lori_single_route_reconfiguration_requests",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    if request_status:
+        rows = [
+            r for r in rows
+            if lori_single_route_clean(r.get("request_status")).lower() == request_status.lower()
+        ]
+
+    if route_id:
+        rows = [
+            r for r in rows
+            if lori_single_route_clean(r.get("current_route_id")).lower() == route_id.lower()
+        ]
+
+    if station_code:
+        rows = [
+            r for r in rows
+            if lori_single_route_clean(r.get("station_code")).lower() == station_code.lower()
+        ]
+
+    return {
+        "status": "success",
+        "requests_count": len(rows[:limit]),
+        "requests": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/single-route-detail")
+async def single_route_detail(
+    api_key: Optional[str] = Query(None),
+    request_id: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not request_id:
+        latest = await lori_single_route_latest_request()
+        request_id = str(latest.get("id")) if latest else None
+
+    if not request_id:
+        return {
+            "status": "empty",
+            "message": "No single route request found.",
+        }
+
+    request = await lori_single_route_resolve_request(request_id)
+
+    if not request:
+        return {
+            "status": "not_found",
+            "message": "Single route request not found.",
+            "request_id": request_id,
+        }
+
+    request_id = str(request.get("id"))
+
+    candidates = await lori_single_route_get_rows(
+        "lori_single_route_surrounding_candidates",
+        f"select=*&request_id=eq.{quote(request_id)}&order=overall_candidate_score.desc&limit=500",
+    )
+
+    recommendations = await lori_single_route_get_rows(
+        "lori_single_route_recommendations",
+        f"select=*&request_id=eq.{quote(request_id)}&order=created_at.desc&limit=100",
+    )
+
+    audit = await lori_single_route_get_rows(
+        "lori_single_route_typed_input_audit",
+        f"select=*&request_id=eq.{quote(request_id)}&order=created_at.asc&limit=500",
+    )
+
+    return {
+        "status": "success",
+        "request": request,
+        "surrounding_candidates_count": len(candidates),
+        "surrounding_candidates": candidates,
+        "recommendations_count": len(recommendations),
+        "recommendations": recommendations,
+        "typed_input_audit_count": len(audit),
+        "typed_input_audit": audit,
+        "top_candidate": candidates[0] if candidates else None,
+        "top_recommendation": recommendations[0] if recommendations else None,
+    }
+
+
+@app.get("/single-route-surrounding-candidates")
+async def single_route_surrounding_candidates(
+    api_key: Optional[str] = Query(None),
+    request_id: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not request_id:
+        latest = await lori_single_route_latest_request()
+        request_id = str(latest.get("id")) if latest else None
+
+    if not request_id:
+        return {
+            "status": "empty",
+            "candidates_count": 0,
+            "candidates": [],
+        }
+
+    request = await lori_single_route_resolve_request(request_id)
+
+    if not request:
+        return {
+            "status": "not_found",
+            "message": "Request not found.",
+        }
+
+    rows = await lori_single_route_get_rows(
+        "lori_single_route_surrounding_candidates",
+        f"select=*&request_id=eq.{quote(str(request.get('id')))}&order=overall_candidate_score.desc&limit=500",
+    )
+
+    return {
+        "status": "success",
+        "request_id": str(request.get("id")),
+        "candidates_count": len(rows[:limit]),
+        "candidates": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/single-route-recommendations")
+async def single_route_recommendations(
+    api_key: Optional[str] = Query(None),
+    request_id: Optional[str] = Query(None),
+    limit: int = Query(100),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not request_id:
+        latest = await lori_single_route_latest_request()
+        request_id = str(latest.get("id")) if latest else None
+
+    if not request_id:
+        return {
+            "status": "empty",
+            "recommendations_count": 0,
+            "recommendations": [],
+        }
+
+    request = await lori_single_route_resolve_request(request_id)
+
+    if not request:
+        return {
+            "status": "not_found",
+            "message": "Request not found.",
+        }
+
+    rows = await lori_single_route_get_rows(
+        "lori_single_route_recommendations",
+        f"select=*&request_id=eq.{quote(str(request.get('id')))}&order=created_at.desc&limit=500",
+    )
+
+    return {
+        "status": "success",
+        "request_id": str(request.get("id")),
+        "recommendations_count": len(rows[:limit]),
+        "recommendations": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.get("/single-route-typed-input-audit")
+async def single_route_typed_input_audit(
+    api_key: Optional[str] = Query(None),
+    request_id: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not request_id:
+        latest = await lori_single_route_latest_request()
+        request_id = str(latest.get("id")) if latest else None
+
+    if not request_id:
+        return {
+            "status": "empty",
+            "typed_input_audit_count": 0,
+            "typed_input_audit": [],
+        }
+
+    request = await lori_single_route_resolve_request(request_id)
+
+    if not request:
+        return {
+            "status": "not_found",
+            "message": "Request not found.",
+        }
+
+    rows = await lori_single_route_get_rows(
+        "lori_single_route_typed_input_audit",
+        f"select=*&request_id=eq.{quote(str(request.get('id')))}&order=created_at.asc&limit=500",
+    )
+
+    return {
+        "status": "success",
+        "request_id": str(request.get("id")),
+        "typed_input_audit_count": len(rows[:limit]),
+        "typed_input_audit": rows[:max(1, min(limit, 300))],
+    }
+
+
+@app.post("/single-route-request-create")
+async def single_route_request_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    current_route_id = lori_single_route_clean(payload.get("current_route_id"))
+    current_driver_name = lori_single_route_clean(payload.get("current_driver_name"))
+
+    if not current_route_id:
+        return {
+            "status": "error",
+            "message": "current_route_id is required.",
+        }
+
+    if not current_driver_name:
+        return {
+            "status": "error",
+            "message": "current_driver_name is required.",
+        }
+
+    request_title = lori_single_route_clean(
+        payload.get("request_title")
+        or f"Single Route Review — {current_route_id} {current_driver_name}"
+    )
+
+    request_payload = {
+        "request_title": request_title,
+        "request_status": "Draft",
+        "request_mode": "Single Route Reconfiguration",
+        "company_name": lori_single_route_clean(payload.get("company_name") or "Food Authority"),
+        "station_code": lori_single_route_clean(payload.get("station_code") or "JESSUP-01"),
+        "operating_state": lori_single_route_clean(payload.get("operating_state") or "MD"),
+        "route_group": lori_single_route_clean(payload.get("route_group") or "Delivery Operations"),
+        "data_source_mode": lori_single_route_clean(payload.get("data_source_mode") or "Typed Data"),
+        "typed_data_present": True,
+        "uploaded_data_present": bool(payload.get("uploaded_data_present") or False),
+        "uploaded_file_count": lori_single_route_int(payload.get("uploaded_file_count"), 0),
+        "current_route_id": current_route_id,
+        "current_route_name": lori_single_route_clean(payload.get("current_route_name")),
+        "current_driver_name": current_driver_name,
+        "current_supervisor_name": lori_single_route_clean(payload.get("current_supervisor_name")),
+        "reason_for_review": lori_single_route_clean(payload.get("reason_for_review")),
+        "route_issue_type": lori_single_route_clean(payload.get("route_issue_type") or "Needs Review"),
+        "typed_stop_count": lori_single_route_int(payload.get("typed_stop_count"), 0),
+        "typed_miles": lori_single_route_num(payload.get("typed_miles"), 0),
+        "typed_scheduled_hours": lori_single_route_num(payload.get("typed_scheduled_hours"), 0),
+        "typed_actual_hours": lori_single_route_num(payload.get("typed_actual_hours"), 0),
+        "typed_overtime_hours": lori_single_route_num(payload.get("typed_overtime_hours"), 0),
+        "typed_helper_count": lori_single_route_int(payload.get("typed_helper_count"), 0),
+        "typed_vehicle_type": lori_single_route_clean(payload.get("typed_vehicle_type") or "Box Truck"),
+        "typed_freight_type": lori_single_route_clean(payload.get("typed_freight_type") or "Small Boxes"),
+        "typed_delivery_window_pressure": lori_single_route_clean(payload.get("typed_delivery_window_pressure") or "Unknown"),
+        "typed_traffic_pressure": lori_single_route_clean(payload.get("typed_traffic_pressure") or "Unknown"),
+        "typed_service_issues": lori_single_route_clean(payload.get("typed_service_issues")),
+        "typed_driver_notes": lori_single_route_clean(payload.get("typed_driver_notes")),
+        "lori_initial_assessment": "Draft created. Run evaluation to compare surrounding routes and generate a recommendation.",
+        "lori_decision_summary": "Pending evaluation.",
+        "leadership_summary": "Pending evaluation.",
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_single_route_reconfiguration_requests",
+        request_payload,
+    )
+
+    request = created[0] if created else {}
+    request_id = str(request.get("id"))
+
+    audit_items = [
+        ("Route", "Current Route ID", current_route_id),
+        ("Route", "Current Driver", current_driver_name),
+        ("Workload", "Typed Stop Count", str(request_payload["typed_stop_count"])),
+        ("Workload", "Typed Actual Hours", str(request_payload["typed_actual_hours"])),
+        ("Workload", "Typed Overtime Hours", str(request_payload["typed_overtime_hours"])),
+        ("Issue", "Reason for Review", request_payload["reason_for_review"]),
+    ]
+
+    for section, label, value in audit_items:
+        if value:
+            await lori_policy_supabase_post(
+                "lori_single_route_typed_input_audit",
+                {
+                    "request_id": request_id,
+                    "input_section": section,
+                    "input_label": label,
+                    "input_value": value,
+                    "input_source": "Typed by User",
+                    "created_by": lori_single_route_clean(payload.get("created_by") or "Route Configuration User"),
+                },
+            )
+
+    return {
+        "status": "success",
+        "message": "Single route reconfiguration request created from typed input.",
+        "request": request,
+        "request_id": request_id,
+        "next_step": "Run POST /single-route-evaluate to compare surrounding routes and generate a recommendation.",
+    }
+
+
+@app.post("/single-route-evaluate")
+async def single_route_evaluate(
+    api_key: Optional[str] = Query(None),
+    request_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request = await lori_single_route_resolve_request(request_id)
+
+    if not request:
+        return {
+            "status": "not_found",
+            "message": "Single route request not found.",
+            "request_id": request_id,
+        }
+
+    request_id = str(request.get("id"))
+    current_route_id = lori_single_route_clean(request.get("current_route_id"))
+    current_driver_name = lori_single_route_clean(request.get("current_driver_name"))
+
+    # Clear previous generated candidates/recommendations for this request.
+    old_candidates = await lori_single_route_get_rows(
+        "lori_single_route_surrounding_candidates",
+        f"select=*&request_id=eq.{quote(request_id)}&limit=500",
+    )
+
+    old_recs = await lori_single_route_get_rows(
+        "lori_single_route_recommendations",
+        f"select=*&request_id=eq.{quote(request_id)}&limit=500",
+    )
+
+    for row in old_candidates:
+        await lori_policy_supabase_delete(
+            "lori_single_route_surrounding_candidates",
+            str(row.get("id")),
+        )
+
+    for row in old_recs:
+        await lori_policy_supabase_delete(
+            "lori_single_route_recommendations",
+            str(row.get("id")),
+        )
+
+    # Use existing route scoring scorecards as surrounding route intelligence.
+    scorecards = await lori_single_route_get_rows(
+        "lori_route_driver_scorecards",
+        "select=*&order=utilization_percent.asc&limit=500",
+    )
+
+    candidate_rows = [
+        row for row in scorecards
+        if lori_single_route_clean(row.get("route_id")).lower() != current_route_id.lower()
+    ]
+
+    created_candidates = []
+
+    for candidate in candidate_rows:
+        utilization = lori_single_route_num(candidate.get("utilization_percent"), 0)
+        stops_per_hour = lori_single_route_num(candidate.get("stops_per_hour"), 0)
+        overtime = lori_single_route_num(candidate.get("overtime_hours"), 0)
+        missed = lori_single_route_num(candidate.get("missed_stop_count"), 0)
+
+        overall_score = lori_single_route_candidate_score(
+            utilization=utilization,
+            stops_per_hour=stops_per_hour,
+            overtime_hours=overtime,
+            missed_stops=missed,
+        )
+
+        can_absorb = utilization < 90
+        should_not_receive = utilization >= 100
+
+        candidate_payload = {
+            "request_id": request_id,
+            "candidate_route_id": candidate.get("route_id"),
+            "candidate_route_name": candidate.get("route_name"),
+            "candidate_driver_name": candidate.get("driver_name"),
+            "candidate_supervisor_name": candidate.get("supervisor_name"),
+            "station_code": candidate.get("station_code") or request.get("station_code"),
+            "route_group": candidate.get("route_group") or request.get("route_group"),
+            "stop_count": lori_single_route_int(candidate.get("stop_count"), 0),
+            "total_miles": lori_single_route_num(candidate.get("total_miles"), 0),
+            "scheduled_hours": lori_single_route_num(candidate.get("scheduled_hours"), 0),
+            "actual_hours": lori_single_route_num(candidate.get("actual_hours"), 0),
+            "overtime_hours": overtime,
+            "helper_count": lori_single_route_int(candidate.get("helper_count"), 0),
+            "vehicle_type": candidate.get("vehicle_type"),
+            "freight_type": candidate.get("freight_type"),
+            "utilization_percent": utilization,
+            "stops_per_hour": stops_per_hour,
+            "capacity_status": "Available Capacity" if can_absorb else "Near/At Capacity",
+            "can_absorb_work": can_absorb,
+            "should_not_receive_work": should_not_receive,
+            "proximity_to_review_route": "Surrounding / Needs Map Confirmation",
+            "compatibility_score": 90 if can_absorb else 65,
+            "productivity_score": min(100, stops_per_hour * 20),
+            "cost_fit_score": max(0, 100 - (overtime * 25)),
+            "service_risk_score": max(0, missed * 20),
+            "overall_candidate_score": overall_score,
+            "lori_candidate_summary": "Candidate evaluated against typed route request using utilization, productivity, overtime, service risk, and capacity.",
+            "reason_to_consider": "May be able to absorb limited nearby work if delivery windows, customer commitments, vehicle fit, and freight complexity are confirmed.",
+            "reason_to_reject": "Reject or hold if adding stops creates overtime, missed windows, safety risk, or vehicle-capacity issues.",
+        }
+
+        created = await lori_policy_supabase_post(
+            "lori_single_route_surrounding_candidates",
+            candidate_payload,
+        )
+
+        if created:
+            created_candidates.append(created[0])
+
+    created_candidates = sorted(
+        created_candidates,
+        key=lambda x: lori_single_route_num(x.get("overall_candidate_score"), 0),
+        reverse=True,
+    )
+
+    best = created_candidates[0] if created_candidates else None
+
+    typed_utilization = 0
+    actual_hours = lori_single_route_num(request.get("typed_actual_hours"), 0)
+    scheduled_hours = lori_single_route_num(request.get("typed_scheduled_hours"), 0)
+
+    if scheduled_hours > 0:
+        typed_utilization = round((actual_hours / scheduled_hours) * 100, 2)
+
+    suggested_stops = 6 if typed_utilization >= 105 else 3
+    before_util = typed_utilization
+    after_from = max(0, before_util - 15)
+    after_to = min(99, lori_single_route_num(best.get("utilization_percent"), 0) + 7) if best else None
+
+    recommendation = None
+
+    if best:
+        recommendation_payload = {
+            "request_id": request_id,
+            "recommendation_title": f"Recommended Reconfiguration: Move {suggested_stops} stops from {current_route_id} to {best.get('candidate_route_id')}",
+            "recommendation_status": "Draft",
+            "decision": "Recommended for Supervisor Review",
+            "priority": "High" if before_util >= 105 else "Medium",
+            "from_route_id": current_route_id,
+            "from_route_name": request.get("current_route_name"),
+            "from_driver_name": current_driver_name,
+            "to_route_id": best.get("candidate_route_id"),
+            "to_route_name": best.get("candidate_route_name"),
+            "to_driver_name": best.get("candidate_driver_name"),
+            "suggested_action": "Move limited low-complexity stops to the surrounding route with the best available capacity.",
+            "suggested_stops_to_move": suggested_stops,
+            "suggested_freight_type": request.get("typed_freight_type") or "Small Boxes",
+            "suggested_complexity": "Low",
+            "before_utilization_percent": before_util,
+            "after_from_route_utilization_percent": after_from,
+            "after_to_route_utilization_percent": after_to,
+            "estimated_miles_reduced": 7.5,
+            "estimated_hours_reduced": 1.25,
+            "estimated_overtime_reduction": 1.0,
+            "estimated_fuel_savings": 3.38,
+            "estimated_labor_savings": 40.00,
+            "estimated_total_savings": 46.58,
+            "estimated_productivity_gain": 7.5,
+            "service_risk": "Low to Medium",
+            "safety_risk": "Low to Medium",
+            "customer_impact": "Delivery windows must be verified before moving stops.",
+            "helper_impact": "No additional helper expected based on typed data.",
+            "vehicle_fit_impact": "Vehicle and freight compatibility require supervisor confirmation.",
+            "why_this_makes_sense": f"{current_route_id} appears overloaded while {best.get('candidate_route_id')} has stronger available-capacity indicators.",
+            "if_you_do_this": "Route pressure should decrease, overtime exposure should improve, and available capacity should be used more productively.",
+            "if_you_do_not_do_this": "The reviewed route may continue carrying overtime, service risk, fuel waste, and driver fatigue exposure.",
+            "supervisor_review_notes": "Supervisor must confirm exact customers/stops, delivery windows, service commitments, driver workload, vehicle fit, and safety before approval.",
+            "recommended_next_action": "Review proposed stop movement with dispatch and supervisor, then test for one review cycle before making permanent.",
+            "diagram_json": {
+                "diagram_title": "Before / After Route Reconfiguration",
+                "before": {
+                    "route_id": current_route_id,
+                    "driver": current_driver_name,
+                    "status": lori_single_route_workload_status(before_util),
+                    "utilization_percent": before_util,
+                    "typed_stop_count": request.get("typed_stop_count"),
+                },
+                "after_from_route": {
+                    "route_id": current_route_id,
+                    "driver": current_driver_name,
+                    "status": "Improved",
+                    "projected_utilization_percent": after_from,
+                    "stops_moved_out": suggested_stops,
+                },
+                "after_to_route": {
+                    "route_id": best.get("candidate_route_id"),
+                    "driver": best.get("candidate_driver_name"),
+                    "status": "Capacity Used",
+                    "projected_utilization_percent": after_to,
+                    "stops_moved_in": suggested_stops,
+                },
+                "arrow_label": f"Move {suggested_stops} low-complexity stops",
+                "visual_type": "route-card-arrow-diagram",
+            },
+        }
+
+        created_rec = await lori_policy_supabase_post(
+            "lori_single_route_recommendations",
+            recommendation_payload,
+        )
+
+        recommendation = created_rec[0] if created_rec else None
+
+        await lori_policy_supabase_patch(
+            "lori_single_route_reconfiguration_requests",
+            request_id,
+            {
+                "request_status": "Analyzed",
+                "surrounding_routes_considered": len(created_candidates),
+                "best_candidate_route_id": best.get("candidate_route_id"),
+                "best_candidate_driver_name": best.get("candidate_driver_name"),
+                "lori_initial_assessment": f"{current_route_id} was evaluated using typed route data and surrounding route scorecards.",
+                "lori_decision_summary": recommendation_payload["suggested_action"],
+                "leadership_summary": recommendation_payload["why_this_makes_sense"],
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+    return {
+        "status": "success",
+        "message": "Single route typed input evaluation completed.",
+        "request_id": request_id,
+        "candidates_created": len(created_candidates),
+        "top_candidate": best,
+        "recommendation": recommendation,
+    }
