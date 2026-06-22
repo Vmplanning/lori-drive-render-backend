@@ -9129,3 +9129,634 @@ async def comm_audit_events(
         "audit_events_count": len(rows[:limit]),
         "audit_events": rows[:max(1, min(limit, 500))],
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# RESEND LIVE EMAIL SENDING
+# Connects Push Notification Center queued email records to Resend.
+# SMS/text remains queued until an SMS provider is connected.
+# ============================================================
+
+import os
+import html as html_lib
+import httpx
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+from fastapi import Body, Query
+
+
+RESEND_API_URL = "https://api.resend.com/emails"
+
+
+def lori_comm_email_enabled() -> bool:
+    return os.getenv("COMM_LIVE_EMAIL_ENABLED", "false").strip().lower() == "true"
+
+
+def lori_comm_get_resend_config() -> Dict[str, str]:
+    return {
+        "api_key": os.getenv("RESEND_API_KEY", "").strip(),
+        "from_email": os.getenv("RESEND_FROM_EMAIL", "").strip(),
+        "reply_to": os.getenv("RESEND_REPLY_TO", "").strip(),
+    }
+
+
+async def lori_comm_resolve_campaign_for_email(campaign_ref: str) -> Optional[Dict[str, Any]]:
+    """
+    Resolves a campaign by:
+    - full UUID
+    - partial UUID copied from a UI
+    - exact message title
+    """
+    ref = lori_comm_clean_text(campaign_ref)
+
+    if not ref:
+        return None
+
+    campaigns = await lori_comm_get_rows(
+        "lori_comm_campaigns",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    for campaign in campaigns:
+        if str(campaign.get("id")) == ref:
+            return campaign
+
+    partial_matches = [
+        campaign for campaign in campaigns
+        if str(campaign.get("id", "")).startswith(ref)
+    ]
+
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+
+    for campaign in campaigns:
+        if lori_comm_clean_text(campaign.get("message_title")).lower() == ref.lower():
+            return campaign
+
+    return None
+
+
+def lori_comm_build_email_html(
+    campaign: Dict[str, Any],
+    recipient: Optional[Dict[str, Any]] = None,
+) -> str:
+    recipient = recipient or {}
+
+    title = html_lib.escape(lori_comm_clean_text(campaign.get("message_title") or "LORI Communication"))
+    subject = html_lib.escape(lori_comm_clean_text(campaign.get("subject_line") or title))
+    message_type = html_lib.escape(lori_comm_clean_text(campaign.get("message_type") or "Notice"))
+    priority = html_lib.escape(lori_comm_clean_text(campaign.get("priority") or "Routine"))
+    body = html_lib.escape(lori_comm_clean_text(campaign.get("message_body") or ""))
+    memo = html_lib.escape(str(campaign.get("memo_body") or ""))
+    recipient_name = html_lib.escape(lori_comm_clean_text(recipient.get("recipient_name") or "Team Member"))
+    station_code = html_lib.escape(lori_comm_clean_text(campaign.get("station_code") or "JESSUP-01"))
+
+    body_html = body.replace("\n", "<br>")
+    memo_html = memo.replace("\n", "<br>")
+
+    acknowledgment_note = ""
+
+    if campaign.get("requires_acknowledgment"):
+        acknowledgment_note = """
+        <div class="ack">
+            <strong>Acknowledgment Required:</strong>
+            Please acknowledge this communication according to your supervisor’s instructions.
+        </div>
+        """
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    body {{
+        margin: 0;
+        padding: 0;
+        background: #f6f8fb;
+        font-family: Arial, Helvetica, sans-serif;
+        color: #111827;
+    }}
+
+    .wrap {{
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 28px;
+    }}
+
+    .card {{
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        padding: 28px;
+    }}
+
+    .brand {{
+        font-size: 12px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        font-weight: 800;
+        color: #475569;
+        margin-bottom: 16px;
+    }}
+
+    .badge {{
+        display: inline-block;
+        background: #1e3a8a;
+        color: #ffffff;
+        border-radius: 999px;
+        padding: 8px 12px;
+        font-size: 12px;
+        font-weight: 700;
+        margin-bottom: 18px;
+    }}
+
+    h1 {{
+        margin: 0 0 10px 0;
+        font-size: 26px;
+        line-height: 1.18;
+    }}
+
+    .meta {{
+        color: #667085;
+        font-size: 13px;
+        margin-bottom: 22px;
+    }}
+
+    .message {{
+        font-size: 15px;
+        line-height: 1.6;
+        margin-bottom: 20px;
+    }}
+
+    .memo {{
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 18px;
+        font-size: 14px;
+        line-height: 1.55;
+        margin-top: 16px;
+    }}
+
+    .ack {{
+        margin-top: 20px;
+        padding: 16px;
+        border-radius: 14px;
+        background: #fff7ed;
+        border: 1px solid #fed7aa;
+        color: #7c2d12;
+        font-size: 14px;
+    }}
+
+    .footer {{
+        margin-top: 22px;
+        color: #667085;
+        font-size: 12px;
+        line-height: 1.45;
+    }}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+        <div class="brand">LORI Drive Command Center</div>
+        <div class="badge">{message_type} | {priority}</div>
+        <h1>{subject}</h1>
+        <div class="meta">To: {recipient_name} | Station: {station_code}</div>
+
+        <div class="message">
+            {body_html}
+        </div>
+
+        <div class="memo">
+            {memo_html}
+        </div>
+
+        {acknowledgment_note}
+
+        <div class="footer">
+            This message was generated through LORI Drive Command Center. Please follow your organization’s communication, safety, HR, compliance, and acknowledgment procedures.
+        </div>
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+def lori_comm_build_email_text(
+    campaign: Dict[str, Any],
+    recipient: Optional[Dict[str, Any]] = None,
+) -> str:
+    recipient = recipient or {}
+
+    recipient_name = lori_comm_clean_text(recipient.get("recipient_name") or "Team Member")
+    subject = lori_comm_clean_text(campaign.get("subject_line") or campaign.get("message_title") or "LORI Communication")
+    message_body = lori_comm_clean_text(campaign.get("message_body") or "")
+    memo_body = str(campaign.get("memo_body") or "")
+
+    ack = ""
+
+    if campaign.get("requires_acknowledgment"):
+        ack = "\n\nACKNOWLEDGMENT REQUIRED: Please acknowledge this communication according to your supervisor’s instructions."
+
+    return f"""LORI Drive Command Center
+
+To: {recipient_name}
+Subject: {subject}
+
+{message_body}
+
+{memo_body}
+{ack}
+
+This message was sent through LORI Drive Command Center.
+"""
+
+
+async def lori_resend_send_email(
+    to_email: str,
+    subject: str,
+    html_content: str,
+    text_content: str,
+) -> Dict[str, Any]:
+    config = lori_comm_get_resend_config()
+
+    if not config["api_key"]:
+        return {
+            "ok": False,
+            "status_code": 500,
+            "error": "RESEND_API_KEY is missing in Render environment variables.",
+        }
+
+    if not config["from_email"]:
+        return {
+            "ok": False,
+            "status_code": 500,
+            "error": "RESEND_FROM_EMAIL is missing in Render environment variables.",
+        }
+
+    payload = {
+        "from": config["from_email"],
+        "to": [to_email],
+        "subject": subject,
+        "html": html_content,
+        "text": text_content,
+    }
+
+    if config["reply_to"]:
+        payload["reply_to"] = config["reply_to"]
+
+    headers = {
+        "Authorization": f"Bearer {config['api_key']}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers=headers,
+            json=payload,
+        )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw_response": response.text}
+
+    if response.status_code >= 400:
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "error": data,
+        }
+
+    return {
+        "ok": True,
+        "status_code": response.status_code,
+        "data": data,
+        "provider_message_id": data.get("id"),
+    }
+
+
+@app.post("/comm-send-test-email")
+async def comm_send_test_email(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    if not lori_comm_email_enabled():
+        return {
+            "status": "email_disabled",
+            "message": "Live email sending is disabled. Set COMM_LIVE_EMAIL_ENABLED=true in Render.",
+        }
+
+    to_email = lori_comm_clean_text(payload.get("to_email"))
+    subject = lori_comm_clean_text(payload.get("subject") or "LORI Drive Test Email")
+    message_body = lori_comm_clean_text(payload.get("message_body") or "This is a LORI Drive test email using Resend.")
+
+    if not to_email:
+        return {
+            "status": "error",
+            "message": "to_email is required.",
+        }
+
+    html_content = f"""
+    <div style="font-family: Arial, sans-serif; line-height: 1.5;">
+        <h2>LORI Drive Command Center</h2>
+        <p>{html_lib.escape(message_body)}</p>
+        <p style="color:#667085;font-size:12px;">This is a live Resend email test from LORI.</p>
+    </div>
+    """
+
+    result = await lori_resend_send_email(
+        to_email=to_email,
+        subject=subject,
+        html_content=html_content,
+        text_content=message_body,
+    )
+
+    if not result.get("ok"):
+        return {
+            "status": "failed",
+            "message": "Test email failed.",
+            "error": result,
+        }
+
+    return {
+        "status": "success",
+        "message": "Test email sent through Resend.",
+        "resend_result": result,
+    }
+
+
+@app.post("/comm-campaign-send-email")
+async def comm_campaign_send_email(
+    api_key: Optional[str] = Query(None),
+    campaign_id: str = Query(...),
+    dry_run: bool = Query(False),
+    force_resend: bool = Query(False),
+    allow_demo_addresses: bool = Query(False),
+):
+    lori_regulatory_require_key(api_key)
+
+    campaign = await lori_comm_resolve_campaign_for_email(campaign_id)
+
+    if not campaign:
+        return {
+            "status": "not_found",
+            "message": "Campaign not found.",
+            "campaign_id": campaign_id,
+        }
+
+    campaign_id = str(campaign.get("id"))
+
+    if not dry_run and not lori_comm_email_enabled():
+        return {
+            "status": "email_disabled",
+            "message": "Live email sending is disabled. Set COMM_LIVE_EMAIL_ENABLED=true in Render.",
+            "campaign_id": campaign_id,
+        }
+
+    approval_status = lori_comm_clean_text(campaign.get("approval_status")).lower()
+    campaign_status = lori_comm_clean_text(campaign.get("campaign_status")).lower()
+
+    allowed_statuses = {
+        "approved",
+        "queued",
+        "email sent - sms pending",
+        "acknowledgment pending",
+    }
+
+    if approval_status != "approved" and campaign_status not in allowed_statuses:
+        return {
+            "status": "error",
+            "message": "Campaign must be approved or queued before sending live email.",
+            "approval_status": campaign.get("approval_status"),
+            "campaign_status": campaign.get("campaign_status"),
+        }
+
+    recipients = await lori_comm_get_rows(
+        "lori_comm_recipients",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    if not recipients:
+        return {
+            "status": "error",
+            "message": "Campaign has no recipients.",
+            "campaign_id": campaign_id,
+        }
+
+    existing_logs = await lori_comm_get_rows(
+        "lori_comm_delivery_logs",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    existing_email_logs_by_recipient = {
+        str(log.get("recipient_id")): log
+        for log in existing_logs
+        if lori_comm_clean_text(log.get("delivery_method")).lower() == "email"
+    }
+
+    sent = []
+    failed = []
+    skipped = []
+    dry_run_targets = []
+
+    subject = lori_comm_clean_text(campaign.get("subject_line") or campaign.get("message_title") or "LORI Communication")
+
+    for recipient in recipients:
+        recipient_id = str(recipient.get("id"))
+        recipient_name = lori_comm_clean_text(recipient.get("recipient_name"))
+        to_email = lori_comm_clean_text(recipient.get("email_address"))
+
+        if not to_email:
+            skipped.append({
+                "recipient": recipient_name,
+                "reason": "No email address on recipient record.",
+            })
+            continue
+
+        if to_email.lower().endswith("@example.com") and not allow_demo_addresses:
+            skipped.append({
+                "recipient": recipient_name,
+                "email": to_email,
+                "reason": "Demo example.com address skipped. Replace with real test email or set allow_demo_addresses=true.",
+            })
+            continue
+
+        opt_out = lori_comm_clean_text(recipient.get("opt_out_status")).lower()
+
+        if "opted out" in opt_out and "not opted out" not in opt_out:
+            skipped.append({
+                "recipient": recipient_name,
+                "email": to_email,
+                "reason": "Recipient is opted out.",
+            })
+            continue
+
+        existing_log = existing_email_logs_by_recipient.get(recipient_id)
+
+        if existing_log and lori_comm_clean_text(existing_log.get("delivery_status")).lower() == "sent" and not force_resend:
+            skipped.append({
+                "recipient": recipient_name,
+                "email": to_email,
+                "reason": "Email already marked as sent. Use force_resend=true to send again.",
+            })
+            continue
+
+        if not existing_log:
+            created_log = await lori_policy_supabase_post(
+                "lori_comm_delivery_logs",
+                {
+                    "campaign_id": campaign_id,
+                    "recipient_id": recipient_id,
+                    "delivery_method": "Email",
+                    "delivery_status": "Pending Email Send",
+                    "provider_name": "Resend",
+                },
+            )
+
+            existing_log = created_log[0] if created_log else None
+
+        if dry_run:
+            dry_run_targets.append({
+                "recipient": recipient_name,
+                "email": to_email,
+                "delivery_log_id": existing_log.get("id") if existing_log else None,
+            })
+            continue
+
+        html_content = lori_comm_build_email_html(campaign, recipient)
+        text_content = lori_comm_build_email_text(campaign, recipient)
+
+        result = await lori_resend_send_email(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+        log_id = existing_log.get("id") if existing_log else None
+
+        if result.get("ok"):
+            if log_id:
+                await lori_policy_supabase_patch(
+                    "lori_comm_delivery_logs",
+                    log_id,
+                    {
+                        "delivery_status": "Sent",
+                        "provider_name": "Resend",
+                        "provider_message_id": result.get("provider_message_id"),
+                        "sent_at": datetime.utcnow().isoformat(),
+                        "failure_reason": None,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    },
+                )
+
+            sent.append({
+                "recipient": recipient_name,
+                "email": to_email,
+                "provider_message_id": result.get("provider_message_id"),
+            })
+        else:
+            if log_id:
+                await lori_policy_supabase_patch(
+                    "lori_comm_delivery_logs",
+                    log_id,
+                    {
+                        "delivery_status": "Failed",
+                        "provider_name": "Resend",
+                        "failed_at": datetime.utcnow().isoformat(),
+                        "failure_reason": json.dumps(result.get("error")),
+                        "updated_at": datetime.utcnow().isoformat(),
+                    },
+                )
+
+            failed.append({
+                "recipient": recipient_name,
+                "email": to_email,
+                "error": result,
+            })
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "message": "Dry run complete. No live email was sent.",
+            "campaign_id": campaign_id,
+            "would_send_count": len(dry_run_targets),
+            "skipped_count": len(skipped),
+            "would_send_to": dry_run_targets,
+            "skipped": skipped,
+        }
+
+    updated_logs = await lori_comm_get_rows(
+        "lori_comm_delivery_logs",
+        f"select=*&campaign_id=eq.{quote(campaign_id)}&limit=1000",
+    )
+
+    sent_count = len([
+        log for log in updated_logs
+        if lori_comm_clean_text(log.get("delivery_status")).lower() == "sent"
+    ])
+
+    failed_count = len([
+        log for log in updated_logs
+        if lori_comm_clean_text(log.get("delivery_status")).lower() == "failed"
+    ])
+
+    text_logs_pending = len([
+        log for log in updated_logs
+        if lori_comm_clean_text(log.get("delivery_method")).lower() in {"text message", "sms", "text"}
+        and lori_comm_clean_text(log.get("delivery_status")).lower() != "sent"
+    ])
+
+    if failed_count > 0:
+        next_status = "Email Sent With Failures"
+    elif text_logs_pending > 0:
+        next_status = "Email Sent - SMS Pending"
+    elif campaign.get("requires_acknowledgment"):
+        next_status = "Acknowledgment Pending"
+    else:
+        next_status = "Sent"
+
+    updated_campaign = await lori_policy_supabase_patch(
+        "lori_comm_campaigns",
+        campaign_id,
+        {
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "campaign_status": next_status,
+            "sent_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_comm_log_event(
+        campaign_id=campaign_id,
+        event_type="Live Email Send Attempted",
+        event_summary=f"Resend email attempt complete. Sent: {len(sent)}. Failed: {len(failed)}. Skipped: {len(skipped)}.",
+        event_details={
+            "provider": "Resend",
+            "sent_count": len(sent),
+            "failed_count": len(failed),
+            "skipped_count": len(skipped),
+            "sms_connected": False,
+        },
+        performed_by="LORI Push Notification Center",
+    )
+
+    return {
+        "status": "success" if not failed else "partial_success",
+        "message": "Live email send attempt completed through Resend.",
+        "campaign": updated_campaign[0] if updated_campaign else {},
+        "sent_count": len(sent),
+        "failed_count": len(failed),
+        "skipped_count": len(skipped),
+        "sent": sent,
+        "failed": failed,
+        "skipped": skipped,
+        "answer_text": "Email sending completed through Resend. SMS/text remains queued until an SMS provider is connected.",
+    }
