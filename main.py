@@ -17612,3 +17612,1018 @@ async def sop_export_html(
         "sop_id": sop_id,
         "html": html,
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# EXECUTIVE REPORTS & PACKET CENTER ENGINE
+# Creates report requests, generates leadership packets,
+# builds HTML/print-ready reports, and stores report history.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime, date
+import os
+import httpx
+
+
+SUPABASE_URL_REPORTS = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_REPORTS = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_report_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_report_upper(value: Any) -> str:
+    return lori_report_clean(value).upper()
+
+
+def lori_report_today() -> str:
+    return date.today().isoformat()
+
+
+async def lori_report_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_report_safe_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    try:
+        return await lori_policy_supabase_get(f"{table}?{query}")
+    except Exception:
+        return []
+
+
+async def lori_report_patch_rows(
+    table: str,
+    match_query: str,
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not SUPABASE_URL_REPORTS or not SUPABASE_SERVICE_ROLE_KEY_REPORTS:
+        raise RuntimeError("Missing Supabase environment variables.")
+
+    url = f"{SUPABASE_URL_REPORTS}/rest/v1/{table}?{match_query}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_REPORTS,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_REPORTS}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(url, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase PATCH failed: {response.status_code} {response.text}")
+
+    try:
+        return response.json()
+    except Exception:
+        return []
+
+
+def lori_report_count_label(count_value: int, singular: str, plural: str) -> str:
+    return f"{count_value} {singular if count_value == 1 else plural}"
+
+
+def lori_report_html_escape(value: Any) -> str:
+    text = lori_report_clean(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+async def lori_report_snapshot_for_station(station_code: str) -> Dict[str, Any]:
+    station_code_clean = lori_report_upper(station_code)
+
+    docs = await lori_report_safe_get_rows(
+        "lori_document_library",
+        f"select=*&station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=1000",
+    )
+
+    action_items = await lori_report_safe_get_rows(
+        "lori_action_items",
+        f"select=*&station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=1000",
+    )
+
+    kpi_plans = await lori_report_safe_get_rows(
+        "lori_kpi_action_plans",
+        f"select=*&station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=500",
+    )
+
+    sop_library = await lori_report_safe_get_rows(
+        "lori_sop_library",
+        f"select=*&station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=500",
+    )
+
+    route_projects = await lori_report_safe_get_rows(
+        "lori_route_config_projects",
+        f"select=*&station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=500",
+    )
+
+    route_contract_reviews = await lori_report_safe_get_rows(
+        "lori_route_contract_safeguard_reviews",
+        f"select=*&station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=500",
+    )
+
+    driver_master = await lori_report_safe_get_rows(
+        "lori_driver_master",
+        f"select=*&station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=1000",
+    )
+
+    regulatory_alerts = await lori_report_safe_get_rows(
+        "lori_regulatory_alerts",
+        "select=*&order=created_at.desc&limit=500",
+    )
+
+    access_changes = await lori_report_safe_get_rows(
+        "lori_user_access_change_requests",
+        f"select=*&current_station_code=eq.{quote(station_code_clean)}&order=created_at.desc&limit=500",
+    )
+
+    return {
+        "documents": docs,
+        "action_items": action_items,
+        "kpi_plans": kpi_plans,
+        "sops": sop_library,
+        "route_projects": route_projects,
+        "contract_reviews": route_contract_reviews,
+        "drivers": driver_master,
+        "regulatory_alerts": regulatory_alerts,
+        "access_changes": access_changes,
+    }
+
+
+def lori_report_build_sections(
+    report_template: Dict[str, Any],
+    request: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    report_code = lori_report_clean(report_template.get("report_code"))
+    report_name = lori_report_clean(report_template.get("report_name"))
+    station_code = lori_report_clean(request.get("station_code"))
+    station_name = lori_report_clean(request.get("station_name"))
+    route_id = lori_report_clean(request.get("route_id"))
+    driver_name = lori_report_clean(request.get("driver_name"))
+
+    docs = snapshot.get("documents", [])
+    action_items = snapshot.get("action_items", [])
+    kpi_plans = snapshot.get("kpi_plans", [])
+    sops = snapshot.get("sops", [])
+    route_projects = snapshot.get("route_projects", [])
+    contract_reviews = snapshot.get("contract_reviews", [])
+    drivers = snapshot.get("drivers", [])
+    regulatory_alerts = snapshot.get("regulatory_alerts", [])
+    access_changes = snapshot.get("access_changes", [])
+
+    open_actions = [
+        item for item in action_items
+        if lori_report_clean(item.get("status") or item.get("action_status")).lower() not in ["completed", "closed", "done"]
+    ]
+
+    high_risk_docs = [
+        d for d in docs
+        if d.get("labor_review_required")
+        or d.get("legal_review_required")
+        or d.get("hr_review_required")
+        or d.get("accident_related")
+        or d.get("contract_related")
+        or d.get("union_related")
+    ]
+
+    high_risk_contracts = [
+        c for c in contract_reviews
+        if c.get("contract_risk") == "High"
+        or c.get("labor_risk") == "High"
+        or c.get("cost_impact_risk") == "High"
+        or c.get("implementation_status") == "Do Not Implement Yet"
+    ]
+
+    draft_sops = [s for s in sops if s.get("sop_status") in ["Draft", "In Review"]]
+    published_sops = [s for s in sops if s.get("sop_status") == "Published"]
+
+    sections = []
+
+    sections.append({
+        "section_order": 1,
+        "section_title": "Executive Summary",
+        "section_type": "Executive Summary",
+        "section_summary": f"{report_name} for {station_code or 'selected station'}.",
+        "section_body": (
+            f"This report summarizes current LORI information for {station_name or station_code or 'the selected operating context'}. "
+            f"It is generated from connected LORI modules and should be reviewed by authorized leadership before action. "
+            f"Source modules include: {', '.join(report_template.get('source_modules') or [])}."
+        ),
+        "source_module": "Reports Engine",
+        "risk_level": "Standard",
+        "requires_attention": False,
+    })
+
+    if report_code in [
+        "EXEC_OPERATIONS_BRIEFING",
+        "LEADERSHIP_DASHBOARD_PACKET",
+        "SUPERVISOR_ACCOUNTABILITY_REPORT",
+        "STATION_READINESS_REPORT",
+    ]:
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "Station Snapshot",
+                "section_type": "Station Summary",
+                "section_summary": "Current station-level operating summary.",
+                "section_body": (
+                    f"Station: {station_code} — {station_name}. "
+                    f"Documents: {len(docs)}. Drivers: {len(drivers)}. "
+                    f"Open action items: {len(open_actions)}. KPI action plans: {len(kpi_plans)}. "
+                    f"SOPs: {len(sops)}. Route configuration projects: {len(route_projects)}."
+                ),
+                "source_module": "Overview / Leadership Dashboard",
+                "risk_level": "Standard",
+                "requires_attention": len(open_actions) > 0,
+            },
+            {
+                "section_order": 3,
+                "section_title": "Leadership Attention Items",
+                "section_type": "Action Summary",
+                "section_summary": "Items leadership should review.",
+                "section_body": (
+                    f"LORI found {len(open_actions)} open action items, {len(high_risk_docs)} sensitive or review-required documents, "
+                    f"{len(high_risk_contracts)} high-risk contract/labor safeguards, and {len(draft_sops)} SOPs in draft or review status."
+                ),
+                "source_module": "Action Center",
+                "risk_level": "Medium" if open_actions or high_risk_docs or high_risk_contracts else "Low",
+                "requires_attention": bool(open_actions or high_risk_docs or high_risk_contracts),
+            }
+        ])
+
+    elif report_code in [
+        "DRIVER_360_PROFILE",
+        "DRIVER_RISK_REPORT",
+        "DRIVER_RECOGNITION_REPORT",
+        "DRIVER_COACHING_COUNSELING_REPORT",
+    ]:
+        driver_docs = [
+            d for d in docs
+            if driver_name.lower() in lori_report_clean(d.get("driver_name")).lower()
+        ] if driver_name else [d for d in docs if d.get("intake_lane") == "Driver File"]
+
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "Driver Summary",
+                "section_type": "Driver",
+                "section_summary": "Driver-related records and document visibility.",
+                "section_body": (
+                    f"Driver filter: {driver_name or 'All drivers at station'}. "
+                    f"Driver records found: {len(drivers)}. Driver documents found: {len(driver_docs)}. "
+                    f"Safety, counseling, performance, document, and action history should be reviewed before final decisions."
+                ),
+                "source_module": "Driver 360",
+                "risk_level": "Medium" if driver_docs else "Standard",
+                "requires_attention": bool(driver_docs),
+            },
+            {
+                "section_order": 3,
+                "section_title": "Driver Follow-Up",
+                "section_type": "Follow-Up",
+                "section_summary": "Recommended next step.",
+                "section_body": "Review Driver 360, attached driver documents, open actions, safety events, counseling status, credentials, and route performance before taking action.",
+                "source_module": "Driver 360 / Action Center",
+                "risk_level": "Standard",
+                "requires_attention": True,
+            }
+        ])
+
+    elif report_code in [
+        "ROUTE_CONFIGURATION_PACKET",
+        "ROUTE_OPTIMIZATION_REPORT",
+        "WORK_AREA_BALANCE_REPORT",
+        "ROUTE_CHANGE_REVIEW_PACKET",
+    ]:
+        route_filtered = [
+            p for p in route_projects
+            if not route_id or route_id.lower() in lori_report_clean(p).lower()
+        ]
+
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "Route Configuration Summary",
+                "section_type": "Route",
+                "section_summary": "Route and work area projects.",
+                "section_body": (
+                    f"Route filter: {route_id or 'All routes'}. "
+                    f"Route configuration projects found: {len(route_filtered)}. "
+                    f"Contract/labor safeguard reviews found: {len(contract_reviews)}. "
+                    f"High-risk safeguard reviews: {len(high_risk_contracts)}."
+                ),
+                "source_module": "Route Configuration",
+                "risk_level": "High" if high_risk_contracts else "Medium",
+                "requires_attention": bool(high_risk_contracts),
+            },
+            {
+                "section_order": 3,
+                "section_title": "Implementation Gate",
+                "section_type": "Approval Gate",
+                "section_summary": "Route changes require review before implementation.",
+                "section_body": (
+                    "Route recommendations are planning outputs until operations leadership completes required review. "
+                    "Contract, labor, union, pay, seniority, route assignment, and policy safeguards must be reviewed before implementation."
+                ),
+                "source_module": "Contract Safeguard",
+                "risk_level": "High" if high_risk_contracts else "Standard",
+                "requires_attention": True,
+            }
+        ])
+
+    elif report_code in [
+        "CONTRACT_LABOR_SAFEGUARD_REPORT",
+        "COMPLIANCE_POLICY_REVIEW_REPORT",
+        "REGULATORY_WATCH_REPORT",
+        "ACCESS_CONTROL_USER_TRANSFER_AUDIT",
+    ]:
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "Compliance / Safeguard Summary",
+                "section_type": "Compliance",
+                "section_summary": "Contract, labor, regulatory, and access-control review.",
+                "section_body": (
+                    f"Contract/labor safeguard reviews: {len(contract_reviews)}. "
+                    f"High-risk safeguard reviews: {len(high_risk_contracts)}. "
+                    f"Regulatory alerts available: {len(regulatory_alerts)}. "
+                    f"User access change records: {len(access_changes)}."
+                ),
+                "source_module": "Compliance / Contract Safeguard / Regulatory Watch",
+                "risk_level": "High" if high_risk_contracts else "Medium",
+                "requires_attention": bool(high_risk_contracts or regulatory_alerts or access_changes),
+            }
+        ])
+
+    elif report_code in [
+        "DOCUMENT_INTAKE_SUMMARY",
+        "SENSITIVE_DOCUMENT_REVIEW_REPORT",
+        "BATCH_INTEGRITY_AUDIT",
+        "DOCUMENT_MODULE_LINK_REPORT",
+    ]:
+        extracted_docs = [d for d in docs if d.get("extraction_status") == "Extracted"]
+        needs_review_docs = [d for d in docs if d.get("extraction_status") != "Extracted"]
+
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "Document Library Summary",
+                "section_type": "Document Intake",
+                "section_summary": "Station document library status.",
+                "section_body": (
+                    f"Total documents: {len(docs)}. Extracted documents: {len(extracted_docs)}. "
+                    f"Documents needing extraction/review: {len(needs_review_docs)}. "
+                    f"Sensitive/review-required documents: {len(high_risk_docs)}."
+                ),
+                "source_module": "Document & Data Intake Center",
+                "risk_level": "Medium" if needs_review_docs or high_risk_docs else "Low",
+                "requires_attention": bool(needs_review_docs or high_risk_docs),
+            }
+        ])
+
+    elif report_code in [
+        "KPI_ACTION_PLAN_REPORT",
+        "KPI_EXCEPTION_REPORT",
+        "ACTION_CENTER_REPORT",
+        "LEADERSHIP_BRIEFING_QUEUE_REPORT",
+    ]:
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "KPI and Action Summary",
+                "section_type": "KPI / Action",
+                "section_summary": "Operational action status.",
+                "section_body": (
+                    f"KPI action plans: {len(kpi_plans)}. Total action items: {len(action_items)}. "
+                    f"Open action items: {len(open_actions)}. "
+                    f"Leadership should review open, overdue, high-priority, and owner-assigned action items."
+                ),
+                "source_module": "KPI Action Plans / Action Center",
+                "risk_level": "Medium" if open_actions else "Low",
+                "requires_attention": bool(open_actions),
+            }
+        ])
+
+    elif report_code in [
+        "SOP_LIBRARY_REPORT",
+        "SOP_REVIEW_PACKET",
+        "SOP_ACKNOWLEDGEMENT_REPORT",
+        "TRAINING_PROCEDURE_GAP_REPORT",
+    ]:
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "SOP and Training Summary",
+                "section_type": "SOP",
+                "section_summary": "SOP library, review, and training status.",
+                "section_body": (
+                    f"Total SOPs: {len(sops)}. Draft/in-review SOPs: {len(draft_sops)}. "
+                    f"Published SOPs: {len(published_sops)}. "
+                    f"Draft and in-review SOPs should be reviewed before use."
+                ),
+                "source_module": "SOP Builder",
+                "risk_level": "Medium" if draft_sops else "Low",
+                "requires_attention": bool(draft_sops),
+            }
+        ])
+
+    elif report_code in [
+        "DRIVER_ROAD_COMMUNICATIONS_LOG",
+        "URGENT_DRIVER_MESSAGE_REPORT",
+    ]:
+        sections.extend([
+            {
+                "section_order": 2,
+                "section_title": "Driver Road Communications Summary",
+                "section_type": "Driver Communications",
+                "section_summary": "Driver field communication report.",
+                "section_body": (
+                    "Driver Road Communications are limited to operational messages to drivers in the field, such as route updates, stop changes, weather alerts, safety reminders, delay notices, and return-to-station instructions. "
+                    "No internal SOP, contract, safeguard, or admin workflow notifications are included in this report."
+                ),
+                "source_module": "Driver Road Communications",
+                "risk_level": "Standard",
+                "requires_attention": False,
+            }
+        ])
+
+    sections.append({
+        "section_order": 99,
+        "section_title": "Decision Support Notice",
+        "section_type": "Disclaimer",
+        "section_summary": "LORI decision-support limitation.",
+        "section_body": (
+            "LORI provides operational decision support only. Reports, packets, recommendations, route changes, SOPs, contract safeguards, compliance items, driver actions, and employment-related issues must be reviewed and approved by authorized company leadership before final action."
+        ),
+        "source_module": "Reports Engine",
+        "risk_level": "Standard",
+        "requires_attention": False,
+    })
+
+    return sections
+
+
+def lori_report_build_html(report: Dict[str, Any], sections: List[Dict[str, Any]]) -> str:
+    section_html = "\n".join([
+        f"""
+        <section style="border:1px solid #e5e7eb; border-radius:12px; padding:18px; margin-bottom:18px;">
+          <div style="font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:.08em;">{lori_report_html_escape(section.get('section_type'))}</div>
+          <h2 style="margin:6px 0 8px 0;">{lori_report_html_escape(section.get('section_title'))}</h2>
+          <p style="font-weight:600; color:#374151;">{lori_report_html_escape(section.get('section_summary'))}</p>
+          <p style="white-space:pre-wrap; line-height:1.55;">{lori_report_html_escape(section.get('section_body'))}</p>
+          <p style="font-size:12px; color:#6b7280;">Source: {lori_report_html_escape(section.get('source_module'))} | Risk: {lori_report_html_escape(section.get('risk_level'))}</p>
+        </section>
+        """
+        for section in sections
+    ])
+
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>{lori_report_html_escape(report.get('report_title'))}</title>
+    </head>
+    <body style="font-family: Arial, sans-serif; background:#f9fafb; color:#111827; padding:36px;">
+      <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:16px; padding:26px; margin-bottom:24px;">
+        <div style="font-size:12px; color:#6b7280; text-transform:uppercase; letter-spacing:.10em;">LORI Drive Command Center</div>
+        <h1 style="margin:8px 0 10px 0;">{lori_report_html_escape(report.get('report_title'))}</h1>
+        <p><strong>Report:</strong> {lori_report_html_escape(report.get('report_name'))}</p>
+        <p><strong>Category:</strong> {lori_report_html_escape(report.get('report_category'))}</p>
+        <p><strong>Station:</strong> {lori_report_html_escape(report.get('station_code'))} — {lori_report_html_escape(report.get('station_name'))}</p>
+        <p><strong>Generated:</strong> {datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}</p>
+        <div style="margin-top:16px; padding:14px; background:#fff7ed; border:1px solid #fed7aa; border-radius:10px;">
+          <strong>Demonstration Data Only — Not Company Proprietary Data</strong>
+          <br>Reports reflect available LORI demo/system data and require authorized review before final action.
+        </div>
+      </div>
+
+      <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:16px; padding:24px;">
+        {section_html}
+      </div>
+    </body>
+    </html>
+    """
+    return html
+
+
+@app.get("/report-templates")
+async def report_templates(
+    api_key: Optional[str] = Query(None),
+    report_category: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    templates = await lori_report_get_rows(
+        "lori_report_templates",
+        "select=*&order=sort_order.asc&limit=500",
+    )
+
+    if report_category:
+        templates = [
+            t for t in templates
+            if lori_report_clean(t.get("report_category")).lower() == report_category.lower()
+        ]
+
+    categories = sorted(list(set([t.get("report_category") for t in templates if t.get("report_category")])))
+
+    return {
+        "status": "success",
+        "templates_count": len(templates),
+        "categories": categories,
+        "templates": templates,
+    }
+
+
+@app.get("/reports-packet-center-summary")
+async def reports_packet_center_summary(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    templates = await lori_report_get_rows(
+        "lori_report_templates",
+        "select=*&order=sort_order.asc&limit=500",
+    )
+
+    reports = await lori_report_safe_get_rows(
+        "lori_report_library",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    requests = await lori_report_safe_get_rows(
+        "lori_report_requests",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        station = lori_report_upper(station_code)
+        reports = [r for r in reports if lori_report_upper(r.get("station_code")) == station]
+        requests = [r for r in requests if lori_report_upper(r.get("station_code")) == station]
+
+    category_counts = {}
+
+    for template in templates:
+        category = template.get("report_category") or "Other"
+        category_counts[category] = category_counts.get(category, 0) + 1
+
+    return {
+        "status": "success",
+        "report_templates_count": len(templates),
+        "generated_reports_count": len(reports),
+        "report_requests_count": len(requests),
+        "pending_backend_count": len([t for t in templates if t.get("report_status") == "Pending Backend"]),
+        "available_reports_count": len([t for t in templates if t.get("report_status") == "Available"]),
+        "published_reports_count": len([r for r in reports if r.get("report_status") == "Published"]),
+        "draft_reports_count": len([r for r in reports if r.get("report_status") == "Draft"]),
+        "category_counts": category_counts,
+    }
+
+
+@app.post("/report-request-create")
+async def report_request_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    report_code = lori_report_upper(payload.get("report_code"))
+
+    if not report_code:
+        return {"status": "error", "message": "report_code is required."}
+
+    templates = await lori_report_get_rows(
+        "lori_report_templates",
+        f"select=*&report_code=eq.{quote(report_code)}&limit=1",
+    )
+
+    if not templates:
+        return {"status": "not_found", "message": f"Report template {report_code} was not found."}
+
+    template = templates[0]
+
+    request_payload = {
+        "report_template_id": template.get("id"),
+        "request_title": lori_report_clean(payload.get("request_title") or f"{template.get('report_name')} — {payload.get('station_code') or 'Station'}"),
+        "report_name": template.get("report_name"),
+        "report_category": template.get("report_category"),
+        "report_code": template.get("report_code"),
+        "request_status": "Draft",
+
+        "company_name": lori_report_clean(payload.get("company_name")),
+        "region_code": lori_report_upper(payload.get("region_code")),
+        "region_name": lori_report_clean(payload.get("region_name")),
+        "operating_state": lori_report_upper(payload.get("operating_state")),
+        "city": lori_report_clean(payload.get("city")),
+        "station_code": lori_report_upper(payload.get("station_code")),
+        "station_name": lori_report_clean(payload.get("station_name")),
+        "primary_zip": lori_report_clean(payload.get("primary_zip")),
+        "route_group": lori_report_clean(payload.get("route_group")),
+        "route_id": lori_report_clean(payload.get("route_id")),
+
+        "driver_id": lori_report_clean(payload.get("driver_id")),
+        "driver_name": lori_report_clean(payload.get("driver_name")),
+        "employee_id": lori_report_clean(payload.get("employee_id")),
+        "employee_name": lori_report_clean(payload.get("employee_name")),
+
+        "date_range_start": payload.get("date_range_start") or None,
+        "date_range_end": payload.get("date_range_end") or None,
+
+        "risk_level": lori_report_clean(payload.get("risk_level")),
+        "action_status": lori_report_clean(payload.get("action_status")),
+        "sop_status": lori_report_clean(payload.get("sop_status")),
+        "document_type": lori_report_clean(payload.get("document_type")),
+
+        "requested_by": lori_report_clean(payload.get("requested_by") or "LORI User"),
+        "request_notes": lori_report_clean(payload.get("request_notes")),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_report_requests",
+        request_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "Report request created.",
+        "request": created[0] if created else request_payload,
+        "template": template,
+    }
+
+
+@app.post("/report-generate-packet")
+async def report_generate_packet(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request_id = lori_report_clean(payload.get("request_id"))
+    report_code = lori_report_upper(payload.get("report_code"))
+
+    request = None
+
+    if request_id:
+        requests = await lori_report_get_rows(
+            "lori_report_requests",
+            f"select=*&id=eq.{quote(request_id)}&limit=1",
+        )
+        if not requests:
+            return {"status": "not_found", "message": "Report request not found."}
+        request = requests[0]
+        report_code = request.get("report_code")
+
+    if not report_code:
+        return {"status": "error", "message": "request_id or report_code is required."}
+
+    templates = await lori_report_get_rows(
+        "lori_report_templates",
+        f"select=*&report_code=eq.{quote(report_code)}&limit=1",
+    )
+
+    if not templates:
+        return {"status": "not_found", "message": f"Report template {report_code} was not found."}
+
+    template = templates[0]
+
+    if not request:
+        request = {
+            "request_title": payload.get("request_title") or template.get("report_name"),
+            "report_name": template.get("report_name"),
+            "report_category": template.get("report_category"),
+            "report_code": template.get("report_code"),
+            "company_name": payload.get("company_name"),
+            "region_code": payload.get("region_code"),
+            "region_name": payload.get("region_name"),
+            "operating_state": payload.get("operating_state"),
+            "city": payload.get("city"),
+            "station_code": payload.get("station_code"),
+            "station_name": payload.get("station_name"),
+            "route_group": payload.get("route_group"),
+            "route_id": payload.get("route_id"),
+            "driver_id": payload.get("driver_id"),
+            "driver_name": payload.get("driver_name"),
+            "employee_id": payload.get("employee_id"),
+            "employee_name": payload.get("employee_name"),
+            "date_range_start": payload.get("date_range_start"),
+            "date_range_end": payload.get("date_range_end"),
+            "requested_by": payload.get("requested_by") or "LORI User",
+        }
+
+    station_code = lori_report_upper(request.get("station_code"))
+    snapshot = await lori_report_snapshot_for_station(station_code) if station_code else await lori_report_snapshot_for_station("")
+
+    sections = lori_report_build_sections(template, request, snapshot)
+
+    executive_summary = sections[0].get("section_body") if sections else "Report generated by LORI."
+    attention_sections = [s for s in sections if s.get("requires_attention")]
+
+    key_findings = f"LORI generated {len(sections)} report sections. {len(attention_sections)} section(s) require attention."
+    recommended_actions = "Review report sections, confirm source data, and assign any required follow-up in Action Center."
+    risk_summary = "High attention required." if any(s.get("risk_level") == "High" for s in sections) else ("Medium attention required." if attention_sections else "No immediate high-risk items detected in available data.")
+
+    report_payload = {
+        "report_request_id": request_id or None,
+        "report_template_id": template.get("id"),
+
+        "report_title": lori_report_clean(payload.get("report_title") or request.get("request_title") or template.get("report_name")),
+        "report_name": template.get("report_name"),
+        "report_category": template.get("report_category"),
+        "report_code": template.get("report_code"),
+        "report_status": "Generated",
+
+        "company_name": request.get("company_name"),
+        "region_code": request.get("region_code"),
+        "region_name": request.get("region_name"),
+        "operating_state": request.get("operating_state"),
+        "city": request.get("city"),
+        "station_code": request.get("station_code"),
+        "station_name": request.get("station_name"),
+        "route_group": request.get("route_group"),
+        "route_id": request.get("route_id"),
+
+        "driver_id": request.get("driver_id"),
+        "driver_name": request.get("driver_name"),
+        "employee_id": request.get("employee_id"),
+        "employee_name": request.get("employee_name"),
+
+        "report_period_start": request.get("date_range_start") or None,
+        "report_period_end": request.get("date_range_end") or None,
+
+        "executive_summary": executive_summary,
+        "key_findings": key_findings,
+        "recommended_actions": recommended_actions,
+        "risk_summary": risk_summary,
+        "source_modules": template.get("source_modules") or [],
+
+        "report_plain_text": "\n\n".join([f"{s.get('section_title')}\n{s.get('section_body')}" for s in sections]),
+        "generated_by": payload.get("generated_by") or "LORI Reports Engine",
+    }
+
+    created_report = await lori_policy_supabase_post(
+        "lori_report_library",
+        report_payload,
+    )
+
+    report = created_report[0] if created_report else report_payload
+    report_id = report.get("id")
+
+    created_sections = []
+
+    for section in sections:
+        section_payload = {
+            "report_id": report_id,
+            **section,
+        }
+
+        created = await lori_policy_supabase_post(
+            "lori_report_sections",
+            section_payload,
+        )
+
+        if created:
+            created_sections.append(created[0])
+
+    html = lori_report_build_html(report, sections)
+
+    await lori_report_patch_rows(
+        "lori_report_library",
+        f"id=eq.{quote(str(report_id))}",
+        {
+            "report_html": html,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    if request_id:
+        await lori_report_patch_rows(
+            "lori_report_requests",
+            f"id=eq.{quote(request_id)}",
+            {
+                "request_status": "Generated",
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+    return {
+        "status": "success",
+        "message": "Report packet generated.",
+        "report": {**report, "report_html": html},
+        "sections_count": len(created_sections),
+        "sections": created_sections,
+        "source_snapshot_counts": {
+            "documents": len(snapshot.get("documents", [])),
+            "action_items": len(snapshot.get("action_items", [])),
+            "kpi_plans": len(snapshot.get("kpi_plans", [])),
+            "sops": len(snapshot.get("sops", [])),
+            "route_projects": len(snapshot.get("route_projects", [])),
+            "contract_reviews": len(snapshot.get("contract_reviews", [])),
+            "drivers": len(snapshot.get("drivers", [])),
+        },
+    }
+
+
+@app.get("/report-library")
+async def report_library(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    report_category: Optional[str] = Query(None),
+    report_code: Optional[str] = Query(None),
+    report_status: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    reports = await lori_report_get_rows(
+        "lori_report_library",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        reports = [r for r in reports if lori_report_upper(r.get("station_code")) == lori_report_upper(station_code)]
+
+    if report_category:
+        reports = [r for r in reports if lori_report_clean(r.get("report_category")).lower() == report_category.lower()]
+
+    if report_code:
+        reports = [r for r in reports if lori_report_upper(r.get("report_code")) == lori_report_upper(report_code)]
+
+    if report_status:
+        reports = [r for r in reports if lori_report_clean(r.get("report_status")).lower() == report_status.lower()]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "reports_count": len(reports[:limit]),
+        "reports": reports[:limit],
+    }
+
+
+@app.get("/report-detail")
+async def report_detail(
+    api_key: Optional[str] = Query(None),
+    report_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reports = await lori_report_get_rows(
+        "lori_report_library",
+        f"select=*&id=eq.{quote(report_id)}&limit=1",
+    )
+
+    if not reports:
+        return {"status": "not_found", "message": "Report not found."}
+
+    sections = await lori_report_get_rows(
+        "lori_report_sections",
+        f"select=*&report_id=eq.{quote(report_id)}&order=section_order.asc&limit=500",
+    )
+
+    source_links = await lori_report_safe_get_rows(
+        "lori_report_source_links",
+        f"select=*&report_id=eq.{quote(report_id)}&order=created_at.desc&limit=500",
+    )
+
+    exports = await lori_report_safe_get_rows(
+        "lori_report_export_history",
+        f"select=*&report_id=eq.{quote(report_id)}&order=created_at.desc&limit=200",
+    )
+
+    return {
+        "status": "success",
+        "report": reports[0],
+        "sections_count": len(sections),
+        "sections": sections,
+        "source_links_count": len(source_links),
+        "source_links": source_links,
+        "export_history_count": len(exports),
+        "export_history": exports,
+    }
+
+
+@app.get("/report-export-html")
+async def report_export_html(
+    api_key: Optional[str] = Query(None),
+    report_id: str = Query(...),
+    exported_by: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    detail = await report_detail(api_key=api_key, report_id=report_id)
+
+    if detail.get("status") != "success":
+        return detail
+
+    report = detail.get("report") or {}
+    sections = detail.get("sections") or []
+
+    html = report.get("report_html") or lori_report_build_html(report, sections)
+
+    await lori_policy_supabase_post(
+        "lori_report_export_history",
+        {
+            "report_id": report_id,
+            "export_type": "HTML Print",
+            "export_status": "Completed",
+            "exported_by": exported_by or "LORI User",
+            "export_notes": "HTML/print-ready report generated. PDF export is not enabled yet.",
+        },
+    )
+
+    return {
+        "status": "success",
+        "report_id": report_id,
+        "export_type": "HTML Print",
+        "pdf_export_available": False,
+        "html": html,
+        "message": "HTML print/export packet generated. PDF generation is not enabled yet.",
+    }
+
+
+@app.post("/report-status-update")
+async def report_status_update(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    report_id = lori_report_clean(payload.get("report_id"))
+    report_status = lori_report_clean(payload.get("report_status"))
+
+    if not report_id:
+        return {"status": "error", "message": "report_id is required."}
+
+    if not report_status:
+        return {"status": "error", "message": "report_status is required."}
+
+    update_payload = {
+        "report_status": report_status,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    if report_status == "Reviewed":
+        update_payload["reviewed_by"] = lori_report_clean(payload.get("reviewed_by") or "LORI User")
+        update_payload["reviewed_at"] = datetime.utcnow().isoformat()
+
+    if report_status == "Published":
+        update_payload["published_by"] = lori_report_clean(payload.get("published_by") or "LORI User")
+        update_payload["published_at"] = datetime.utcnow().isoformat()
+
+    updated = await lori_report_patch_rows(
+        "lori_report_library",
+        f"id=eq.{quote(report_id)}",
+        update_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": f"Report status updated to {report_status}.",
+        "report": updated[0] if updated else update_payload,
+    }
+
+
+@app.get("/report-requests")
+async def report_requests(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    request_status: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    requests = await lori_report_get_rows(
+        "lori_report_requests",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        requests = [r for r in requests if lori_report_upper(r.get("station_code")) == lori_report_upper(station_code)]
+
+    if request_status:
+        requests = [r for r in requests if lori_report_clean(r.get("request_status")).lower() == request_status.lower()]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "requests_count": len(requests[:limit]),
+        "requests": requests[:limit],
+    }
