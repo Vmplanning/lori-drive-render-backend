@@ -20997,3 +20997,805 @@ async def trend_quick_analyze_v2(
     Same safe endpoint with a non-Voiceflow path, available for Lovable or manual testing.
     """
     return await voiceflow_trend_quick_analyze(api_key=api_key, payload=payload)
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# VOICEFLOW ACTUAL TREND DATA ENDPOINT
+#
+# Purpose:
+# Returns actual dated trend data when available, instead of only
+# a general trend interpretation.
+#
+# Voiceflow URL:
+# POST /voiceflow/trend-quick-analyze-data
+# ============================================================
+
+from fastapi import Body, Query, HTTPException
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from urllib.parse import quote
+import os
+import uuid
+import httpx
+
+
+SUPABASE_URL_TREND_DATA = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_TREND_DATA = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_trend_data_clean(value: Any) -> str:
+    if value is None:
+        return ""
+
+    cleaned = " ".join(str(value).strip().split())
+
+    # Prevent Voiceflow placeholders from being treated as real values.
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        return ""
+
+    return cleaned
+
+
+def lori_trend_data_upper(value: Any) -> str:
+    return lori_trend_data_clean(value).upper()
+
+
+def lori_trend_data_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def lori_trend_data_require_key(api_key: Optional[str]):
+    """
+    Uses the existing LORI key checker if available.
+    Falls back to common environment variable names if needed.
+    """
+    try:
+        lori_regulatory_require_key(api_key)
+        return
+    except NameError:
+        pass
+
+    expected = (
+        os.getenv("LORI_API_KEY")
+        or os.getenv("LORI_DRIVE_API_KEY")
+        or os.getenv("API_KEY")
+        or os.getenv("VOICEFLOW_API_KEY")
+    )
+
+    if expected and api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+    if expected and not api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+async def lori_trend_data_supabase_get(table: str, query: str) -> List[Dict[str, Any]]:
+    """
+    Safe Supabase GET. Returns [] instead of crashing.
+    """
+    if not SUPABASE_URL_TREND_DATA or not SUPABASE_SERVICE_ROLE_KEY_TREND_DATA:
+        return []
+
+    url = f"{SUPABASE_URL_TREND_DATA}/rest/v1/{table}?{query}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_TREND_DATA,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_TREND_DATA}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(url, headers=headers)
+
+        if response.status_code >= 400:
+            return []
+
+        return response.json()
+    except Exception:
+        return []
+
+
+async def lori_trend_data_supabase_post(table: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Safe Supabase POST. Returns [] instead of crashing.
+    """
+    if not SUPABASE_URL_TREND_DATA or not SUPABASE_SERVICE_ROLE_KEY_TREND_DATA:
+        return []
+
+    url = f"{SUPABASE_URL_TREND_DATA}/rest/v1/{table}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_TREND_DATA,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_TREND_DATA}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+        if response.status_code >= 400:
+            return []
+
+        try:
+            return response.json()
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def lori_trend_data_infer_driver_name(payload: Dict[str, Any]) -> str:
+    """
+    Attempts to find a driver name even if Voiceflow fails to map driver_name.
+    """
+    driver_name = lori_trend_data_clean(payload.get("driver_name"))
+
+    if driver_name:
+        return driver_name
+
+    text = (
+        lori_trend_data_clean(payload.get("question_text"))
+        + " "
+        + lori_trend_data_clean(payload.get("trend_subject"))
+    ).lower()
+
+    known_drivers = [
+        "Marcus Hill",
+        "Avery Stone",
+        "Jordan Blake",
+        "Evan Miles",
+        "Tanya Reed",
+        "Calvin Price",
+        "Nia Carter",
+        "Sofia Grant",
+    ]
+
+    for name in known_drivers:
+        if name.lower() in text:
+            return name
+
+    return ""
+
+
+def lori_trend_data_infer_driver_id(payload: Dict[str, Any], driver_name: str) -> str:
+    driver_id = lori_trend_data_clean(payload.get("driver_id"))
+
+    if driver_id:
+        return driver_id
+
+    known_map = {
+        "Marcus Hill": "DEMO-D001",
+        "Tanya Reed": "DEMO-D002",
+        "Calvin Price": "DEMO-D003",
+        "Nia Carter": "DEMO-D004",
+        "Evan Miles": "DEMO-D005",
+        "Sofia Grant": "DEMO-D006",
+        "Avery Stone": "DEMO-D008",
+    }
+
+    return known_map.get(driver_name, "")
+
+
+def lori_trend_data_extract_date(row: Dict[str, Any]) -> str:
+    for key in [
+        "metric_date",
+        "record_date",
+        "event_date",
+        "counseling_date",
+        "action_date",
+        "created_at",
+        "updated_at",
+        "date",
+    ]:
+        value = lori_trend_data_clean(row.get(key))
+        if value:
+            return value[:10]
+
+    return ""
+
+
+def lori_trend_data_parse_date(value: str) -> datetime:
+    value = lori_trend_data_clean(value)
+
+    if not value:
+        return datetime.min
+
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        pass
+
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d")
+    except Exception:
+        return datetime.min
+
+
+def lori_trend_data_extract_numeric_metric(row: Dict[str, Any]) -> Tuple[str, Optional[float]]:
+    """
+    Finds a useful numeric metric from a row.
+    """
+    preferred_keys = [
+        "performance_score",
+        "safety_score",
+        "compliance_score",
+        "risk_score",
+        "on_time_rate",
+        "on_time_percentage",
+        "delivery_score",
+        "route_score",
+        "metric_value",
+        "score",
+        "rating",
+        "incident_count",
+        "counseling_count",
+        "late_count",
+        "missed_stop_count",
+        "exception_count",
+        "open_action_count",
+        "count",
+    ]
+
+    for key in preferred_keys:
+        if key in row and row.get(key) is not None:
+            try:
+                return key, float(row.get(key))
+            except Exception:
+                continue
+
+    # fallback: use the first numeric value that is not clearly an ID/year
+    for key, value in row.items():
+        if key.lower().endswith("id"):
+            continue
+        if key.lower() in ["year", "zip", "station_zip"]:
+            continue
+
+        try:
+            if value is not None and str(value).strip() != "":
+                return key, float(value)
+        except Exception:
+            continue
+
+    return "", None
+
+
+def lori_trend_data_month_key(date_text: str) -> str:
+    if not date_text:
+        return "Unknown Date"
+
+    return date_text[:7]
+
+
+def lori_trend_data_direction_from_values(values: List[float]) -> Dict[str, str]:
+    if len(values) < 2:
+        return {
+            "trend_direction": "Needs More Data",
+            "trend_strength": "Preliminary",
+            "confidence_level": "Low",
+            "risk_level": "Medium",
+        }
+
+    first = values[0]
+    last = values[-1]
+    change = last - first
+
+    if change > 0:
+        return {
+            "trend_direction": "Increasing",
+            "trend_strength": "Moderate" if abs(change) >= 2 else "Light",
+            "confidence_level": "Medium" if len(values) >= 3 else "Low",
+            "risk_level": "High" if abs(change) >= 5 else "Medium",
+        }
+
+    if change < 0:
+        return {
+            "trend_direction": "Decreasing",
+            "trend_strength": "Moderate" if abs(change) >= 2 else "Light",
+            "confidence_level": "Medium" if len(values) >= 3 else "Low",
+            "risk_level": "Low" if last <= first else "Medium",
+        }
+
+    return {
+        "trend_direction": "Flat",
+        "trend_strength": "Stable",
+        "confidence_level": "Medium" if len(values) >= 3 else "Low",
+        "risk_level": "Medium",
+    }
+
+
+def lori_trend_data_infer_category(payload: Dict[str, Any]) -> str:
+    combined = (
+        lori_trend_data_clean(payload.get("question_text"))
+        + " "
+        + lori_trend_data_clean(payload.get("trend_subject"))
+    ).lower()
+
+    if any(x in combined for x in ["driver", "marcus", "safety", "counseling", "coaching", "performance"]):
+        return "Driver Performance Trend"
+
+    if any(x in combined for x in ["route", "late", "delay", "stop", "work area", "route balance"]):
+        return "Route / Work Area Trend"
+
+    if any(x in combined for x in ["kpi", "metric", "score", "expected result"]):
+        return "KPI Trend"
+
+    if any(x in combined for x in ["sop", "acknowledgement", "procedure"]):
+        return "SOP Trend"
+
+    if any(x in combined for x in ["document", "upload", "employee handbook", "policy", "agreement"]):
+        return "Document Trend"
+
+    if any(x in combined for x in ["action", "task", "follow-up", "overdue"]):
+        return "Action Center Trend"
+
+    if any(x in combined for x in ["compliance", "regulatory", "dot", "fmcsa"]):
+        return "Compliance Trend"
+
+    return "Operational Trend"
+
+
+async def lori_trend_data_collect_driver_rows(
+    driver_id: str,
+    driver_name: str,
+    station_code: str,
+) -> List[Dict[str, Any]]:
+    """
+    Collects actual records from known LORI tables.
+    """
+    all_rows: List[Dict[str, Any]] = []
+
+    # Driver metrics
+    if driver_id:
+        rows = await lori_trend_data_supabase_get(
+            "lori_driver_metrics",
+            f"select=*&driver_id=eq.{quote(driver_id)}&order=created_at.asc&limit=50",
+        )
+        for row in rows:
+            row["_source_module"] = "Driver Metrics"
+            all_rows.append(row)
+
+    if driver_name:
+        rows = await lori_trend_data_supabase_get(
+            "lori_driver_metrics",
+            f"select=*&driver_name=ilike.*{quote(driver_name)}*&order=created_at.asc&limit=50",
+        )
+        for row in rows:
+            row["_source_module"] = "Driver Metrics"
+            all_rows.append(row)
+
+    # Safety events
+    if driver_id:
+        rows = await lori_trend_data_supabase_get(
+            "lori_driver_safety_events",
+            f"select=*&driver_id=eq.{quote(driver_id)}&order=created_at.asc&limit=50",
+        )
+        for row in rows:
+            row["_source_module"] = "Driver Safety Events"
+            all_rows.append(row)
+
+    if driver_name:
+        rows = await lori_trend_data_supabase_get(
+            "lori_driver_safety_events",
+            f"select=*&driver_name=ilike.*{quote(driver_name)}*&order=created_at.asc&limit=50",
+        )
+        for row in rows:
+            row["_source_module"] = "Driver Safety Events"
+            all_rows.append(row)
+
+    # Counseling records
+    if driver_id:
+        rows = await lori_trend_data_supabase_get(
+            "lori_driver_counseling",
+            f"select=*&driver_id=eq.{quote(driver_id)}&order=created_at.asc&limit=50",
+        )
+        for row in rows:
+            row["_source_module"] = "Driver Counseling"
+            all_rows.append(row)
+
+    if driver_name:
+        rows = await lori_trend_data_supabase_get(
+            "lori_driver_counseling",
+            f"select=*&driver_name=ilike.*{quote(driver_name)}*&order=created_at.asc&limit=50",
+        )
+        for row in rows:
+            row["_source_module"] = "Driver Counseling"
+            all_rows.append(row)
+
+    # Action items
+    if station_code:
+        rows = await lori_trend_data_supabase_get(
+            "lori_action_items",
+            f"select=*&station_code=eq.{quote(station_code)}&order=created_at.asc&limit=100",
+        )
+        for row in rows:
+            row_text = str(row).lower()
+            if driver_name and driver_name.lower() not in row_text:
+                continue
+            row["_source_module"] = "Action Center"
+            all_rows.append(row)
+
+    # Deduplicate by id/source
+    seen = set()
+    unique_rows = []
+
+    for row in all_rows:
+        row_id = str(row.get("id") or row.get("driver_id") or "") + "|" + row.get("_source_module", "")
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        unique_rows.append(row)
+
+    unique_rows.sort(key=lambda r: lori_trend_data_parse_date(lori_trend_data_extract_date(r)))
+
+    return unique_rows
+
+
+def lori_trend_data_build_points_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Converts actual rows into trend data points.
+    If numeric values are available, uses numeric trend.
+    If not, uses monthly record counts as actual trend data.
+    """
+    numeric_points = []
+
+    for row in rows:
+        date_text = lori_trend_data_extract_date(row)
+        metric_name, metric_value = lori_trend_data_extract_numeric_metric(row)
+
+        if metric_name and metric_value is not None:
+            numeric_points.append({
+                "date": date_text or "Unknown Date",
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+                "source_module": row.get("_source_module", "Unknown Source"),
+                "source_reference": str(row.get("id") or row.get("driver_id") or ""),
+                "notes": lori_trend_data_clean(
+                    row.get("notes")
+                    or row.get("event_type")
+                    or row.get("counseling_type")
+                    or row.get("action_title")
+                    or row.get("status")
+                    or ""
+                ),
+            })
+
+    if numeric_points:
+        values = [float(p["metric_value"]) for p in numeric_points]
+        direction = lori_trend_data_direction_from_values(values)
+
+        return {
+            "mode": "numeric",
+            "metric_used": numeric_points[0]["metric_name"],
+            "points": numeric_points,
+            "values": values,
+            "direction": direction,
+        }
+
+    # If no numeric metrics, use monthly counts of actual records.
+    monthly_counts: Dict[str, int] = {}
+
+    for row in rows:
+        date_text = lori_trend_data_extract_date(row)
+        month = lori_trend_data_month_key(date_text)
+        monthly_counts[month] = monthly_counts.get(month, 0) + 1
+
+    count_points = [
+        {
+            "date": month,
+            "metric_name": "record_count",
+            "metric_value": count,
+            "source_module": "Combined Actual Records",
+            "source_reference": "",
+            "notes": "Monthly count of related records found in LORI.",
+        }
+        for month, count in sorted(monthly_counts.items())
+    ]
+
+    values = [float(p["metric_value"]) for p in count_points]
+    direction = lori_trend_data_direction_from_values(values)
+
+    return {
+        "mode": "record_count",
+        "metric_used": "record_count",
+        "points": count_points,
+        "values": values,
+        "direction": direction,
+    }
+
+
+def lori_trend_data_format_points(points: List[Dict[str, Any]], limit: int = 8) -> str:
+    if not points:
+        return "No dated data points were found."
+
+    lines = []
+
+    for point in points[:limit]:
+        lines.append(
+            f"- {point.get('date')}: {point.get('metric_name')} = {point.get('metric_value')} "
+            f"({point.get('source_module')})"
+        )
+
+    if len(points) > limit:
+        lines.append(f"- Plus {len(points) - limit} additional data point(s).")
+
+    return "\n".join(lines)
+
+
+@app.post("/voiceflow/trend-quick-analyze-data")
+async def voiceflow_trend_quick_analyze_data(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    """
+    Actual trend data endpoint for Voiceflow.
+    This returns real data points if they exist in the LORI tables.
+    """
+    lori_trend_data_require_key(api_key)
+
+    payload = dict(payload or {})
+
+    question_text = lori_trend_data_clean(payload.get("question_text"))
+    trend_subject = lori_trend_data_clean(payload.get("trend_subject"))
+
+    if not question_text and not trend_subject:
+        return {
+            "status": "error",
+            "message": "question_text or trend_subject is required.",
+        }
+
+    company_name = lori_trend_data_clean(payload.get("company_name") or "Food Authority")
+    region_code = lori_trend_data_upper(payload.get("region_code") or "MID_ATLANTIC")
+    region_name = lori_trend_data_clean(payload.get("region_name") or "Mid-Atlantic")
+    operating_state = lori_trend_data_upper(payload.get("operating_state") or "MD")
+    city = lori_trend_data_clean(payload.get("city") or "Jessup")
+    station_code = lori_trend_data_upper(payload.get("station_code") or "JESSUP-01")
+    station_name = lori_trend_data_clean(payload.get("station_name") or "Jessup Delivery Station")
+    route_group = lori_trend_data_clean(payload.get("route_group") or "Delivery Operations")
+
+    driver_name = lori_trend_data_infer_driver_name(payload)
+    driver_id = lori_trend_data_infer_driver_id(payload, driver_name)
+
+    trend_category = lori_trend_data_infer_category(payload)
+
+    actual_rows = await lori_trend_data_collect_driver_rows(
+        driver_id=driver_id,
+        driver_name=driver_name,
+        station_code=station_code,
+    )
+
+    actual_data_used = len(actual_rows) > 0
+
+    trend_data = lori_trend_data_build_points_from_rows(actual_rows)
+
+    points = trend_data.get("points", [])
+    values = trend_data.get("values", [])
+    direction = trend_data.get("direction", {})
+    metric_used = trend_data.get("metric_used", "record_count")
+    mode = trend_data.get("mode", "none")
+
+    if values:
+        first_value = values[0]
+        latest_value = values[-1]
+        change_value = latest_value - first_value
+    else:
+        first_value = None
+        latest_value = None
+        change_value = None
+
+    if points:
+        date_range = f"{points[0].get('date')} to {points[-1].get('date')}"
+    else:
+        date_range = "No date range available"
+
+    request_id = str(uuid.uuid4())
+    result_id = str(uuid.uuid4())
+
+    trend_title = f"Trend Analysis — {driver_name or trend_subject or question_text}"
+
+    if actual_data_used:
+        trend_summary = (
+            f"LORI reviewed actual trend data for {driver_name or trend_subject}. "
+            f"The trend is categorized as {trend_category} with a current direction of {direction.get('trend_direction', 'Needs Review')}."
+        )
+    else:
+        trend_summary = (
+            f"LORI reviewed the trend request for {driver_name or trend_subject or question_text}, "
+            "but did not find enough dated source records to produce actual trend data. "
+            "More source records need to be uploaded or linked for a reliable trend."
+        )
+
+    actual_points_text = lori_trend_data_format_points(points)
+
+    if actual_data_used:
+        plain_language_explanation = (
+            f"LORI found {len(actual_rows)} related source record(s) and converted them into {len(points)} trend data point(s). "
+            f"The metric used was {metric_used}. The reviewed date range was {date_range}."
+        )
+    else:
+        plain_language_explanation = (
+            "LORI did not find enough dated source records in the current tables to produce a reliable actual trend. "
+            "This should be treated as a preliminary signal until more records are available."
+        )
+
+    recommended_action = (
+        "Review the source records, confirm whether the issue is isolated or recurring, and assign supervisor follow-up if the pattern is confirmed."
+    )
+
+    decision_support_note = (
+        "LORI provides operational decision support only. Trend analysis should be reviewed by authorized leadership before final action."
+    )
+
+    request_payload = {
+        "id": request_id,
+        "request_title": trend_title,
+        "question_text": question_text,
+        "trend_subject": trend_subject or driver_name or question_text,
+        "trend_category": trend_category,
+        "company_name": company_name,
+        "region_code": region_code,
+        "region_name": region_name,
+        "operating_state": operating_state,
+        "city": city,
+        "station_code": station_code,
+        "station_name": station_name,
+        "route_group": route_group,
+        "route_id": lori_trend_data_clean(payload.get("route_id")),
+        "driver_id": driver_id,
+        "driver_name": driver_name,
+        "employee_id": lori_trend_data_clean(payload.get("employee_id")),
+        "employee_name": lori_trend_data_clean(payload.get("employee_name")),
+        "requested_by": lori_trend_data_clean(payload.get("requested_by") or "Voiceflow / Ask LORI"),
+        "request_status": "Completed",
+        "user_requested_trend": bool(payload.get("user_requested_trend", True)),
+        "lori_offered_trend": bool(payload.get("lori_offered_trend", True)),
+        "created_at": lori_trend_data_now_iso(),
+        "updated_at": lori_trend_data_now_iso(),
+    }
+
+    saved_request = await lori_trend_data_supabase_post("lori_trend_requests", request_payload)
+
+    if saved_request and saved_request[0].get("id"):
+        request_id = saved_request[0]["id"]
+
+    result_payload = {
+        "id": result_id,
+        "trend_request_id": request_id,
+        "result_status": "Generated" if actual_data_used else "Not Enough Data",
+        "trend_title": trend_title,
+        "trend_summary": trend_summary,
+        "trend_direction": direction.get("trend_direction", "Needs More Data"),
+        "trend_strength": direction.get("trend_strength", "Preliminary"),
+        "confidence_level": direction.get("confidence_level", "Low"),
+        "risk_level": direction.get("risk_level", "Medium"),
+        "finding_type": "Actual Trend Data",
+        "finding_category": trend_category,
+        "plain_language_explanation": plain_language_explanation,
+        "leadership_summary": (
+            f"Leadership should review this {direction.get('risk_level', 'medium').lower()} risk trend signal for {station_code}."
+        ),
+        "counseling_summary": (
+            "If this trend is used for coaching or counseling, keep the conversation neutral and fact-based. "
+            "Review the source records before discussing the trend with the driver."
+        ),
+        "operational_summary": trend_summary,
+        "recommended_action": recommended_action,
+        "suggested_follow_up_question": "Would you like LORI to prepare a supervisor follow-up, counseling summary, action item, or reminder based on this trend?",
+        "decision_support_note": decision_support_note,
+        "should_offer_chart": True,
+        "should_offer_counseling_language": True,
+        "should_offer_leadership_packet": True,
+        "should_send_to_action_center": True,
+        "data_points_count": len(points),
+        "source_records_count": len(actual_rows),
+        "generated_by": "LORI Trend Intelligence",
+        "created_at": lori_trend_data_now_iso(),
+        "updated_at": lori_trend_data_now_iso(),
+    }
+
+    saved_result = await lori_trend_data_supabase_post("lori_trend_results", result_payload)
+
+    if saved_result and saved_result[0].get("id"):
+        result_id = saved_result[0]["id"]
+
+    for point in points:
+        point_payload = {
+            "trend_result_id": result_id,
+            "point_label": point.get("date"),
+            "metric_name": point.get("metric_name"),
+            "metric_value": point.get("metric_value"),
+            "source_module": point.get("source_module"),
+            "notes": point.get("notes"),
+            "created_at": lori_trend_data_now_iso(),
+        }
+        await lori_trend_data_supabase_post("lori_trend_data_points", point_payload)
+
+    for row in actual_rows[:25]:
+        source_payload = {
+            "trend_result_id": result_id,
+            "source_module": row.get("_source_module", "Unknown Source"),
+            "source_title": (
+                row.get("action_title")
+                or row.get("event_type")
+                or row.get("counseling_type")
+                or row.get("metric_name")
+                or "Trend source record"
+            ),
+            "source_reference": str(row.get("id") or row.get("driver_id") or ""),
+            "driver_id": driver_id,
+            "driver_name": driver_name,
+            "station_code": station_code,
+            "relevance": "Actual source record used for trend review.",
+            "created_at": lori_trend_data_now_iso(),
+        }
+        await lori_trend_data_supabase_post("lori_trend_source_records", source_payload)
+
+    if actual_data_used:
+        voiceflow_message = (
+            f"{trend_summary}\n\n"
+            f"Actual Trend Data:\n"
+            f"Data Points Reviewed: {len(points)}\n"
+            f"Source Records Reviewed: {len(actual_rows)}\n"
+            f"Date Range: {date_range}\n"
+            f"Metric Used: {metric_used}\n"
+            f"First Value: {first_value}\n"
+            f"Latest Value: {latest_value}\n"
+            f"Change: {change_value}\n\n"
+            f"Trend Direction: {direction.get('trend_direction', 'Needs More Data')}\n"
+            f"Trend Strength: {direction.get('trend_strength', 'Preliminary')}\n"
+            f"Confidence Level: {direction.get('confidence_level', 'Low')}\n"
+            f"Risk Level: {direction.get('risk_level', 'Medium')}\n\n"
+            f"Data Points:\n{actual_points_text}\n\n"
+            f"Recommended Action: {recommended_action}\n\n"
+            f"{decision_support_note}"
+        )
+    else:
+        voiceflow_message = (
+            f"{trend_summary}\n\n"
+            f"Actual Trend Data:\n"
+            f"Data Points Reviewed: 0\n"
+            f"Source Records Reviewed: 0\n"
+            f"Date Range: Not available\n"
+            f"Metric Used: Not available\n\n"
+            f"Recommended Action: Upload or link dated driver performance, counseling, safety, route, KPI, or action records so LORI can calculate a reliable trend.\n\n"
+            f"{decision_support_note}"
+        )
+
+    return {
+        "status": "success",
+        "actual_data_used": actual_data_used,
+        "voiceflow_message": voiceflow_message,
+        "trend_request_id": request_id,
+        "trend_result_id": result_id,
+        "trend_title": trend_title,
+        "trend_summary": trend_summary,
+        "trend_direction": direction.get("trend_direction", "Needs More Data"),
+        "trend_strength": direction.get("trend_strength", "Preliminary"),
+        "confidence_level": direction.get("confidence_level", "Low"),
+        "risk_level": direction.get("risk_level", "Medium"),
+        "finding_category": trend_category,
+        "metric_used": metric_used,
+        "first_value": first_value,
+        "latest_value": latest_value,
+        "change_value": change_value,
+        "date_range": date_range,
+        "plain_language_explanation": plain_language_explanation,
+        "recommended_action": recommended_action,
+        "decision_support_note": decision_support_note,
+        "data_points_count": len(points),
+        "source_records_count": len(actual_rows),
+        "data_points": points,
+        "source_records": actual_rows[:25],
+    }
+
+
+@app.post("/trend-quick-analyze-data")
+async def trend_quick_analyze_data(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    """
+    Same actual-data endpoint for Lovable/manual testing.
+    """
+    return await voiceflow_trend_quick_analyze_data(api_key=api_key, payload=payload)
