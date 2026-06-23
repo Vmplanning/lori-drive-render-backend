@@ -19725,3 +19725,723 @@ async def trend_requests(
         "requests_count": len(requests[:limit]),
         "requests": requests[:limit],
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# CALENDAR & REMINDER ENGINE
+# Internal LORI reminders and calendar-style follow-up events.
+# External Google/Outlook calendar sync can be added later.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime, date, timedelta
+import os
+import httpx
+
+
+SUPABASE_URL_CALENDAR = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_CALENDAR = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_calendar_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_calendar_upper(value: Any) -> str:
+    return lori_calendar_clean(value).upper()
+
+
+def lori_calendar_today() -> str:
+    return date.today().isoformat()
+
+
+def lori_calendar_parse_due_date(value: Any) -> Optional[str]:
+    text = lori_calendar_clean(value)
+    if not text:
+        return None
+
+    try:
+        if "T" in text:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+        return date.fromisoformat(text[:10]).isoformat()
+    except Exception:
+        return None
+
+
+def lori_calendar_parse_due_time(value: Any) -> Optional[str]:
+    text = lori_calendar_clean(value)
+    if not text:
+        return None
+
+    try:
+        if len(text) >= 5:
+            return text[:5]
+        return None
+    except Exception:
+        return None
+
+
+def lori_calendar_make_datetime(due_date: Any, due_time: Any) -> Optional[str]:
+    due_date_clean = lori_calendar_parse_due_date(due_date)
+    due_time_clean = lori_calendar_parse_due_time(due_time)
+
+    if not due_date_clean:
+        return None
+
+    if not due_time_clean:
+        due_time_clean = "09:00"
+
+    return f"{due_date_clean}T{due_time_clean}:00+00:00"
+
+
+async def lori_calendar_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_calendar_patch_rows(
+    table: str,
+    match_query: str,
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not SUPABASE_URL_CALENDAR or not SUPABASE_SERVICE_ROLE_KEY_CALENDAR:
+        raise RuntimeError("Missing Supabase environment variables.")
+
+    url = f"{SUPABASE_URL_CALENDAR}/rest/v1/{table}?{match_query}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_CALENDAR,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_CALENDAR}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(url, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase PATCH failed: {response.status_code} {response.text}")
+
+    try:
+        return response.json()
+    except Exception:
+        return []
+
+
+async def lori_calendar_log_activity(
+    reminder_id: str,
+    activity_type: str,
+    activity_summary: str,
+    activity_by_name: str = "",
+    activity_by_email: str = "",
+    old_status: str = "",
+    new_status: str = "",
+    activity_metadata: Optional[Dict[str, Any]] = None,
+):
+    payload = {
+        "reminder_id": reminder_id,
+        "activity_type": activity_type,
+        "activity_summary": activity_summary,
+        "activity_by_name": activity_by_name,
+        "activity_by_email": activity_by_email,
+        "old_status": old_status,
+        "new_status": new_status,
+        "activity_metadata": activity_metadata or {},
+    }
+
+    try:
+        await lori_policy_supabase_post("lori_calendar_reminder_activity_log", payload)
+    except Exception:
+        pass
+
+
+@app.get("/calendar-reminder-templates")
+async def calendar_reminder_templates(
+    api_key: Optional[str] = Query(None),
+    related_module: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    templates = await lori_calendar_get_rows(
+        "lori_calendar_reminder_templates",
+        "select=*&order=template_name.asc&limit=500",
+    )
+
+    if related_module:
+        templates = [
+            t for t in templates
+            if lori_calendar_clean(t.get("related_module")).lower() == related_module.lower()
+        ]
+
+    return {
+        "status": "success",
+        "templates_count": len(templates),
+        "templates": templates,
+    }
+
+
+@app.get("/calendar-reminders-summary")
+async def calendar_reminders_summary(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    assigned_to_email: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminders = await lori_calendar_get_rows(
+        "lori_calendar_reminders",
+        "select=*&order=created_at.desc&limit=5000",
+    )
+
+    if station_code:
+        reminders = [
+            r for r in reminders
+            if lori_calendar_upper(r.get("station_code")) == lori_calendar_upper(station_code)
+        ]
+
+    if assigned_to_email:
+        reminders = [
+            r for r in reminders
+            if lori_calendar_clean(r.get("assigned_to_email")).lower() == assigned_to_email.lower()
+        ]
+
+    today = date.today()
+
+    def due_date_obj(row):
+        try:
+            return date.fromisoformat(str(row.get("due_date"))[:10])
+        except Exception:
+            return None
+
+    open_items = [
+        r for r in reminders
+        if lori_calendar_clean(r.get("reminder_status")).lower() in ["open", "scheduled", "snoozed"]
+    ]
+
+    overdue_items = [
+        r for r in open_items
+        if due_date_obj(r) and due_date_obj(r) < today
+    ]
+
+    due_today_items = [
+        r for r in open_items
+        if due_date_obj(r) and due_date_obj(r) == today
+    ]
+
+    upcoming_items = [
+        r for r in open_items
+        if due_date_obj(r) and today < due_date_obj(r) <= today + timedelta(days=7)
+    ]
+
+    return {
+        "status": "success",
+        "reminders_count": len(reminders),
+        "open_count": len(open_items),
+        "scheduled_count": len([r for r in reminders if r.get("reminder_status") == "Scheduled"]),
+        "completed_count": len([r for r in reminders if r.get("reminder_status") == "Completed"]),
+        "cancelled_count": len([r for r in reminders if r.get("reminder_status") == "Cancelled"]),
+        "overdue_count": len(overdue_items),
+        "due_today_count": len(due_today_items),
+        "upcoming_7_days_count": len(upcoming_items),
+        "urgent_count": len([r for r in reminders if r.get("priority") == "Urgent"]),
+        "important_count": len([r for r in reminders if r.get("priority") == "Important"]),
+        "external_calendar_status": "Not Connected",
+        "external_calendar_note": "Internal LORI reminders are available. Google/Outlook calendar sync is not connected yet.",
+    }
+
+
+@app.get("/calendar-reminders")
+async def calendar_reminders(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    related_module: Optional[str] = Query(None),
+    reminder_status: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    assigned_to_email: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    employee_name: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    due_from: Optional[str] = Query(None),
+    due_to: Optional[str] = Query(None),
+    limit: int = Query(300),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminders = await lori_calendar_get_rows(
+        "lori_calendar_reminders",
+        "select=*&order=due_date.asc,created_at.desc&limit=5000",
+    )
+
+    if station_code:
+        reminders = [r for r in reminders if lori_calendar_upper(r.get("station_code")) == lori_calendar_upper(station_code)]
+
+    if related_module:
+        reminders = [r for r in reminders if lori_calendar_clean(r.get("related_module")).lower() == related_module.lower()]
+
+    if reminder_status:
+        reminders = [r for r in reminders if lori_calendar_clean(r.get("reminder_status")).lower() == reminder_status.lower()]
+
+    if priority:
+        reminders = [r for r in reminders if lori_calendar_clean(r.get("priority")).lower() == priority.lower()]
+
+    if assigned_to_email:
+        reminders = [r for r in reminders if lori_calendar_clean(r.get("assigned_to_email")).lower() == assigned_to_email.lower()]
+
+    if driver_name:
+        reminders = [r for r in reminders if driver_name.lower() in lori_calendar_clean(r.get("driver_name")).lower()]
+
+    if employee_name:
+        reminders = [r for r in reminders if employee_name.lower() in lori_calendar_clean(r.get("employee_name")).lower()]
+
+    if route_id:
+        reminders = [r for r in reminders if lori_calendar_clean(r.get("route_id")).lower() == route_id.lower()]
+
+    due_from_date = lori_calendar_parse_due_date(due_from)
+    due_to_date = lori_calendar_parse_due_date(due_to)
+
+    if due_from_date:
+        reminders = [
+            r for r in reminders
+            if r.get("due_date") and str(r.get("due_date"))[:10] >= due_from_date
+        ]
+
+    if due_to_date:
+        reminders = [
+            r for r in reminders
+            if r.get("due_date") and str(r.get("due_date"))[:10] <= due_to_date
+        ]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "reminders_count": len(reminders[:limit]),
+        "reminders": reminders[:limit],
+    }
+
+
+@app.post("/calendar-reminder-create")
+async def calendar_reminder_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminder_title = lori_calendar_clean(payload.get("reminder_title"))
+
+    if not reminder_title:
+        return {"status": "error", "message": "reminder_title is required."}
+
+    due_date = lori_calendar_parse_due_date(payload.get("due_date"))
+    due_time = lori_calendar_parse_due_time(payload.get("due_time"))
+    reminder_datetime = lori_calendar_make_datetime(due_date, due_time)
+
+    reminder_payload = {
+        "reminder_title": reminder_title,
+        "reminder_type": lori_calendar_clean(payload.get("reminder_type") or "Internal Reminder"),
+        "reminder_status": lori_calendar_clean(payload.get("reminder_status") or "Open"),
+        "priority": lori_calendar_clean(payload.get("priority") or "Normal"),
+
+        "company_name": lori_calendar_clean(payload.get("company_name")),
+        "region_code": lori_calendar_upper(payload.get("region_code")),
+        "region_name": lori_calendar_clean(payload.get("region_name")),
+        "operating_state": lori_calendar_upper(payload.get("operating_state")),
+        "city": lori_calendar_clean(payload.get("city")),
+        "station_code": lori_calendar_upper(payload.get("station_code")),
+        "station_name": lori_calendar_clean(payload.get("station_name")),
+        "route_group": lori_calendar_clean(payload.get("route_group")),
+        "route_id": lori_calendar_clean(payload.get("route_id")),
+
+        "related_module": lori_calendar_clean(payload.get("related_module")),
+        "related_record_id": payload.get("related_record_id") or None,
+        "related_reference": lori_calendar_clean(payload.get("related_reference")),
+
+        "driver_id": lori_calendar_clean(payload.get("driver_id")),
+        "driver_name": lori_calendar_clean(payload.get("driver_name")),
+        "employee_id": lori_calendar_clean(payload.get("employee_id")),
+        "employee_name": lori_calendar_clean(payload.get("employee_name")),
+
+        "document_id": payload.get("document_id") or None,
+        "document_title": lori_calendar_clean(payload.get("document_title")),
+        "sop_id": payload.get("sop_id") or None,
+        "sop_title": lori_calendar_clean(payload.get("sop_title")),
+        "report_id": payload.get("report_id") or None,
+        "report_title": lori_calendar_clean(payload.get("report_title")),
+        "action_item_id": payload.get("action_item_id") or None,
+        "action_title": lori_calendar_clean(payload.get("action_title")),
+        "kpi_plan_id": payload.get("kpi_plan_id") or None,
+        "kpi_plan_title": lori_calendar_clean(payload.get("kpi_plan_title")),
+        "route_project_id": payload.get("route_project_id") or None,
+        "route_project_title": lori_calendar_clean(payload.get("route_project_title")),
+
+        "due_date": due_date,
+        "due_time": due_time,
+        "reminder_datetime": reminder_datetime,
+
+        "assigned_to_name": lori_calendar_clean(payload.get("assigned_to_name")),
+        "assigned_to_email": lori_calendar_clean(payload.get("assigned_to_email")),
+        "created_by_name": lori_calendar_clean(payload.get("created_by_name") or payload.get("created_by") or "LORI User"),
+        "created_by_email": lori_calendar_clean(payload.get("created_by_email")),
+
+        "reminder_notes": lori_calendar_clean(payload.get("reminder_notes") or payload.get("notes")),
+        "voiceflow_created": bool(payload.get("voiceflow_created", False)),
+        "ask_lori_created": bool(payload.get("ask_lori_created", False)),
+
+        "external_calendar_status": "Not Connected",
+        "external_calendar_provider": None,
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_calendar_reminders",
+        reminder_payload,
+    )
+
+    reminder = created[0] if created else reminder_payload
+    reminder_id = reminder.get("id")
+
+    if reminder_id:
+        await lori_calendar_log_activity(
+            reminder_id=reminder_id,
+            activity_type="Created",
+            activity_summary="Internal LORI reminder created.",
+            activity_by_name=reminder_payload["created_by_name"],
+            activity_by_email=reminder_payload["created_by_email"],
+            old_status="",
+            new_status=reminder_payload["reminder_status"],
+            activity_metadata={
+                "related_module": reminder_payload["related_module"],
+                "voiceflow_created": reminder_payload["voiceflow_created"],
+                "ask_lori_created": reminder_payload["ask_lori_created"],
+                "external_calendar_status": "Not Connected",
+            },
+        )
+
+        if reminder_payload["assigned_to_name"] or reminder_payload["assigned_to_email"]:
+            await lori_policy_supabase_post(
+                "lori_calendar_reminder_participants",
+                {
+                    "reminder_id": reminder_id,
+                    "participant_name": reminder_payload["assigned_to_name"],
+                    "participant_email": reminder_payload["assigned_to_email"],
+                    "participant_role": "Assigned Owner",
+                    "participant_type": "Assigned User",
+                    "participation_status": "Pending",
+                },
+            )
+
+    return {
+        "status": "success",
+        "message": "Internal LORI reminder created.",
+        "reminder": reminder,
+        "external_calendar_status": "Not Connected",
+        "external_calendar_note": "This was saved as an internal LORI reminder. Google/Outlook calendar sync is not connected yet.",
+    }
+
+
+@app.get("/calendar-reminder-detail")
+async def calendar_reminder_detail(
+    api_key: Optional[str] = Query(None),
+    reminder_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminders = await lori_calendar_get_rows(
+        "lori_calendar_reminders",
+        f"select=*&id=eq.{quote(reminder_id)}&limit=1",
+    )
+
+    if not reminders:
+        return {"status": "not_found", "message": "Reminder not found."}
+
+    participants = await lori_calendar_get_rows(
+        "lori_calendar_reminder_participants",
+        f"select=*&reminder_id=eq.{quote(reminder_id)}&order=created_at.asc&limit=100",
+    )
+
+    activity = await lori_calendar_get_rows(
+        "lori_calendar_reminder_activity_log",
+        f"select=*&reminder_id=eq.{quote(reminder_id)}&order=created_at.desc&limit=200",
+    )
+
+    return {
+        "status": "success",
+        "reminder": reminders[0],
+        "participants_count": len(participants),
+        "participants": participants,
+        "activity_count": len(activity),
+        "activity": activity,
+    }
+
+
+@app.post("/calendar-reminder-update")
+async def calendar_reminder_update(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminder_id = lori_calendar_clean(payload.get("reminder_id"))
+
+    if not reminder_id:
+        return {"status": "error", "message": "reminder_id is required."}
+
+    existing_rows = await lori_calendar_get_rows(
+        "lori_calendar_reminders",
+        f"select=*&id=eq.{quote(reminder_id)}&limit=1",
+    )
+
+    if not existing_rows:
+        return {"status": "not_found", "message": "Reminder not found."}
+
+    existing = existing_rows[0]
+
+    due_date = lori_calendar_parse_due_date(payload.get("due_date") or existing.get("due_date"))
+    due_time = lori_calendar_parse_due_time(payload.get("due_time") or existing.get("due_time"))
+    reminder_datetime = lori_calendar_make_datetime(due_date, due_time)
+
+    update_payload = {
+        "reminder_title": lori_calendar_clean(payload.get("reminder_title") or existing.get("reminder_title")),
+        "reminder_type": lori_calendar_clean(payload.get("reminder_type") or existing.get("reminder_type")),
+        "reminder_status": lori_calendar_clean(payload.get("reminder_status") or existing.get("reminder_status")),
+        "priority": lori_calendar_clean(payload.get("priority") or existing.get("priority")),
+        "due_date": due_date,
+        "due_time": due_time,
+        "reminder_datetime": reminder_datetime,
+        "assigned_to_name": lori_calendar_clean(payload.get("assigned_to_name") or existing.get("assigned_to_name")),
+        "assigned_to_email": lori_calendar_clean(payload.get("assigned_to_email") or existing.get("assigned_to_email")),
+        "reminder_notes": lori_calendar_clean(payload.get("reminder_notes") or existing.get("reminder_notes")),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    updated = await lori_calendar_patch_rows(
+        "lori_calendar_reminders",
+        f"id=eq.{quote(reminder_id)}",
+        update_payload,
+    )
+
+    await lori_calendar_log_activity(
+        reminder_id=reminder_id,
+        activity_type="Updated",
+        activity_summary="Internal LORI reminder updated.",
+        activity_by_name=lori_calendar_clean(payload.get("updated_by_name") or "LORI User"),
+        activity_by_email=lori_calendar_clean(payload.get("updated_by_email")),
+        old_status=existing.get("reminder_status"),
+        new_status=update_payload["reminder_status"],
+        activity_metadata=update_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "Reminder updated.",
+        "reminder": updated[0] if updated else update_payload,
+    }
+
+
+@app.post("/calendar-reminder-complete")
+async def calendar_reminder_complete(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminder_id = lori_calendar_clean(payload.get("reminder_id"))
+
+    if not reminder_id:
+        return {"status": "error", "message": "reminder_id is required."}
+
+    completed_by_name = lori_calendar_clean(payload.get("completed_by_name") or "LORI User")
+    completed_by_email = lori_calendar_clean(payload.get("completed_by_email"))
+
+    updated = await lori_calendar_patch_rows(
+        "lori_calendar_reminders",
+        f"id=eq.{quote(reminder_id)}",
+        {
+            "reminder_status": "Completed",
+            "completed_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_calendar_log_activity(
+        reminder_id=reminder_id,
+        activity_type="Completed",
+        activity_summary=lori_calendar_clean(payload.get("completion_notes") or "Reminder completed."),
+        activity_by_name=completed_by_name,
+        activity_by_email=completed_by_email,
+        new_status="Completed",
+    )
+
+    return {
+        "status": "success",
+        "message": "Reminder completed.",
+        "reminder": updated[0] if updated else {"id": reminder_id, "reminder_status": "Completed"},
+    }
+
+
+@app.post("/calendar-reminder-cancel")
+async def calendar_reminder_cancel(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminder_id = lori_calendar_clean(payload.get("reminder_id"))
+
+    if not reminder_id:
+        return {"status": "error", "message": "reminder_id is required."}
+
+    cancelled_by_name = lori_calendar_clean(payload.get("cancelled_by_name") or "LORI User")
+    cancelled_by_email = lori_calendar_clean(payload.get("cancelled_by_email"))
+    cancel_reason = lori_calendar_clean(payload.get("cancel_reason") or "Reminder cancelled.")
+
+    updated = await lori_calendar_patch_rows(
+        "lori_calendar_reminders",
+        f"id=eq.{quote(reminder_id)}",
+        {
+            "reminder_status": "Cancelled",
+            "cancelled_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_calendar_log_activity(
+        reminder_id=reminder_id,
+        activity_type="Cancelled",
+        activity_summary=cancel_reason,
+        activity_by_name=cancelled_by_name,
+        activity_by_email=cancelled_by_email,
+        new_status="Cancelled",
+    )
+
+    return {
+        "status": "success",
+        "message": "Reminder cancelled.",
+        "reminder": updated[0] if updated else {"id": reminder_id, "reminder_status": "Cancelled"},
+    }
+
+
+@app.post("/calendar-reminder-snooze")
+async def calendar_reminder_snooze(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    reminder_id = lori_calendar_clean(payload.get("reminder_id"))
+    snoozed_until = lori_calendar_clean(payload.get("snoozed_until"))
+
+    if not reminder_id:
+        return {"status": "error", "message": "reminder_id is required."}
+
+    if not snoozed_until:
+        return {"status": "error", "message": "snoozed_until is required."}
+
+    updated = await lori_calendar_patch_rows(
+        "lori_calendar_reminders",
+        f"id=eq.{quote(reminder_id)}",
+        {
+            "reminder_status": "Snoozed",
+            "snoozed_until": snoozed_until,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    await lori_calendar_log_activity(
+        reminder_id=reminder_id,
+        activity_type="Snoozed",
+        activity_summary=f"Reminder snoozed until {snoozed_until}.",
+        activity_by_name=lori_calendar_clean(payload.get("snoozed_by_name") or "LORI User"),
+        activity_by_email=lori_calendar_clean(payload.get("snoozed_by_email")),
+        new_status="Snoozed",
+        activity_metadata={"snoozed_until": snoozed_until},
+    )
+
+    return {
+        "status": "success",
+        "message": "Reminder snoozed.",
+        "reminder": updated[0] if updated else {"id": reminder_id, "reminder_status": "Snoozed"},
+    }
+
+
+@app.get("/calendar-reminders-due")
+async def calendar_reminders_due(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    assigned_to_email: Optional[str] = Query(None),
+    days_ahead: int = Query(7),
+):
+    lori_regulatory_require_key(api_key)
+
+    today = date.today()
+    end_date = today + timedelta(days=max(0, min(days_ahead, 60)))
+
+    response = await calendar_reminders(
+        api_key=api_key,
+        station_code=station_code,
+        assigned_to_email=assigned_to_email,
+        limit=1000,
+    )
+
+    reminders = response.get("reminders", [])
+
+    due = []
+
+    for reminder in reminders:
+        if reminder.get("reminder_status") in ["Completed", "Cancelled"]:
+            continue
+
+        due_date = lori_calendar_parse_due_date(reminder.get("due_date"))
+
+        if not due_date:
+            continue
+
+        due_date_obj = date.fromisoformat(due_date)
+
+        if today <= due_date_obj <= end_date:
+            due.append(reminder)
+
+    return {
+        "status": "success",
+        "due_count": len(due),
+        "date_range_start": today.isoformat(),
+        "date_range_end": end_date.isoformat(),
+        "reminders": due,
+    }
+
+
+@app.post("/voiceflow/calendar-reminder-create")
+async def voiceflow_calendar_reminder_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    payload = dict(payload or {})
+    payload["voiceflow_created"] = True
+    payload["ask_lori_created"] = True
+
+    if not payload.get("created_by_name"):
+        payload["created_by_name"] = payload.get("user_name") or "Voiceflow / Ask LORI"
+
+    if not payload.get("reminder_type"):
+        payload["reminder_type"] = "Internal Reminder"
+
+    if not payload.get("related_module"):
+        payload["related_module"] = "Ask LORI"
+
+    created = await calendar_reminder_create(api_key=api_key, payload=payload)
+
+    if created.get("status") == "success":
+        return {
+            "status": "success",
+            "voiceflow_message": "Reminder created inside LORI. External calendar sync is not connected yet.",
+            "reminder": created.get("reminder"),
+            "external_calendar_status": "Not Connected",
+        }
+
+    return created
