@@ -20445,3 +20445,555 @@ async def voiceflow_calendar_reminder_create(
         }
 
     return created
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# SAFE VOICEFLOW TREND INTELLIGENCE ENDPOINT
+# Use this endpoint from Voiceflow instead of the older
+# /trend-quick-analyze route if the older route is throwing 500.
+#
+# Voiceflow URL:
+# POST /voiceflow/trend-quick-analyze
+# ============================================================
+
+from fastapi import Body, Query, HTTPException
+from typing import Any, Dict, List, Optional
+from datetime import datetime, date
+from urllib.parse import quote
+import os
+import uuid
+import httpx
+
+
+SUPABASE_URL_TREND_VF = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_TREND_VF = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_trend_vf_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_trend_vf_upper(value: Any) -> str:
+    return lori_trend_vf_clean(value).upper()
+
+
+def lori_trend_vf_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def lori_trend_vf_require_key(api_key: Optional[str]):
+    """
+    Uses the existing LORI key checker if available.
+    Falls back to common environment variable names if needed.
+    """
+    try:
+        lori_regulatory_require_key(api_key)
+        return
+    except NameError:
+        pass
+
+    expected = (
+        os.getenv("LORI_API_KEY")
+        or os.getenv("LORI_DRIVE_API_KEY")
+        or os.getenv("API_KEY")
+        or os.getenv("VOICEFLOW_API_KEY")
+    )
+
+    if expected and api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+    if expected and not api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+async def lori_trend_vf_supabase_get(table: str, query: str) -> List[Dict[str, Any]]:
+    """
+    Safe Supabase GET.
+    Returns [] instead of crashing the trend endpoint.
+    """
+    if not SUPABASE_URL_TREND_VF or not SUPABASE_SERVICE_ROLE_KEY_TREND_VF:
+        return []
+
+    url = f"{SUPABASE_URL_TREND_VF}/rest/v1/{table}?{query}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_TREND_VF,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_TREND_VF}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(url, headers=headers)
+
+        if response.status_code >= 400:
+            return []
+
+        return response.json()
+    except Exception:
+        return []
+
+
+async def lori_trend_vf_supabase_post(table: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Safe Supabase POST.
+    Returns [] instead of crashing the trend endpoint.
+    """
+    if not SUPABASE_URL_TREND_VF or not SUPABASE_SERVICE_ROLE_KEY_TREND_VF:
+        return []
+
+    url = f"{SUPABASE_URL_TREND_VF}/rest/v1/{table}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_TREND_VF,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_TREND_VF}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+        if response.status_code >= 400:
+            return []
+
+        try:
+            return response.json()
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def lori_trend_vf_infer_category(payload: Dict[str, Any]) -> str:
+    question = lori_trend_vf_clean(payload.get("question_text")).lower()
+    subject = lori_trend_vf_clean(payload.get("trend_subject")).lower()
+
+    combined = f"{question} {subject}"
+
+    if any(x in combined for x in ["driver", "marcus", "safety", "counseling", "coaching", "performance"]):
+        return "Driver Performance Trend"
+
+    if any(x in combined for x in ["route", "late", "delay", "stop", "work area", "route balance"]):
+        return "Route / Work Area Trend"
+
+    if any(x in combined for x in ["kpi", "metric", "score", "expected result"]):
+        return "KPI Trend"
+
+    if any(x in combined for x in ["sop", "acknowledgement", "procedure"]):
+        return "SOP Trend"
+
+    if any(x in combined for x in ["document", "upload", "employee handbook", "policy", "agreement"]):
+        return "Document Trend"
+
+    if any(x in combined for x in ["action", "task", "follow-up", "overdue"]):
+        return "Action Center Trend"
+
+    if any(x in combined for x in ["compliance", "regulatory", "dot", "fmcsa"]):
+        return "Compliance Trend"
+
+    return "Operational Trend"
+
+
+def lori_trend_vf_infer_direction(payload: Dict[str, Any], source_count: int) -> Dict[str, str]:
+    question = lori_trend_vf_clean(payload.get("question_text")).lower()
+    subject = lori_trend_vf_clean(payload.get("trend_subject")).lower()
+    combined = f"{question} {subject}"
+
+    if any(x in combined for x in ["keep having issues", "worse", "worsening", "increasing", "more accidents", "always late", "falling behind"]):
+        return {
+            "trend_direction": "Worsening",
+            "trend_strength": "Moderate" if source_count else "Preliminary",
+            "confidence_level": "Medium" if source_count >= 3 else "Low",
+            "risk_level": "Medium" if source_count < 5 else "High",
+        }
+
+    if any(x in combined for x in ["better", "improving", "improved", "less", "reduced"]):
+        return {
+            "trend_direction": "Improving",
+            "trend_strength": "Moderate" if source_count else "Preliminary",
+            "confidence_level": "Medium" if source_count >= 3 else "Low",
+            "risk_level": "Low",
+        }
+
+    return {
+        "trend_direction": "Needs Review",
+        "trend_strength": "Preliminary",
+        "confidence_level": "Low" if source_count < 3 else "Medium",
+        "risk_level": "Medium",
+    }
+
+
+def lori_trend_vf_build_summary(payload: Dict[str, Any], source_count: int, category: str, direction: Dict[str, str]) -> Dict[str, str]:
+    question = lori_trend_vf_clean(payload.get("question_text"))
+    subject = lori_trend_vf_clean(payload.get("trend_subject"))
+    driver_name = lori_trend_vf_clean(payload.get("driver_name"))
+    route_id = lori_trend_vf_clean(payload.get("route_id"))
+    station_code = lori_trend_vf_clean(payload.get("station_code") or "JESSUP-01")
+
+    display_subject = subject or driver_name or route_id or question or "Operational trend"
+
+    if driver_name:
+        trend_title = f"Trend Analysis — {driver_name}"
+        trend_summary = (
+            f"LORI reviewed the trend request for {driver_name}. "
+            f"The pattern is categorized as {category} with a current direction of {direction['trend_direction']}."
+        )
+    elif route_id:
+        trend_title = f"Trend Analysis — Route {route_id}"
+        trend_summary = (
+            f"LORI reviewed the trend request for route {route_id}. "
+            f"The pattern is categorized as {category} with a current direction of {direction['trend_direction']}."
+        )
+    else:
+        trend_title = f"Trend Analysis — {display_subject}"
+        trend_summary = (
+            f"LORI reviewed the requested operational trend. "
+            f"The pattern is categorized as {category} with a current direction of {direction['trend_direction']}."
+        )
+
+    if source_count == 0:
+        source_note = (
+            "LORI did not find enough dated source records in this quick Voiceflow review to create a fully reliable trend. "
+            "This should be treated as a preliminary operational signal."
+        )
+    else:
+        source_note = (
+            f"LORI found {source_count} possible source record(s) that may support this trend review. "
+            "The source records should be reviewed before taking action."
+        )
+
+    plain_language = (
+        f"Based on the question, this may indicate a recurring operational issue that needs closer review. "
+        f"{source_note}"
+    )
+
+    leadership_summary = (
+        f"Leadership should treat this as a {direction['risk_level'].lower()} risk trend signal for {station_code}. "
+        "The next step is to validate the source records and assign the appropriate owner for follow-up."
+    )
+
+    counseling_summary = (
+        "If this trend is used for counseling or coaching, keep the conversation neutral and fact-based. "
+        "This should be positioned as review and expectation-setting, not a final disciplinary conclusion."
+    )
+
+    recommended_action = (
+        "Review the source records, confirm whether the issue is isolated or recurring, and assign supervisor follow-up if the pattern is confirmed."
+    )
+
+    follow_up_question = "Would you like LORI to prepare a supervisor follow-up or counseling summary based on this trend?"
+
+    return {
+        "trend_title": trend_title,
+        "trend_summary": trend_summary,
+        "plain_language_explanation": plain_language,
+        "leadership_summary": leadership_summary,
+        "counseling_summary": counseling_summary,
+        "operational_summary": trend_summary,
+        "recommended_action": recommended_action,
+        "suggested_follow_up_question": follow_up_question,
+    }
+
+
+async def lori_trend_vf_collect_sources(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Pulls possible supporting records if tables exist.
+    This is intentionally safe and optional.
+    """
+    driver_id = lori_trend_vf_clean(payload.get("driver_id"))
+    driver_name = lori_trend_vf_clean(payload.get("driver_name"))
+    station_code = lori_trend_vf_upper(payload.get("station_code") or "JESSUP-01")
+
+    sources: List[Dict[str, Any]] = []
+
+    if driver_id:
+        driver_metrics = await lori_trend_vf_supabase_get(
+            "lori_driver_metrics",
+            f"select=*&driver_id=eq.{quote(driver_id)}&order=created_at.desc&limit=20",
+        )
+        for row in driver_metrics:
+            sources.append({
+                "source_module": "Driver Metrics",
+                "source_title": f"Driver metric record for {driver_id}",
+                "source_reference": row.get("id") or row.get("driver_id") or driver_id,
+                "driver_id": driver_id,
+                "driver_name": row.get("driver_name") or driver_name,
+                "station_code": row.get("station_code") or station_code,
+                "relevance": "Possible supporting driver metric record",
+            })
+
+        counseling = await lori_trend_vf_supabase_get(
+            "lori_driver_counseling",
+            f"select=*&driver_id=eq.{quote(driver_id)}&order=created_at.desc&limit=20",
+        )
+        for row in counseling:
+            sources.append({
+                "source_module": "Driver Counseling",
+                "source_title": f"Counseling record for {driver_id}",
+                "source_reference": row.get("id") or row.get("driver_id") or driver_id,
+                "driver_id": driver_id,
+                "driver_name": row.get("driver_name") or driver_name,
+                "station_code": row.get("station_code") or station_code,
+                "relevance": "Possible supporting counseling record",
+            })
+
+        safety = await lori_trend_vf_supabase_get(
+            "lori_driver_safety_events",
+            f"select=*&driver_id=eq.{quote(driver_id)}&order=created_at.desc&limit=20",
+        )
+        for row in safety:
+            sources.append({
+                "source_module": "Driver Safety Events",
+                "source_title": f"Safety event for {driver_id}",
+                "source_reference": row.get("id") or row.get("driver_id") or driver_id,
+                "driver_id": driver_id,
+                "driver_name": row.get("driver_name") or driver_name,
+                "station_code": row.get("station_code") or station_code,
+                "relevance": "Possible supporting safety event",
+            })
+
+    elif driver_name:
+        driver_search_name = quote(driver_name)
+
+        driver_records = await lori_trend_vf_supabase_get(
+            "lori_driver_master",
+            f"select=*&driver_name=ilike.*{driver_search_name}*&limit=10",
+        )
+        for row in driver_records:
+            sources.append({
+                "source_module": "Driver Master",
+                "source_title": f"Driver record for {driver_name}",
+                "source_reference": row.get("id") or row.get("driver_id") or driver_name,
+                "driver_id": row.get("driver_id") or "",
+                "driver_name": row.get("driver_name") or driver_name,
+                "station_code": row.get("station_code") or station_code,
+                "relevance": "Driver record match",
+            })
+
+    station_actions = await lori_trend_vf_supabase_get(
+        "lori_action_items",
+        f"select=*&station_code=eq.{quote(station_code)}&order=created_at.desc&limit=20",
+    )
+    for row in station_actions:
+        if driver_name and driver_name.lower() not in str(row).lower():
+            continue
+        sources.append({
+            "source_module": "Action Center",
+            "source_title": row.get("action_title") or "Action item",
+            "source_reference": row.get("id") or "",
+            "driver_id": row.get("driver_id") or "",
+            "driver_name": row.get("driver_name") or driver_name,
+            "station_code": row.get("station_code") or station_code,
+            "relevance": "Possible related action item",
+        })
+
+    return sources[:50]
+
+
+@app.post("/voiceflow/trend-quick-analyze")
+async def voiceflow_trend_quick_analyze(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    """
+    Safe endpoint for Voiceflow Trend Intelligence.
+    This endpoint should not crash if older trend tables or optional fields are missing.
+    """
+    lori_trend_vf_require_key(api_key)
+
+    payload = dict(payload or {})
+
+    question_text = lori_trend_vf_clean(payload.get("question_text"))
+    trend_subject = lori_trend_vf_clean(payload.get("trend_subject"))
+
+    if not question_text and not trend_subject:
+        return {
+            "status": "error",
+            "message": "question_text or trend_subject is required.",
+        }
+
+    company_name = lori_trend_vf_clean(payload.get("company_name") or "Food Authority")
+    region_code = lori_trend_vf_upper(payload.get("region_code") or "MID_ATLANTIC")
+    region_name = lori_trend_vf_clean(payload.get("region_name") or "Mid-Atlantic")
+    operating_state = lori_trend_vf_upper(payload.get("operating_state") or "MD")
+    city = lori_trend_vf_clean(payload.get("city") or "Jessup")
+    station_code = lori_trend_vf_upper(payload.get("station_code") or "JESSUP-01")
+    station_name = lori_trend_vf_clean(payload.get("station_name") or "Jessup Delivery Station")
+    route_group = lori_trend_vf_clean(payload.get("route_group") or "Delivery Operations")
+
+    payload["company_name"] = company_name
+    payload["region_code"] = region_code
+    payload["region_name"] = region_name
+    payload["operating_state"] = operating_state
+    payload["city"] = city
+    payload["station_code"] = station_code
+    payload["station_name"] = station_name
+    payload["route_group"] = route_group
+
+    trend_category = lori_trend_vf_infer_category(payload)
+
+    sources = await lori_trend_vf_collect_sources(payload)
+    source_count = len(sources)
+
+    direction = lori_trend_vf_infer_direction(payload, source_count)
+    text_parts = lori_trend_vf_build_summary(payload, source_count, trend_category, direction)
+
+    request_id = str(uuid.uuid4())
+    result_id = str(uuid.uuid4())
+
+    request_payload = {
+        "id": request_id,
+        "request_title": lori_trend_vf_clean(payload.get("request_title") or f"Trend Analysis — {trend_subject or question_text}"),
+        "question_text": question_text,
+        "trend_subject": trend_subject or question_text,
+        "trend_category": trend_category,
+        "company_name": company_name,
+        "region_code": region_code,
+        "region_name": region_name,
+        "operating_state": operating_state,
+        "city": city,
+        "station_code": station_code,
+        "station_name": station_name,
+        "route_group": route_group,
+        "route_id": lori_trend_vf_clean(payload.get("route_id")),
+        "driver_id": lori_trend_vf_clean(payload.get("driver_id")),
+        "driver_name": lori_trend_vf_clean(payload.get("driver_name")),
+        "employee_id": lori_trend_vf_clean(payload.get("employee_id")),
+        "employee_name": lori_trend_vf_clean(payload.get("employee_name")),
+        "requested_by": lori_trend_vf_clean(payload.get("requested_by") or "Voiceflow / Ask LORI"),
+        "request_status": "Completed",
+        "user_requested_trend": bool(payload.get("user_requested_trend", True)),
+        "lori_offered_trend": bool(payload.get("lori_offered_trend", True)),
+        "created_at": lori_trend_vf_now_iso(),
+        "updated_at": lori_trend_vf_now_iso(),
+    }
+
+    saved_request = await lori_trend_vf_supabase_post("lori_trend_requests", request_payload)
+
+    if saved_request and saved_request[0].get("id"):
+        request_id = saved_request[0]["id"]
+
+    result_payload = {
+        "id": result_id,
+        "trend_request_id": request_id,
+        "result_status": "Generated" if source_count >= 1 else "Preliminary",
+        "trend_title": text_parts["trend_title"],
+        "trend_summary": text_parts["trend_summary"],
+        "trend_direction": direction["trend_direction"],
+        "trend_strength": direction["trend_strength"],
+        "confidence_level": direction["confidence_level"],
+        "risk_level": direction["risk_level"],
+        "finding_type": "Trend Analysis",
+        "finding_category": trend_category,
+        "plain_language_explanation": text_parts["plain_language_explanation"],
+        "leadership_summary": text_parts["leadership_summary"],
+        "counseling_summary": text_parts["counseling_summary"],
+        "operational_summary": text_parts["operational_summary"],
+        "recommended_action": text_parts["recommended_action"],
+        "suggested_follow_up_question": text_parts["suggested_follow_up_question"],
+        "decision_support_note": "LORI provides operational decision support only. Trend analysis should be reviewed by authorized leadership before final action.",
+        "should_offer_chart": True,
+        "should_offer_counseling_language": True,
+        "should_offer_leadership_packet": True,
+        "should_send_to_action_center": True,
+        "data_points_count": max(source_count, 1),
+        "source_records_count": source_count,
+        "generated_by": "LORI Trend Intelligence",
+        "created_at": lori_trend_vf_now_iso(),
+        "updated_at": lori_trend_vf_now_iso(),
+    }
+
+    saved_result = await lori_trend_vf_supabase_post("lori_trend_results", result_payload)
+
+    if saved_result and saved_result[0].get("id"):
+        result_id = saved_result[0]["id"]
+
+    data_points = []
+
+    if source_count:
+        for index, source in enumerate(sources[:10], start=1):
+            point = {
+                "trend_result_id": result_id,
+                "point_label": f"Record {index}",
+                "metric_name": trend_category,
+                "metric_value": index,
+                "source_module": source.get("source_module"),
+                "notes": source.get("relevance"),
+                "created_at": lori_trend_vf_now_iso(),
+            }
+            data_points.append(point)
+            await lori_trend_vf_supabase_post("lori_trend_data_points", point)
+    else:
+        point = {
+            "trend_result_id": result_id,
+            "point_label": "Preliminary Review",
+            "metric_name": trend_category,
+            "metric_value": 1,
+            "source_module": "Voiceflow",
+            "notes": "Preliminary trend request created from Voiceflow. More dated records are needed for a stronger trend.",
+            "created_at": lori_trend_vf_now_iso(),
+        }
+        data_points.append(point)
+        await lori_trend_vf_supabase_post("lori_trend_data_points", point)
+
+    for source in sources[:25]:
+        source_payload = {
+            "trend_result_id": result_id,
+            "source_module": source.get("source_module"),
+            "source_title": source.get("source_title"),
+            "source_reference": str(source.get("source_reference") or ""),
+            "driver_id": source.get("driver_id") or "",
+            "driver_name": source.get("driver_name") or "",
+            "station_code": source.get("station_code") or station_code,
+            "relevance": source.get("relevance") or "Possible supporting source record",
+            "created_at": lori_trend_vf_now_iso(),
+        }
+        await lori_trend_vf_supabase_post("lori_trend_source_records", source_payload)
+
+    voiceflow_message = (
+        f"{text_parts['trend_summary']}\n\n"
+        f"Trend Direction: {direction['trend_direction']}\n"
+        f"Confidence Level: {direction['confidence_level']}\n"
+        f"Risk Level: {direction['risk_level']}\n\n"
+        f"Recommended Action: {text_parts['recommended_action']}\n\n"
+        "LORI provides operational decision support only. Trend analysis should be reviewed by authorized leadership before final action."
+    )
+
+    return {
+        "status": "success",
+        "voiceflow_message": voiceflow_message,
+        "trend_request_id": request_id,
+        "trend_result_id": result_id,
+        "trend_title": text_parts["trend_title"],
+        "trend_summary": text_parts["trend_summary"],
+        "trend_direction": direction["trend_direction"],
+        "trend_strength": direction["trend_strength"],
+        "confidence_level": direction["confidence_level"],
+        "risk_level": direction["risk_level"],
+        "finding_category": trend_category,
+        "plain_language_explanation": text_parts["plain_language_explanation"],
+        "leadership_summary": text_parts["leadership_summary"],
+        "counseling_summary": text_parts["counseling_summary"],
+        "operational_summary": text_parts["operational_summary"],
+        "recommended_action": text_parts["recommended_action"],
+        "suggested_follow_up_question": text_parts["suggested_follow_up_question"],
+        "decision_support_note": "LORI provides operational decision support only. Trend analysis should be reviewed by authorized leadership before final action.",
+        "data_points_count": len(data_points),
+        "source_records_count": source_count,
+        "data_points": data_points,
+        "source_records": sources,
+    }
+
+
+@app.post("/trend-quick-analyze-v2")
+async def trend_quick_analyze_v2(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    """
+    Same safe endpoint with a non-Voiceflow path, available for Lovable or manual testing.
+    """
+    return await voiceflow_trend_quick_analyze(api_key=api_key, payload=payload)
