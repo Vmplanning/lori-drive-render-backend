@@ -18627,3 +18627,1101 @@ async def report_requests(
         "requests_count": len(requests[:limit]),
         "requests": requests[:limit],
     }
+# ============================================================
+# LORI DRIVE COMMAND CENTER
+# TREND INTELLIGENCE ENGINE
+# Allows LORI to offer trend analysis, analyze patterns, create
+# trend points, explain trends, support counseling language, and
+# surface insights from uploaded data, reports, drivers, routes,
+# documents, SOPs, KPI plans, action items, compliance, and more.
+# ============================================================
+
+from fastapi import Body, Query
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from datetime import datetime, date
+from collections import Counter
+import os
+import httpx
+import re
+
+
+SUPABASE_URL_TREND = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY_TREND = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def lori_trend_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().split())
+
+
+def lori_trend_upper(value: Any) -> str:
+    return lori_trend_clean(value).upper()
+
+
+def lori_trend_lower(value: Any) -> str:
+    return lori_trend_clean(value).lower()
+
+
+def lori_trend_today() -> str:
+    return date.today().isoformat()
+
+
+def lori_trend_parse_date(value: Any) -> Optional[date]:
+    if not value:
+        return None
+
+    text = str(value).strip()
+
+    try:
+        if "T" in text:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+        return date.fromisoformat(text[:10])
+    except Exception:
+        return None
+
+
+def lori_trend_period_label(value: Optional[date]) -> str:
+    if not value:
+        return date.today().strftime("%Y-%m")
+    return value.strftime("%Y-%m")
+
+
+async def lori_trend_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    return await lori_policy_supabase_get(f"{table}?{query}")
+
+
+async def lori_trend_safe_get_rows(
+    table: str,
+    query: str = "select=*&limit=500",
+) -> List[Dict[str, Any]]:
+    try:
+        return await lori_policy_supabase_get(f"{table}?{query}")
+    except Exception:
+        return []
+
+
+async def lori_trend_patch_rows(
+    table: str,
+    match_query: str,
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not SUPABASE_URL_TREND or not SUPABASE_SERVICE_ROLE_KEY_TREND:
+        raise RuntimeError("Missing Supabase environment variables.")
+
+    url = f"{SUPABASE_URL_TREND}/rest/v1/{table}?{match_query}"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY_TREND,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY_TREND}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(url, headers=headers, json=payload)
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"Supabase PATCH failed: {response.status_code} {response.text}")
+
+    try:
+        return response.json()
+    except Exception:
+        return []
+
+
+def lori_trend_infer_template_from_question(question_text: str) -> Dict[str, str]:
+    q = lori_trend_lower(question_text)
+
+    mapping = [
+        {
+            "code": "DRIVER_PERFORMANCE_TREND",
+            "category": "Driver",
+            "use_case": "Coaching / Counseling",
+            "keywords": ["driver", "performance", "score", "better", "worse", "improving", "declining"],
+        },
+        {
+            "code": "DRIVER_SAFETY_TREND",
+            "category": "Safety",
+            "use_case": "Safety Review",
+            "keywords": ["safety", "accident", "incident", "crash", "injury", "unsafe"],
+        },
+        {
+            "code": "COUNSELING_PATTERN_TREND",
+            "category": "Counseling",
+            "use_case": "Counseling",
+            "keywords": ["counseling", "coach", "coaching", "discipline", "write up", "pattern", "behavior"],
+        },
+        {
+            "code": "ROUTE_DELAY_TREND",
+            "category": "Route",
+            "use_case": "Route Review",
+            "keywords": ["late", "delay", "delays", "route", "delivery window", "always late"],
+        },
+        {
+            "code": "WORK_AREA_BALANCE_TREND",
+            "category": "Route",
+            "use_case": "Route Configuration",
+            "keywords": ["work area", "territory", "balance", "unbalanced", "stops", "route change", "stop moves"],
+        },
+        {
+            "code": "KPI_PERFORMANCE_TREND",
+            "category": "KPI",
+            "use_case": "Leadership Briefing",
+            "keywords": ["kpi", "metric", "metrics", "goal", "target", "performance gap"],
+        },
+        {
+            "code": "ACTION_ITEM_CLOSURE_TREND",
+            "category": "Action Center",
+            "use_case": "Leadership Briefing",
+            "keywords": ["action item", "follow up", "overdue", "closed", "closure", "owner"],
+        },
+        {
+            "code": "DOCUMENT_REVIEW_TREND",
+            "category": "Document",
+            "use_case": "Document Review",
+            "keywords": ["document", "upload", "file", "policy", "accident report", "employee file"],
+        },
+        {
+            "code": "SOP_REVIEW_TREND",
+            "category": "SOP",
+            "use_case": "Training Review",
+            "keywords": ["sop", "procedure", "training", "acknowledgement", "acknowledgment"],
+        },
+        {
+            "code": "COMPLIANCE_RISK_TREND",
+            "category": "Compliance",
+            "use_case": "Compliance Review",
+            "keywords": ["compliance", "regulatory", "policy risk", "audit", "violation"],
+        },
+        {
+            "code": "DRIVER_ROAD_COMMUNICATION_TREND",
+            "category": "Driver Road Communications",
+            "use_case": "General Information",
+            "keywords": ["message", "driver message", "road communication", "urgent message", "stop change"],
+        },
+    ]
+
+    for item in mapping:
+        if any(keyword in q for keyword in item["keywords"]):
+            return item
+
+    return {
+        "code": "KPI_PERFORMANCE_TREND",
+        "category": "General",
+        "use_case": "General Information",
+    }
+
+
+def lori_trend_direction_from_points(point_values: List[float]) -> Dict[str, str]:
+    if len(point_values) < 2:
+        return {
+            "trend_direction": "Unknown",
+            "trend_strength": "Weak",
+            "confidence_level": "Low",
+        }
+
+    first = point_values[0]
+    last = point_values[-1]
+    change = last - first
+
+    if change > 0:
+        direction = "Worsening"
+    elif change < 0:
+        direction = "Improving"
+    else:
+        direction = "Stable"
+
+    absolute_change = abs(change)
+
+    if absolute_change >= 5:
+        strength = "Strong"
+        confidence = "High"
+    elif absolute_change >= 2:
+        strength = "Moderate"
+        confidence = "Medium"
+    else:
+        strength = "Weak"
+        confidence = "Low"
+
+    return {
+        "trend_direction": direction,
+        "trend_strength": strength,
+        "confidence_level": confidence,
+    }
+
+
+def lori_trend_risk_from_direction(direction: str, strength: str, record_count: int) -> str:
+    if direction == "Worsening" and strength in ["Strong", "Moderate"]:
+        return "High" if record_count >= 5 else "Medium"
+    if direction == "Worsening":
+        return "Medium"
+    if direction == "Stable" and record_count >= 10:
+        return "Medium"
+    return "Low"
+
+
+async def lori_trend_snapshot(
+    station_code: str = "",
+    driver_name: str = "",
+    driver_id: str = "",
+    employee_name: str = "",
+    employee_id: str = "",
+    route_id: str = "",
+) -> Dict[str, List[Dict[str, Any]]]:
+    station = lori_trend_upper(station_code)
+
+    def filter_common(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        filtered = rows
+
+        if station:
+            filtered = [
+                r for r in filtered
+                if lori_trend_upper(r.get("station_code")) == station
+                or lori_trend_upper(r.get("current_station_code")) == station
+                or lori_trend_upper(r.get("new_station_code")) == station
+            ]
+
+        if driver_name:
+            filtered = [
+                r for r in filtered
+                if driver_name.lower() in lori_trend_lower(r.get("driver_name"))
+                or driver_name.lower() in lori_trend_lower(r.get("current_driver_name"))
+                or driver_name.lower() in lori_trend_lower(r.get("receiving_driver_name"))
+            ]
+
+        if driver_id:
+            filtered = [
+                r for r in filtered
+                if lori_trend_lower(r.get("driver_id")) == driver_id.lower()
+            ]
+
+        if employee_name:
+            filtered = [
+                r for r in filtered
+                if employee_name.lower() in lori_trend_lower(r.get("employee_name"))
+            ]
+
+        if employee_id:
+            filtered = [
+                r for r in filtered
+                if lori_trend_lower(r.get("employee_id")) == employee_id.lower()
+            ]
+
+        if route_id:
+            filtered = [
+                r for r in filtered
+                if lori_trend_lower(r.get("route_id")) == route_id.lower()
+                or lori_trend_lower(r.get("current_route_id")) == route_id.lower()
+                or lori_trend_lower(r.get("receiving_route_id")) == route_id.lower()
+            ]
+
+        return filtered
+
+    docs = filter_common(await lori_trend_safe_get_rows("lori_document_library", "select=*&order=created_at.desc&limit=3000"))
+    action_items = filter_common(await lori_trend_safe_get_rows("lori_action_items", "select=*&order=created_at.desc&limit=3000"))
+    kpi_plans = filter_common(await lori_trend_safe_get_rows("lori_kpi_action_plans", "select=*&order=created_at.desc&limit=1000"))
+    sops = filter_common(await lori_trend_safe_get_rows("lori_sop_library", "select=*&order=created_at.desc&limit=1000"))
+    sop_ack = filter_common(await lori_trend_safe_get_rows("lori_sop_acknowledgements", "select=*&order=created_at.desc&limit=2000"))
+    route_projects = filter_common(await lori_trend_safe_get_rows("lori_route_config_projects", "select=*&order=created_at.desc&limit=1000"))
+    contract_reviews = filter_common(await lori_trend_safe_get_rows("lori_route_contract_safeguard_reviews", "select=*&order=created_at.desc&limit=1000"))
+    driver_master = filter_common(await lori_trend_safe_get_rows("lori_driver_master", "select=*&order=created_at.desc&limit=3000"))
+    driver_metrics = filter_common(await lori_trend_safe_get_rows("lori_driver_metrics", "select=*&order=created_at.desc&limit=3000"))
+    driver_safety = filter_common(await lori_trend_safe_get_rows("lori_driver_safety_events", "select=*&order=created_at.desc&limit=3000"))
+    driver_counseling = filter_common(await lori_trend_safe_get_rows("lori_driver_counseling", "select=*&order=created_at.desc&limit=3000"))
+    reports = filter_common(await lori_trend_safe_get_rows("lori_report_library", "select=*&order=created_at.desc&limit=1000"))
+    regulatory_alerts = await lori_trend_safe_get_rows("lori_regulatory_alerts", "select=*&order=created_at.desc&limit=1000")
+
+    road_messages = filter_common(await lori_trend_safe_get_rows("lori_driver_road_communications", "select=*&order=created_at.desc&limit=3000"))
+
+    return {
+        "documents": docs,
+        "action_items": action_items,
+        "kpi_plans": kpi_plans,
+        "sops": sops,
+        "sop_acknowledgements": sop_ack,
+        "route_projects": route_projects,
+        "contract_reviews": contract_reviews,
+        "driver_master": driver_master,
+        "driver_metrics": driver_metrics,
+        "driver_safety": driver_safety,
+        "driver_counseling": driver_counseling,
+        "reports": reports,
+        "regulatory_alerts": regulatory_alerts,
+        "road_messages": road_messages,
+    }
+
+
+def lori_trend_rows_for_template(template_code: str, snapshot: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    code = lori_trend_upper(template_code)
+
+    if code == "DRIVER_PERFORMANCE_TREND":
+        rows = snapshot.get("driver_metrics", []) + [
+            d for d in snapshot.get("documents", [])
+            if d.get("intake_lane") == "Driver File" or d.get("kpi_related") or d.get("safety_related")
+        ]
+        metric_name = "Driver performance-related records"
+
+    elif code == "DRIVER_SAFETY_TREND":
+        rows = snapshot.get("driver_safety", []) + [
+            d for d in snapshot.get("documents", [])
+            if d.get("safety_related") or d.get("accident_related")
+        ]
+        metric_name = "Safety events and safety-related records"
+
+    elif code == "COUNSELING_PATTERN_TREND":
+        rows = snapshot.get("driver_counseling", []) + [
+            d for d in snapshot.get("documents", [])
+            if d.get("counseling_related")
+        ]
+        metric_name = "Counseling and coaching-related records"
+
+    elif code == "ROUTE_DELAY_TREND":
+        rows = snapshot.get("route_projects", []) + [
+            d for d in snapshot.get("documents", [])
+            if d.get("route_configuration_related") or d.get("route_assignment_related")
+        ]
+        metric_name = "Route delay / route review records"
+
+    elif code == "WORK_AREA_BALANCE_TREND":
+        rows = snapshot.get("route_projects", []) + [
+            d for d in snapshot.get("documents", [])
+            if d.get("route_configuration_related") or "route" in lori_trend_lower(d.get("document_type"))
+        ]
+        metric_name = "Work area balance records"
+
+    elif code == "KPI_PERFORMANCE_TREND":
+        rows = snapshot.get("kpi_plans", []) + [
+            d for d in snapshot.get("documents", [])
+            if d.get("kpi_related")
+        ]
+        metric_name = "KPI and performance records"
+
+    elif code == "ACTION_ITEM_CLOSURE_TREND":
+        rows = snapshot.get("action_items", [])
+        metric_name = "Action items"
+
+    elif code == "DOCUMENT_REVIEW_TREND":
+        rows = snapshot.get("documents", [])
+        metric_name = "Uploaded documents"
+
+    elif code == "SOP_REVIEW_TREND":
+        rows = snapshot.get("sops", []) + snapshot.get("sop_acknowledgements", [])
+        metric_name = "SOP and acknowledgement records"
+
+    elif code == "COMPLIANCE_RISK_TREND":
+        rows = snapshot.get("contract_reviews", []) + snapshot.get("regulatory_alerts", []) + [
+            d for d in snapshot.get("documents", [])
+            if d.get("compliance_related") or d.get("policy_related") or d.get("legal_review_required")
+        ]
+        metric_name = "Compliance, policy, contract, and regulatory records"
+
+    elif code == "DRIVER_ROAD_COMMUNICATION_TREND":
+        rows = snapshot.get("road_messages", [])
+        metric_name = "Driver road messages"
+
+    else:
+        rows = (
+            snapshot.get("documents", [])
+            + snapshot.get("action_items", [])
+            + snapshot.get("kpi_plans", [])
+            + snapshot.get("route_projects", [])
+            + snapshot.get("sops", [])
+        )
+        metric_name = "LORI records"
+
+    return {
+        "rows": rows,
+        "metric_name": metric_name,
+    }
+
+
+def lori_trend_date_for_row(row: Dict[str, Any]) -> date:
+    for key in [
+        "incident_date",
+        "event_date",
+        "metric_date",
+        "review_due_date",
+        "effective_date",
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "published_at",
+    ]:
+        parsed = lori_trend_parse_date(row.get(key))
+        if parsed:
+            return parsed
+
+    return date.today()
+
+
+def lori_trend_make_points(rows: List[Dict[str, Any]], metric_name: str) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+
+    counter = Counter()
+
+    for row in rows:
+        d = lori_trend_date_for_row(row)
+        counter[lori_trend_period_label(d)] += 1
+
+    labels = sorted(counter.keys())
+
+    points = []
+
+    for idx, label in enumerate(labels):
+        year, month = label.split("-")
+        point_date = date(int(year), int(month), 1)
+        points.append({
+            "point_order": idx + 1,
+            "point_label": label,
+            "point_date": point_date.isoformat(),
+            "point_period": "Monthly",
+            "metric_name": metric_name,
+            "metric_value": float(counter[label]),
+            "metric_unit": "records",
+        })
+
+    return points
+
+
+def lori_trend_result_text(
+    template: Dict[str, Any],
+    request: Dict[str, Any],
+    points: List[Dict[str, Any]],
+    direction: Dict[str, str],
+    rows: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    subject = lori_trend_clean(request.get("trend_subject") or template.get("trend_template_name") or "Trend")
+    category = lori_trend_clean(request.get("trend_category") or template.get("trend_category") or "General")
+    use_case = lori_trend_clean(request.get("trend_use_case") or template.get("trend_use_case") or "General Information")
+    driver_name = lori_trend_clean(request.get("driver_name"))
+    route_id = lori_trend_clean(request.get("route_id"))
+
+    direction_label = direction.get("trend_direction", "Unknown").lower()
+    strength = direction.get("trend_strength", "Moderate").lower()
+    count = len(rows)
+
+    if not points:
+        summary = f"LORI does not have enough dated records yet to create a reliable trend for {subject}."
+        explanation = "More uploaded data, reports, documents, action records, route records, counseling entries, KPI records, or safety records are needed before LORI can show a meaningful pattern."
+        recommended = "Upload or connect more source data, then run the trend again."
+    else:
+        target_text = driver_name or route_id or lori_trend_clean(request.get("station_code")) or "the selected context"
+        summary = f"LORI found a {strength} {direction_label} trend for {subject} based on {count} source record(s)."
+        explanation = f"The trend was calculated from available LORI records grouped over time for {target_text}. It should be treated as decision support, not as final proof or disciplinary conclusion."
+        recommended = "Review the underlying records, confirm accuracy, and decide whether this trend should be used for coaching, counseling, leadership briefing, route review, KPI follow-up, or Action Center tracking."
+
+    counseling_summary = (
+        f"Counseling trend note: LORI identified a {direction.get('trend_direction', 'Unknown')} pattern. "
+        f"Use this as a coaching conversation starter only. Confirm the facts, dates, and documents before discussing performance or corrective action."
+    )
+
+    leadership_summary = (
+        f"Leadership trend summary: {summary} The pattern may require supervisor review, operational follow-up, or additional data validation."
+    )
+
+    operational_summary = (
+        f"Operational trend summary: {explanation} Recommended next step: {recommended}"
+    )
+
+    suggested_follow_up = f"Would you like LORI to show the source records and create a chart for this {category.lower()} trend?"
+
+    return {
+        "trend_title": f"{subject} Trend",
+        "trend_summary": summary,
+        "plain_language_explanation": explanation,
+        "leadership_summary": leadership_summary,
+        "counseling_summary": counseling_summary,
+        "operational_summary": operational_summary,
+        "recommended_action": recommended,
+        "suggested_follow_up_question": suggested_follow_up,
+    }
+
+
+@app.get("/trend-templates")
+async def trend_templates(
+    api_key: Optional[str] = Query(None),
+    trend_category: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    templates = await lori_trend_get_rows(
+        "lori_trend_templates",
+        "select=*&order=trend_template_name.asc&limit=500",
+    )
+
+    if trend_category:
+        templates = [
+            t for t in templates
+            if lori_trend_clean(t.get("trend_category")).lower() == trend_category.lower()
+        ]
+
+    return {
+        "status": "success",
+        "templates_count": len(templates),
+        "templates": templates,
+    }
+
+
+@app.get("/trend-intelligence-summary")
+async def trend_intelligence_summary(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+):
+    lori_regulatory_require_key(api_key)
+
+    templates = await lori_trend_safe_get_rows(
+        "lori_trend_templates",
+        "select=*&order=trend_template_name.asc&limit=500",
+    )
+
+    requests = await lori_trend_safe_get_rows(
+        "lori_trend_intelligence_requests",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    results = await lori_trend_safe_get_rows(
+        "lori_trend_intelligence_results",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    insights = await lori_trend_safe_get_rows(
+        "lori_trend_insight_library",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    offers = await lori_trend_safe_get_rows(
+        "lori_trend_conversation_offers",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        station = lori_trend_upper(station_code)
+        requests = [r for r in requests if lori_trend_upper(r.get("station_code")) == station]
+        insights = [i for i in insights if lori_trend_upper(i.get("station_code")) == station]
+        offers = [o for o in offers if lori_trend_upper(o.get("station_code")) == station]
+
+    return {
+        "status": "success",
+        "trend_templates_count": len(templates),
+        "trend_requests_count": len(requests),
+        "trend_results_count": len(results),
+        "active_insights_count": len([i for i in insights if i.get("insight_status") == "Active"]),
+        "offers_count": len(offers),
+        "accepted_offers_count": len([o for o in offers if o.get("offer_status") == "Accepted"]),
+        "declined_offers_count": len([o for o in offers if o.get("offer_status") == "Declined"]),
+    }
+
+
+@app.post("/trend-offer-for-question")
+async def trend_offer_for_question(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    question_text = lori_trend_clean(payload.get("question_text") or payload.get("original_question"))
+
+    if not question_text:
+        return {"status": "error", "message": "question_text is required."}
+
+    inferred = lori_trend_infer_template_from_question(question_text)
+
+    templates = await lori_trend_safe_get_rows(
+        "lori_trend_templates",
+        f"select=*&trend_template_code=eq.{quote(inferred['code'])}&limit=1",
+    )
+
+    template = templates[0] if templates else {}
+
+    offer_text = template.get("trend_offer_text") or f"Would you like LORI to trend this information over time?"
+
+    offer_payload = {
+        "conversation_id": lori_trend_clean(payload.get("conversation_id")),
+        "user_email": lori_trend_clean(payload.get("user_email")),
+        "offered_by_module": lori_trend_clean(payload.get("offered_by_module") or "Ask LORI"),
+        "original_question": question_text,
+        "trend_subject": lori_trend_clean(payload.get("trend_subject") or template.get("trend_template_name") or inferred["category"]),
+        "trend_category": lori_trend_clean(payload.get("trend_category") or template.get("trend_category") or inferred["category"]),
+        "trend_use_case": lori_trend_clean(payload.get("trend_use_case") or template.get("trend_use_case") or inferred["use_case"]),
+        "offer_text": offer_text,
+        "offer_status": "Offered",
+        "company_name": lori_trend_clean(payload.get("company_name")),
+        "station_code": lori_trend_upper(payload.get("station_code")),
+        "route_id": lori_trend_clean(payload.get("route_id")),
+        "driver_id": lori_trend_clean(payload.get("driver_id")),
+        "driver_name": lori_trend_clean(payload.get("driver_name")),
+        "employee_id": lori_trend_clean(payload.get("employee_id")),
+        "employee_name": lori_trend_clean(payload.get("employee_name")),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_trend_conversation_offers",
+        offer_payload,
+    )
+
+    return {
+        "status": "success",
+        "should_offer_trend": True,
+        "offer": created[0] if created else offer_payload,
+        "recommended_template_code": inferred["code"],
+        "trend_category": offer_payload["trend_category"],
+        "trend_use_case": offer_payload["trend_use_case"],
+        "offer_text": offer_text,
+    }
+
+
+@app.post("/trend-offer-update")
+async def trend_offer_update(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    offer_id = lori_trend_clean(payload.get("offer_id"))
+    offer_status = lori_trend_clean(payload.get("offer_status"))
+
+    if not offer_id:
+        return {"status": "error", "message": "offer_id is required."}
+
+    if offer_status not in ["Accepted", "Declined", "Expired", "Offered"]:
+        return {"status": "error", "message": "offer_status must be Accepted, Declined, Expired, or Offered."}
+
+    update_payload = {
+        "offer_status": offer_status,
+    }
+
+    if offer_status == "Accepted":
+        update_payload["accepted_at"] = datetime.utcnow().isoformat()
+
+    if offer_status == "Declined":
+        update_payload["declined_at"] = datetime.utcnow().isoformat()
+
+    updated = await lori_trend_patch_rows(
+        "lori_trend_conversation_offers",
+        f"id=eq.{quote(offer_id)}",
+        update_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": f"Trend offer marked {offer_status}.",
+        "offer": updated[0] if updated else update_payload,
+    }
+
+
+@app.post("/trend-request-create")
+async def trend_request_create(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    question_text = lori_trend_clean(payload.get("question_text"))
+    template_code = lori_trend_upper(payload.get("trend_template_code"))
+
+    if not template_code:
+        inferred = lori_trend_infer_template_from_question(question_text)
+        template_code = inferred["code"]
+
+    templates = await lori_trend_safe_get_rows(
+        "lori_trend_templates",
+        f"select=*&trend_template_code=eq.{quote(template_code)}&limit=1",
+    )
+
+    template = templates[0] if templates else {}
+
+    request_payload = {
+        "request_title": lori_trend_clean(payload.get("request_title") or f"{template.get('trend_template_name') or 'Trend'} — {payload.get('station_code') or 'Station'}"),
+        "request_status": "Draft",
+        "question_text": question_text,
+        "trend_subject": lori_trend_clean(payload.get("trend_subject") or template.get("trend_template_name")),
+        "trend_category": lori_trend_clean(payload.get("trend_category") or template.get("trend_category")),
+        "trend_use_case": lori_trend_clean(payload.get("trend_use_case") or template.get("trend_use_case") or "General Information"),
+        "requested_scope": lori_trend_clean(payload.get("requested_scope") or "Station"),
+
+        "company_name": lori_trend_clean(payload.get("company_name")),
+        "region_code": lori_trend_upper(payload.get("region_code")),
+        "region_name": lori_trend_clean(payload.get("region_name")),
+        "operating_state": lori_trend_upper(payload.get("operating_state")),
+        "city": lori_trend_clean(payload.get("city")),
+        "station_code": lori_trend_upper(payload.get("station_code")),
+        "station_name": lori_trend_clean(payload.get("station_name")),
+        "route_group": lori_trend_clean(payload.get("route_group")),
+        "route_id": lori_trend_clean(payload.get("route_id")),
+
+        "driver_id": lori_trend_clean(payload.get("driver_id")),
+        "driver_name": lori_trend_clean(payload.get("driver_name")),
+        "employee_id": lori_trend_clean(payload.get("employee_id")),
+        "employee_name": lori_trend_clean(payload.get("employee_name")),
+
+        "date_range_start": payload.get("date_range_start") or None,
+        "date_range_end": payload.get("date_range_end") or None,
+
+        "source_modules": template.get("source_modules") or payload.get("source_modules") or [],
+        "source_report_id": payload.get("source_report_id") or None,
+        "source_document_id": payload.get("source_document_id") or None,
+        "source_sop_id": payload.get("source_sop_id") or None,
+        "source_action_item_id": payload.get("source_action_item_id") or None,
+        "source_route_project_id": payload.get("source_route_project_id") or None,
+        "source_kpi_plan_id": payload.get("source_kpi_plan_id") or None,
+
+        "requested_by": lori_trend_clean(payload.get("requested_by") or "LORI User"),
+        "user_requested_trend": bool(payload.get("user_requested_trend", True)),
+        "lori_offered_trend": bool(payload.get("lori_offered_trend", False)),
+        "trend_offer_text": lori_trend_clean(payload.get("trend_offer_text") or template.get("trend_offer_text")),
+    }
+
+    created = await lori_policy_supabase_post(
+        "lori_trend_intelligence_requests",
+        request_payload,
+    )
+
+    return {
+        "status": "success",
+        "message": "Trend intelligence request created.",
+        "request": created[0] if created else request_payload,
+        "trend_template_code": template_code,
+        "template": template,
+    }
+
+
+@app.post("/trend-analyze")
+async def trend_analyze(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    request_id = lori_trend_clean(payload.get("request_id"))
+
+    if not request_id:
+        return {"status": "error", "message": "request_id is required."}
+
+    requests = await lori_trend_get_rows(
+        "lori_trend_intelligence_requests",
+        f"select=*&id=eq.{quote(request_id)}&limit=1",
+    )
+
+    if not requests:
+        return {"status": "not_found", "message": "Trend request not found."}
+
+    request = requests[0]
+
+    inferred = lori_trend_infer_template_from_question(request.get("question_text") or request.get("trend_subject") or "")
+    template_code = lori_trend_upper(payload.get("trend_template_code") or inferred["code"])
+
+    templates = await lori_trend_safe_get_rows(
+        "lori_trend_templates",
+        f"select=*&trend_template_code=eq.{quote(template_code)}&limit=1",
+    )
+
+    template = templates[0] if templates else {
+        "trend_template_name": request.get("trend_subject") or "Trend",
+        "trend_category": request.get("trend_category") or "General",
+        "trend_use_case": request.get("trend_use_case") or "General Information",
+        "supports_chart": True,
+        "supports_counseling": False,
+        "supports_leadership_summary": True,
+        "supports_action_center": True,
+    }
+
+    snapshot = await lori_trend_snapshot(
+        station_code=request.get("station_code"),
+        driver_name=request.get("driver_name"),
+        driver_id=request.get("driver_id"),
+        employee_name=request.get("employee_name"),
+        employee_id=request.get("employee_id"),
+        route_id=request.get("route_id"),
+    )
+
+    row_bundle = lori_trend_rows_for_template(template_code, snapshot)
+    rows = row_bundle["rows"]
+    metric_name = row_bundle["metric_name"]
+
+    points = lori_trend_make_points(rows, metric_name)
+    values = [float(p["metric_value"]) for p in points]
+
+    direction = lori_trend_direction_from_points(values)
+    risk_level = lori_trend_risk_from_direction(
+        direction.get("trend_direction"),
+        direction.get("trend_strength"),
+        len(rows),
+    )
+
+    text_parts = lori_trend_result_text(template, request, points, direction, rows)
+
+    result_payload = {
+        "trend_request_id": request_id,
+        "result_status": "Generated" if points else "Not Enough Data",
+        "trend_title": text_parts["trend_title"],
+        "trend_summary": text_parts["trend_summary"],
+        "trend_direction": direction["trend_direction"],
+        "trend_strength": direction["trend_strength"],
+        "confidence_level": direction["confidence_level"],
+        "risk_level": risk_level,
+        "finding_type": "Trend Analysis",
+        "finding_category": template.get("trend_category") or request.get("trend_category"),
+        "plain_language_explanation": text_parts["plain_language_explanation"],
+        "leadership_summary": text_parts["leadership_summary"],
+        "counseling_summary": text_parts["counseling_summary"],
+        "operational_summary": text_parts["operational_summary"],
+        "recommended_action": text_parts["recommended_action"],
+        "suggested_follow_up_question": text_parts["suggested_follow_up_question"],
+        "should_offer_chart": bool(template.get("supports_chart", True)),
+        "should_offer_counseling_language": bool(template.get("supports_counseling", False)),
+        "should_offer_leadership_packet": bool(template.get("supports_leadership_summary", True)),
+        "should_send_to_action_center": bool(template.get("supports_action_center", True)),
+        "data_points_count": len(points),
+        "source_records_count": len(rows),
+        "generated_by": "LORI Trend Intelligence",
+    }
+
+    created_result = await lori_policy_supabase_post(
+        "lori_trend_intelligence_results",
+        result_payload,
+    )
+
+    result = created_result[0] if created_result else result_payload
+    result_id = result.get("id")
+
+    created_points = []
+
+    for point in points:
+        point_payload = {
+            "trend_result_id": result_id,
+            **point,
+            "route_id": request.get("route_id"),
+            "driver_id": request.get("driver_id"),
+            "driver_name": request.get("driver_name"),
+            "employee_id": request.get("employee_id"),
+            "employee_name": request.get("employee_name"),
+            "station_code": request.get("station_code"),
+            "source_module": ", ".join(template.get("source_modules") or []),
+            "source_reference": template_code,
+            "notes": "Trend point generated from available LORI records.",
+        }
+
+        created = await lori_policy_supabase_post(
+            "lori_trend_data_points",
+            point_payload,
+        )
+
+        if created:
+            created_points.append(created[0])
+
+    created_sources = []
+
+    for row in rows[:75]:
+        source_payload = {
+            "trend_result_id": result_id,
+            "source_module": template.get("trend_category") or "LORI",
+            "source_table": "multiple_lori_tables",
+            "source_record_id": row.get("id") if isinstance(row.get("id"), str) else None,
+            "source_reference": row.get("document_title") or row.get("sop_title") or row.get("report_title") or row.get("action_title") or row.get("route_id") or row.get("driver_name"),
+            "source_title": row.get("document_title") or row.get("sop_title") or row.get("report_title") or row.get("request_title") or metric_name,
+            "source_summary": row.get("notes") or row.get("summary") or row.get("executive_summary") or row.get("trend_summary") or "",
+            "station_code": row.get("station_code") or request.get("station_code"),
+            "route_id": row.get("route_id") or request.get("route_id"),
+            "driver_id": row.get("driver_id") or request.get("driver_id"),
+            "driver_name": row.get("driver_name") or request.get("driver_name"),
+            "employee_id": row.get("employee_id") or request.get("employee_id"),
+            "employee_name": row.get("employee_name") or request.get("employee_name"),
+            "relevance_score": 1.0,
+        }
+
+        created = await lori_policy_supabase_post(
+            "lori_trend_source_records",
+            source_payload,
+        )
+
+        if created:
+            created_sources.append(created[0])
+
+    insight_payload = {
+        "insight_title": result_payload["trend_title"],
+        "insight_category": result_payload["finding_category"],
+        "insight_status": "Active",
+        "company_name": request.get("company_name"),
+        "region_code": request.get("region_code"),
+        "region_name": request.get("region_name"),
+        "operating_state": request.get("operating_state"),
+        "station_code": request.get("station_code"),
+        "route_group": request.get("route_group"),
+        "route_id": request.get("route_id"),
+        "driver_id": request.get("driver_id"),
+        "driver_name": request.get("driver_name"),
+        "employee_id": request.get("employee_id"),
+        "employee_name": request.get("employee_name"),
+        "insight_summary": result_payload["trend_summary"],
+        "trend_direction": result_payload["trend_direction"],
+        "risk_level": result_payload["risk_level"],
+        "confidence_level": result_payload["confidence_level"],
+        "source_modules": template.get("source_modules") or [],
+        "recommended_action": result_payload["recommended_action"],
+    }
+
+    await lori_policy_supabase_post(
+        "lori_trend_insight_library",
+        insight_payload,
+    )
+
+    await lori_trend_patch_rows(
+        "lori_trend_intelligence_requests",
+        f"id=eq.{quote(request_id)}",
+        {
+            "request_status": "Analyzed" if points else "Needs More Data",
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    )
+
+    return {
+        "status": "success",
+        "message": "Trend analysis generated.",
+        "result": result,
+        "data_points_count": len(created_points),
+        "data_points": created_points,
+        "source_records_count": len(created_sources),
+        "source_records": created_sources,
+        "trend_template_code": template_code,
+        "decision_support_note": result_payload["decision_support_note"],
+    }
+
+
+@app.post("/trend-quick-analyze")
+async def trend_quick_analyze(
+    api_key: Optional[str] = Query(None),
+    payload: Dict[str, Any] = Body(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    create_response = await trend_request_create(api_key=api_key, payload=payload)
+
+    if create_response.get("status") != "success":
+        return create_response
+
+    request = create_response.get("request") or {}
+
+    analyze_response = await trend_analyze(
+        api_key=api_key,
+        payload={
+            "request_id": request.get("id"),
+            "trend_template_code": create_response.get("trend_template_code"),
+        },
+    )
+
+    return {
+        "status": "success",
+        "request": request,
+        "analysis": analyze_response,
+    }
+
+
+@app.get("/trend-result-detail")
+async def trend_result_detail(
+    api_key: Optional[str] = Query(None),
+    trend_result_id: str = Query(...),
+):
+    lori_regulatory_require_key(api_key)
+
+    results = await lori_trend_get_rows(
+        "lori_trend_intelligence_results",
+        f"select=*&id=eq.{quote(trend_result_id)}&limit=1",
+    )
+
+    if not results:
+        return {"status": "not_found", "message": "Trend result not found."}
+
+    points = await lori_trend_safe_get_rows(
+        "lori_trend_data_points",
+        f"select=*&trend_result_id=eq.{quote(trend_result_id)}&order=point_order.asc&limit=500",
+    )
+
+    sources = await lori_trend_safe_get_rows(
+        "lori_trend_source_records",
+        f"select=*&trend_result_id=eq.{quote(trend_result_id)}&order=created_at.desc&limit=500",
+    )
+
+    return {
+        "status": "success",
+        "result": results[0],
+        "data_points_count": len(points),
+        "data_points": points,
+        "source_records_count": len(sources),
+        "source_records": sources,
+    }
+
+
+@app.get("/trend-insights")
+async def trend_insights(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    driver_name: Optional[str] = Query(None),
+    route_id: Optional[str] = Query(None),
+    insight_category: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    insights = await lori_trend_safe_get_rows(
+        "lori_trend_insight_library",
+        "select=*&order=last_detected_at.desc&limit=1000",
+    )
+
+    if station_code:
+        insights = [i for i in insights if lori_trend_upper(i.get("station_code")) == lori_trend_upper(station_code)]
+
+    if driver_name:
+        insights = [i for i in insights if driver_name.lower() in lori_trend_lower(i.get("driver_name"))]
+
+    if route_id:
+        insights = [i for i in insights if lori_trend_lower(i.get("route_id")) == route_id.lower()]
+
+    if insight_category:
+        insights = [i for i in insights if lori_trend_lower(i.get("insight_category")) == insight_category.lower()]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "insights_count": len(insights[:limit]),
+        "insights": insights[:limit],
+    }
+
+
+@app.get("/trend-requests")
+async def trend_requests(
+    api_key: Optional[str] = Query(None),
+    station_code: Optional[str] = Query(None),
+    request_status: Optional[str] = Query(None),
+    trend_category: Optional[str] = Query(None),
+    limit: int = Query(200),
+):
+    lori_regulatory_require_key(api_key)
+
+    requests = await lori_trend_safe_get_rows(
+        "lori_trend_intelligence_requests",
+        "select=*&order=created_at.desc&limit=1000",
+    )
+
+    if station_code:
+        requests = [r for r in requests if lori_trend_upper(r.get("station_code")) == lori_trend_upper(station_code)]
+
+    if request_status:
+        requests = [r for r in requests if lori_trend_lower(r.get("request_status")) == request_status.lower()]
+
+    if trend_category:
+        requests = [r for r in requests if lori_trend_lower(r.get("trend_category")) == trend_category.lower()]
+
+    limit = max(1, min(limit, 1000))
+
+    return {
+        "status": "success",
+        "requests_count": len(requests[:limit]),
+        "requests": requests[:limit],
+    }
